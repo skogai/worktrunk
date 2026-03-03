@@ -66,6 +66,9 @@ use cli::{
 };
 use worktrunk::HookType;
 
+const NO_BACKGROUND_DEPRECATED_MSG: &str =
+    "--no-background is deprecated; use --foreground instead";
+
 /// Enhance clap errors with command-specific hints, then exit.
 ///
 /// For unrecognized subcommands that match nested commands, suggests the full path.
@@ -90,6 +93,138 @@ fn enhance_and_exit_error(err: clap::Error) -> ! {
     // so this error enhancement is no longer triggered for that case.
 
     err.exit()
+}
+
+fn warn_no_background_deprecated() {
+    eprintln!("{}", warning_message(NO_BACKGROUND_DEPRECATED_MSG));
+}
+
+#[cfg(not(unix))]
+fn print_windows_picker_unavailable() {
+    eprintln!(
+        "{}",
+        error_message("Interactive picker is not available on Windows")
+    );
+    eprintln!(
+        "{}",
+        hint_message(cformat!(
+            "Specify a branch: <bright-black>wt switch BRANCH</>"
+        ))
+    );
+}
+
+fn is_foreground_mode(foreground: bool, no_background: bool) -> bool {
+    if no_background {
+        warn_no_background_deprecated();
+    }
+    foreground || no_background
+}
+
+fn flag_pair(positive: bool, negative: bool) -> Option<bool> {
+    match (positive, negative) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
+    }
+}
+
+fn run_non_toggle_hook(
+    hook_type: HookType,
+    yes: bool,
+    name: Option<&str>,
+    vars: &[(String, String)],
+) -> anyhow::Result<()> {
+    run_hook(hook_type, yes, None, name, vars)
+}
+
+fn run_toggleable_hook(
+    hook_type: HookType,
+    yes: bool,
+    foreground: bool,
+    no_background: bool,
+    name: Option<&str>,
+    vars: &[(String, String)],
+) -> anyhow::Result<()> {
+    let foreground = is_foreground_mode(foreground, no_background);
+    run_hook(hook_type, yes, Some(foreground), name, vars)
+}
+
+fn warn_select_deprecated() {
+    eprintln!(
+        "{}",
+        warning_message("wt select is deprecated; use wt switch instead")
+    );
+}
+
+fn handle_hook_command(action: HookCommand) -> anyhow::Result<()> {
+    match action {
+        HookCommand::Show {
+            hook_type,
+            expanded,
+        } => handle_hook_show(hook_type.as_deref(), expanded),
+        HookCommand::PreSwitch { name, yes, vars } => {
+            run_non_toggle_hook(HookType::PreSwitch, yes, name.as_deref(), &vars)
+        }
+        HookCommand::PostCreate { name, yes, vars } => {
+            run_non_toggle_hook(HookType::PostCreate, yes, name.as_deref(), &vars)
+        }
+        HookCommand::PostStart {
+            name,
+            yes,
+            foreground,
+            no_background,
+            vars,
+        } => run_toggleable_hook(
+            HookType::PostStart,
+            yes,
+            foreground,
+            no_background,
+            name.as_deref(),
+            &vars,
+        ),
+        HookCommand::PostSwitch {
+            name,
+            yes,
+            foreground,
+            no_background,
+            vars,
+        } => run_toggleable_hook(
+            HookType::PostSwitch,
+            yes,
+            foreground,
+            no_background,
+            name.as_deref(),
+            &vars,
+        ),
+        HookCommand::PreCommit { name, yes, vars } => {
+            run_non_toggle_hook(HookType::PreCommit, yes, name.as_deref(), &vars)
+        }
+        HookCommand::PreMerge { name, yes, vars } => {
+            run_non_toggle_hook(HookType::PreMerge, yes, name.as_deref(), &vars)
+        }
+        HookCommand::PostMerge { name, yes, vars } => {
+            run_non_toggle_hook(HookType::PostMerge, yes, name.as_deref(), &vars)
+        }
+        HookCommand::PreRemove { name, yes, vars } => {
+            run_non_toggle_hook(HookType::PreRemove, yes, name.as_deref(), &vars)
+        }
+        HookCommand::PostRemove {
+            name,
+            yes,
+            foreground,
+            vars,
+        } => run_hook(
+            HookType::PostRemove,
+            yes,
+            Some(foreground),
+            name.as_deref(),
+            &vars,
+        ),
+        HookCommand::Approvals { action } => match action {
+            ApprovalsCommand::Add { all } => add_approvals(all),
+            ApprovalsCommand::Clear { global } => clear_approvals(global),
+        },
+    }
 }
 
 fn main() {
@@ -579,114 +714,18 @@ fn main() {
                 clobber,
             } => step_relocate(branches, dry_run, commit, clobber),
         },
-        Commands::Hook { action } => match action {
-            HookCommand::Show {
-                hook_type,
-                expanded,
-            } => handle_hook_show(hook_type.as_deref(), expanded),
-            HookCommand::PreSwitch { name, yes, vars } => {
-                run_hook(HookType::PreSwitch, yes, None, name.as_deref(), &vars)
-            }
-            HookCommand::PostCreate { name, yes, vars } => {
-                run_hook(HookType::PostCreate, yes, None, name.as_deref(), &vars)
-            }
-            HookCommand::PostStart {
-                name,
-                yes,
-                foreground,
-                no_background,
-                vars,
-            } => {
-                if no_background {
-                    eprintln!(
-                        "{}",
-                        warning_message("--no-background is deprecated; use --foreground instead")
-                    );
-                }
-                run_hook(
-                    HookType::PostStart,
-                    yes,
-                    Some(foreground || no_background),
-                    name.as_deref(),
-                    &vars,
-                )
-            }
-            HookCommand::PostSwitch {
-                name,
-                yes,
-                foreground,
-                no_background,
-                vars,
-            } => {
-                if no_background {
-                    eprintln!(
-                        "{}",
-                        warning_message("--no-background is deprecated; use --foreground instead")
-                    );
-                }
-                run_hook(
-                    HookType::PostSwitch,
-                    yes,
-                    Some(foreground || no_background),
-                    name.as_deref(),
-                    &vars,
-                )
-            }
-            HookCommand::PreCommit { name, yes, vars } => {
-                run_hook(HookType::PreCommit, yes, None, name.as_deref(), &vars)
-            }
-            HookCommand::PreMerge { name, yes, vars } => {
-                run_hook(HookType::PreMerge, yes, None, name.as_deref(), &vars)
-            }
-            HookCommand::PostMerge { name, yes, vars } => {
-                run_hook(HookType::PostMerge, yes, None, name.as_deref(), &vars)
-            }
-            HookCommand::PreRemove { name, yes, vars } => {
-                run_hook(HookType::PreRemove, yes, None, name.as_deref(), &vars)
-            }
-            HookCommand::PostRemove {
-                name,
-                yes,
-                foreground,
-                vars,
-            } => run_hook(
-                HookType::PostRemove,
-                yes,
-                Some(foreground),
-                name.as_deref(),
-                &vars,
-            ),
-            HookCommand::Approvals { action } => match action {
-                ApprovalsCommand::Add { all } => add_approvals(all),
-                ApprovalsCommand::Clear { global } => clear_approvals(global),
-            },
-        },
+        Commands::Hook { action } => handle_hook_command(action),
         #[cfg(unix)]
         Commands::Select { branches, remotes } => {
             // Deprecated: show warning and delegate to handle_select
-            eprintln!(
-                "{}",
-                warning_message("wt select is deprecated; use wt switch instead")
-            );
+            warn_select_deprecated();
 
             handle_select(branches, remotes)
         }
         #[cfg(not(unix))]
         Commands::Select { .. } => {
-            eprintln!(
-                "{}",
-                warning_message("wt select is deprecated; use wt switch instead")
-            );
-            eprintln!(
-                "{}",
-                error_message("Interactive picker is not available on Windows")
-            );
-            eprintln!(
-                "{}",
-                hint_message(cformat!(
-                    "Specify a branch: <bright-black>wt switch BRANCH</>"
-                ))
-            );
+            warn_select_deprecated();
+            print_windows_picker_unavailable();
             std::process::exit(1);
         }
         Commands::List {
@@ -750,16 +789,7 @@ fn main() {
                         // Suppress unused variable warnings on Windows
                         let _ = (branches, remotes);
 
-                        eprintln!(
-                            "{}",
-                            error_message("Interactive picker is not available on Windows")
-                        );
-                        eprintln!(
-                            "{}",
-                            hint_message(cformat!(
-                                "Specify a branch: <bright-black>wt switch BRANCH</>"
-                            ))
-                        );
+                        print_windows_picker_unavailable();
                         std::process::exit(2);
                     }
                 };
@@ -792,14 +822,7 @@ fn main() {
         } => UserConfig::load()
             .context("Failed to load config")
             .and_then(|config| {
-                // Handle deprecated --no-background flag
-                if no_background {
-                    eprintln!(
-                        "{}",
-                        warning_message("--no-background is deprecated; use --foreground instead")
-                    );
-                }
-                let background = !(foreground || no_background);
+                let background = !is_foreground_mode(foreground, no_background);
 
                 // Validate conflicting flags
                 if !delete_branch && force_delete {
@@ -999,15 +1022,6 @@ fn main() {
             yes,
             stage,
         } => {
-            // Convert paired flags to Option<bool>
-            fn flag_pair(positive: bool, negative: bool) -> Option<bool> {
-                match (positive, negative) {
-                    (true, _) => Some(true),
-                    (_, true) => Some(false),
-                    _ => None,
-                }
-            }
-
             // Pass CLI flags as options; handle_merge determines effective defaults
             // using per-project config merged with global config
             handle_merge(MergeOptions {
