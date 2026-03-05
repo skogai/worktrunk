@@ -54,11 +54,6 @@ jobs:
           fetch-tags: true
           token: ${{ secrets.WORKTRUNK_BOT_TOKEN }}
 
-      - name: 🔧 Configure git for Claude
-        run: |
-          git config --global user.name "Claude Code"
-          git config --global user.email "claude@anthropic.com"
-
       - name: 📌 Check out PR branch
         if: github.event_name == 'pull_request_review'
         run: gh pr checkout ${{ github.event.pull_request.number }}
@@ -99,7 +94,10 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.WORKTRUNK_BOT_TOKEN }}
+          bot_id: "254187624"
+          bot_name: "worktrunk-bot"
           allowed_bots: "*"
+          allowed_non_write_users: "*"
           additional_permissions: |
             actions: read
           use_sticky_comment: ${{ github.event_name == 'pull_request_target' }}
@@ -111,7 +109,7 @@ jobs:
 
       - name: 📋 Upload Claude Code session logs
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: claude-session-logs
           path: /home/runner/.claude/projects/

@@ -268,6 +268,31 @@ fn test_prune_orphan_branch_min_age(repo: TestRepo) {
     assert_cmd_snapshot!(cmd);
 }
 
+/// Prune can remove a mix of branch-only and worktree candidates in one run.
+#[rstest]
+fn test_prune_mixed_worktree_and_orphan_branch(mut repo: TestRepo) {
+    repo.commit("initial");
+
+    // Branch-only candidate: integrated orphan branch without a worktree.
+    repo.create_branch("orphan-mixed");
+
+    // Worktree candidate: integrated worktree at the same commit as main.
+    repo.add_worktree("merged-mixed");
+
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "step",
+        &["prune", "--yes", "--min-age=0s"],
+        None
+    ));
+
+    let parent = repo.root_path().parent().unwrap();
+    assert!(
+        !parent.join("repo.merged-mixed").exists(),
+        "Merged worktree should be removed"
+    );
+}
+
 /// Prune from a merged worktree removes it last (CandidateKind::Current).
 ///
 /// Skipped on Windows: Windows locks the current working directory, preventing
@@ -323,6 +348,59 @@ fn test_prune_min_age_passes(mut repo: TestRepo) {
     repo.add_worktree("old-merged");
 
     // Far-future epoch: worktrees appear ~4 years old
+    let mut cmd = make_snapshot_cmd(&repo, "step", &["prune", "--dry-run"], None);
+    cmd.env("WORKTRUNK_TEST_EPOCH", "1893456000"); // 2030-01-01
+
+    assert_cmd_snapshot!(cmd);
+}
+
+/// Prune skips worktrees with uncommitted changes
+#[rstest]
+fn test_prune_skips_dirty(mut repo: TestRepo) {
+    repo.commit("initial");
+
+    // Merged worktree with uncommitted changes — should be skipped
+    let wt_path = repo.add_worktree("dirty-merged");
+    std::fs::write(wt_path.join("scratch.txt"), "wip").unwrap();
+
+    // Clean merged worktree — should be pruned
+    repo.add_worktree("clean-merged");
+
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "step",
+        &["prune", "--yes", "--min-age=0s"],
+        None
+    ));
+
+    // Dirty worktree still exists
+    assert!(wt_path.exists(), "Dirty worktree should be skipped");
+
+    // Clean worktree removed
+    let clean_path = repo.root_path().parent().unwrap().join("repo.clean-merged");
+    assert!(
+        !clean_path.exists(),
+        "Clean merged worktree should be removed"
+    );
+}
+
+/// Dry-run with mixed worktrees + orphan branches shows both counts.
+///
+/// Exercises the "N worktrees, M branches would be removed (dry run)" path
+/// where the summary must distinguish worktree candidates from branch-only
+/// candidates.
+#[rstest]
+fn test_prune_dry_run_mixed_worktrees_and_branches(mut repo: TestRepo) {
+    repo.commit("initial");
+
+    // Two worktrees at same commit as main (integrated)
+    repo.add_worktree("merged-a");
+    repo.add_worktree("merged-b");
+
+    // One orphan branch (integrated, no worktree)
+    repo.create_branch("orphan-integrated");
+
+    // Far-future epoch so everything passes the age guard
     let mut cmd = make_snapshot_cmd(&repo, "step", &["prune", "--dry-run"], None);
     cmd.env("WORKTRUNK_TEST_EPOCH", "1893456000"); // 2030-01-01
 

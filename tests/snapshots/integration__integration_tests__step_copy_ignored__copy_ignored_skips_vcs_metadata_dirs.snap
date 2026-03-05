@@ -1,11 +1,10 @@
 ---
-source: tests/integration_tests/step_prune.rs
+source: tests/integration_tests/step_copy_ignored.rs
 info:
   program: wt
   args:
     - step
-    - prune
-    - "--dry-run"
+    - copy-ignored
   env:
     APPDATA: "[TEST_CONFIG_HOME]"
     CLICOLOR_FORCE: "1"
@@ -20,6 +19,7 @@ info:
     LANG: C
     LC_ALL: C
     MOCK_CONFIG_DIR: "[MOCK_CONFIG_DIR]"
+    NO_COLOR: ""
     PATH: "[PATH]"
     PSModulePath: ""
     RUST_LOG: warn
@@ -42,4 +42,4 @@ exit_code: 0
 ----- stdout -----
 
 ----- stderr -----
-[2m○[22m Skipped young-branch (younger than 1h)
+[32m✓[39m [32mCopied 1 entry[39m

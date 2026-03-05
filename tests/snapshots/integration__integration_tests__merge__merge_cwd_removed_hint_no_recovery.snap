@@ -1,12 +1,11 @@
 ---
-source: tests/integration_tests/step_prune.rs
+source: tests/integration_tests/merge.rs
 info:
   program: wt
   args:
-    - step
-    - prune
+    - merge
+    - main
     - "--yes"
-    - "--min-age=0s"
   env:
     APPDATA: "[TEST_CONFIG_HOME]"
     CLICOLOR_FORCE: "1"
@@ -23,6 +22,7 @@ info:
     MOCK_CONFIG_DIR: "[MOCK_CONFIG_DIR]"
     PATH: "[PATH]"
     PSModulePath: ""
+    PWD: /private/var/folders/wf/s6ycxvvs4ln8qsdbfx40hnc40000gn/T/.tmpbWAT4p/repo.feature
     RUST_LOG: warn
     SHELL: ""
     TERM: alacritty
@@ -38,12 +38,20 @@ info:
     WORKTRUNK_TEST_SKIP_URL_HEALTH_CHECK: "1"
     XDG_CONFIG_HOME: "[TEST_CONFIG_HOME]"
 ---
-success: true
-exit_code: 0
+success: false
+exit_code: 1
 ----- stdout -----
 
 ----- stderr -----
-[36m◎ Removing [1mcurrent-merged[22m worktree & branch in background (same commit as [1mmain[22m,[39m [2m_[22m[36m)[39m
+[36m◎[39m [36mMerging 1 commit to [1mmain[22m @ [2m[HASH][22m (no commit/squash/rebase needed)[39m
+[107m [0m * [33m[HASH][m Add feature file
+[107m [0m  feature.txt | 1 [32m+[m
+[107m [0m  1 file changed, 1 insertion(+)
+[32m✓[39m [32mMerged to [1mmain[22m [90m(1 commit, 1 file, [32m+1[39m[39m[90m)[39m[39m
+[36m◎ Removing [1mfeature[22m worktree & branch in background (same commit as [1mmain[22m,[39m [2m_[22m[36m)[39m
 [33m▲[39m [33mCannot change directory — shell integration not installed[39m
 [2m↳[22m [2mTo enable automatic cd, run [90mwt config shell install[39m[22m
-[32m✓[39m [32mPruned 1 worktree (with branch)[39m
+[36m◎[39m [36mRunning post-merge project hook @ [1m_REPO_[22m[39m
+[107m [0m [2m[0m[2m[34mexit[0m[2m 1
+[0m[31m✗[39m [31mCommand failed: exit status: 1[39m
+[2m↳[22m [2mCurrent directory was removed.[22m

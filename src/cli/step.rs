@@ -196,12 +196,12 @@ wt step diff | delta
 Equivalent to:
 
 ```console
-GIT_INDEX_FILE=/tmp/idx git read-tree --empty
+cp "$(git rev-parse --git-dir)/index" /tmp/idx
 GIT_INDEX_FILE=/tmp/idx git add --intent-to-add .
 GIT_INDEX_FILE=/tmp/idx git diff $(git merge-base HEAD $(wt config state default-branch))
 ```
 
-`git diff` ignores untracked files. `git add --intent-to-add .` registers them in the index without staging their content, making them visible to `git diff`. This runs against a temporary empty index so the real one is never modified.
+`git diff` ignores untracked files. `git add --intent-to-add .` registers them in the index without staging their content, making them visible to `git diff`. This runs against a copy of the real index so the original is never modified.
 "#
     )]
     Diff {
@@ -260,7 +260,7 @@ target/
 - Handles nested `.gitignore` files, global excludes, and `.git/info/exclude`
 - Skips existing files by default (safe to re-run)
 - `--force` overwrites existing files in the destination
-- Skips `.git` entries and other worktrees
+- Skips `.git` entries, VCS metadata directories (`.jj`, `.hg`, etc.), and other worktrees
 
 ## Performance
 
@@ -423,7 +423,7 @@ Gitignored files are swapped along with the branches so each worktree keeps the 
         branch: Option<String>,
     },
 
-    /// Remove worktrees merged into the default branch
+    /// \[experimental\] Remove worktrees merged into the default branch
     #[command(
         after_long_help = r#"Bulk-removes worktrees and branches that are integrated into the default branch, using the same criteria as `wt remove`'s branch cleanup. Stale worktree entries are cleaned up too.
 

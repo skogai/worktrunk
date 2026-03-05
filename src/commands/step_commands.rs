@@ -32,7 +32,7 @@ use worktrunk::styling::{
 use super::command_approval::approve_hooks;
 use super::commit::{CommitGenerator, CommitOptions, StageMode};
 use super::context::CommandEnv;
-use super::hooks::{HookFailureStrategy, run_hook_with_filter};
+use super::hooks::{HookCommandSpec, HookFailureStrategy, run_hook_with_filter};
 use super::repository_ext::{RemoveTarget, RepositoryCliExt};
 use super::worktree::BranchDeletionMode;
 use crate::output::handle_remove_output;
@@ -192,15 +192,17 @@ pub fn handle_squash(
         let extra_vars = [("target", integration_target.as_str())];
         run_hook_with_filter(
             &ctx,
-            user_hooks.pre_commit.as_ref(),
-            project_config
-                .as_ref()
-                .and_then(|c| c.hooks.pre_commit.as_ref()),
-            HookType::PreCommit,
-            &extra_vars,
+            HookCommandSpec {
+                user_config: user_hooks.pre_commit.as_ref(),
+                project_config: project_config
+                    .as_ref()
+                    .and_then(|c| c.hooks.pre_commit.as_ref()),
+                hook_type: HookType::PreCommit,
+                extra_vars: &extra_vars,
+                name_filter: None,
+                display_path: crate::output::pre_hook_display_path(ctx.worktree_path),
+            },
             HookFailureStrategy::FailFast,
-            None,
-            crate::output::pre_hook_display_path(ctx.worktree_path),
         )
         .map_err(worktrunk::git::add_hook_skip_hint)?;
     }
@@ -483,8 +485,9 @@ pub fn handle_rebase(target: Option<&str>) -> anyhow::Result<RebaseResult> {
 /// Handle `wt step diff` command
 ///
 /// Shows all changes since branching from the target: committed, staged, unstaged,
-/// and untracked files in a single diff. Uses a temporary index to include untracked
-/// files without modifying the real git index.
+/// and untracked files in a single diff. Copies the real index to preserve git's stat
+/// cache (avoiding re-reads of unchanged files), then registers untracked files with
+/// `git add -N` so they appear in the diff.
 ///
 /// TODO: consider adding `--stage` flag (all/tracked/none) like `step commit` to
 /// control which change types are included. `tracked` would skip the temp index,
@@ -503,26 +506,21 @@ pub fn step_diff(target: Option<&str>, extra_args: &[String]) -> anyhow::Result<
 
     let current_branch = wt.branch()?.unwrap_or_else(|| "HEAD".to_string());
 
-    // Create an empty temporary index and register all working tree files with
-    // `git add -N .` so untracked files become visible to `git diff`.
+    // Copy the real index so git's stat cache is warm for tracked files, then
+    // register untracked files with `git add -N .` so they appear in the diff.
+    // This avoids re-reading and hashing every tracked file during `git diff`.
     let worktree_root = wt.root()?;
 
+    let real_index = wt.git_dir()?.join("index");
     let temp_index = tempfile::NamedTempFile::new().context("Failed to create temporary index")?;
     let temp_index_path = temp_index
         .path()
         .to_str()
         .context("Temporary index path is not valid UTF-8")?;
 
-    // Initialize a valid empty index
-    Cmd::new("git")
-        .args(["read-tree", "--empty"])
-        .current_dir(&worktree_root)
-        .context(&current_branch)
-        .env("GIT_INDEX_FILE", temp_index_path)
-        .run()
-        .context("Failed to initialize temporary index")?;
+    std::fs::copy(&real_index, temp_index.path()).context("Failed to copy index file")?;
 
-    // Register all working tree files as intent-to-add
+    // Register untracked files as intent-to-add (tracked files already have entries)
     Cmd::new("git")
         .args(["add", "--intent-to-add", "."])
         .current_dir(&worktree_root)
@@ -544,13 +542,21 @@ pub fn step_diff(target: Option<&str>, extra_args: &[String]) -> anyhow::Result<
     Ok(())
 }
 
-/// List gitignored entries in a worktree, filtered by `.worktreeinclude` and excluding
-/// entries that contain nested worktrees.
+/// VCS metadata directories that should never be copied between worktrees.
 ///
-/// Combines three steps:
+/// These directories contain internal state tied to a specific working directory.
+/// Git's own `.git` is implicitly excluded (git ls-files never reports it), but
+/// other VCS tools colocated with git need explicit exclusion.
+const VCS_METADATA_DIRS: &[&str] = &[".jj", ".hg", ".svn", ".sl", ".bzr", ".pijul"];
+
+/// List gitignored entries in a worktree, filtered by `.worktreeinclude` and excluding
+/// VCS metadata directories and entries that contain nested worktrees.
+///
+/// Combines four steps:
 /// 1. `list_ignored_entries()` — git ls-files for ignored entries
 /// 2. `.worktreeinclude` filtering — only matching entries if the file exists
-/// 3. Nested worktree filtering — exclude entries containing other worktrees
+/// 3. VCS metadata filtering — exclude directories like `.jj`, `.hg`
+/// 4. Nested worktree filtering — exclude entries containing other worktrees
 fn list_and_filter_ignored_entries(
     worktree_path: &Path,
     context: &str,
@@ -579,9 +585,22 @@ fn list_and_filter_ignored_entries(
         ignored_entries
     };
 
-    // Filter out entries that contain other worktrees
+    // Filter out VCS metadata directories and entries that contain other worktrees
     Ok(filtered
         .into_iter()
+        .filter(|(entry_path, is_dir)| {
+            // Skip VCS metadata directories (.jj, .hg, etc.) — these contain
+            // internal state tied to a specific working directory
+            if *is_dir
+                && entry_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|name| VCS_METADATA_DIRS.contains(&name))
+            {
+                return false;
+            }
+            true
+        })
         .filter(|(entry_path, _)| {
             !worktree_paths
                 .iter()
@@ -1308,7 +1327,6 @@ pub fn step_prune(dry_run: bool, yes: bool, min_age: &str, foreground: bool) -> 
         path: Option<PathBuf>,
         /// Current worktree, other worktree, or branch-only (no worktree)
         kind: CandidateKind,
-        reason_desc: String,
     }
     enum CandidateKind {
         Current,
@@ -1316,40 +1334,123 @@ pub fn step_prune(dry_run: bool, yes: bool, min_age: &str, foreground: bool) -> 
         BranchOnly,
     }
 
-    /// Build a human-readable count like "2 worktrees, 1 branch".
-    fn count_summary(candidates: &[Candidate]) -> String {
-        let worktree_count = candidates
-            .iter()
-            .filter(|c| !matches!(c.kind, CandidateKind::BranchOnly))
-            .count();
-        let branch_count = candidates.len() - worktree_count;
-        let mut parts = Vec::new();
-        if worktree_count > 0 {
-            let noun = if worktree_count == 1 {
-                "worktree"
-            } else {
-                "worktrees"
-            };
-            parts.push(format!("{worktree_count} {noun}"));
+    /// Build a human-readable count like "2 worktrees (with branches), 1 branch".
+    fn prune_summary(candidates: &[Candidate]) -> String {
+        let mut worktree_with_branch = 0;
+        let mut branch_only = 0;
+        let mut detached_worktree = 0;
+        for c in candidates {
+            match (&c.kind, &c.branch) {
+                (CandidateKind::BranchOnly, _) => branch_only += 1,
+                (CandidateKind::Current | CandidateKind::Other, Some(_)) => {
+                    worktree_with_branch += 1;
+                }
+                (CandidateKind::Current | CandidateKind::Other, None) => {
+                    detached_worktree += 1;
+                }
+            }
         }
-        if branch_count > 0 {
-            let noun = if branch_count == 1 {
+        let mut parts = Vec::new();
+        if worktree_with_branch > 0 {
+            let noun = if worktree_with_branch == 1 {
+                "worktree (with branch)"
+            } else {
+                "worktrees (with branches)"
+            };
+            parts.push(format!("{worktree_with_branch} {noun}"));
+        }
+        if branch_only > 0 {
+            let noun = if branch_only == 1 {
                 "branch"
             } else {
                 "branches"
             };
-            parts.push(format!("{branch_count} {noun}"));
+            parts.push(format!("{branch_only} {noun}"));
+        }
+        if detached_worktree > 0 {
+            let noun = if detached_worktree == 1 {
+                "detached worktree"
+            } else {
+                "detached worktrees"
+            };
+            parts.push(format!("{detached_worktree} {noun}"));
         }
         parts.join(", ")
     }
 
-    let mut candidates: Vec<Candidate> = Vec::new();
+    // For non-dry-run, approve hooks upfront so we can remove inline.
+    let run_hooks = if dry_run {
+        false // unused in dry-run path
+    } else {
+        let env = CommandEnv::for_action_branchless()?;
+        let ctx = env.context(yes);
+        let approved = approve_hooks(
+            &ctx,
+            &[
+                HookType::PreRemove,
+                HookType::PostRemove,
+                HookType::PostSwitch,
+            ],
+        )?;
+        if !approved {
+            eprintln!("{}", info_message("Commands declined, continuing removal"));
+        }
+        approved
+    };
+
+    let mut candidates: Vec<Candidate> = Vec::new(); // dry-run collects here
+    let mut removed: Vec<Candidate> = Vec::new(); // non-dry-run tracks removals
+    let mut deferred_current: Option<Candidate> = None; // current worktree removed last
     let mut skipped_young: Vec<String> = Vec::new();
     // Track branches seen via worktree entries so we don't double-count.
     // Pre-seed with the default branch to prevent it from being pruned
     // (it's trivially "integrated" into itself).
     let mut seen_branches: std::collections::HashSet<String> =
         default_branch.iter().cloned().collect();
+
+    /// Try to remove a candidate immediately. Returns Ok(true) if removed,
+    /// Ok(false) if skipped (preparation error), Err on execution error.
+    fn try_remove(
+        candidate: &Candidate,
+        repo: &Repository,
+        config: &UserConfig,
+        foreground: bool,
+        run_hooks: bool,
+    ) -> anyhow::Result<bool> {
+        let target = match candidate.kind {
+            CandidateKind::Current => RemoveTarget::Current,
+            CandidateKind::BranchOnly => RemoveTarget::Branch(
+                candidate
+                    .branch
+                    .as_ref()
+                    .context("BranchOnly candidate missing branch")?,
+            ),
+            CandidateKind::Other => match &candidate.branch {
+                Some(branch) => RemoveTarget::Branch(branch),
+                None => RemoveTarget::Path(
+                    candidate
+                        .path
+                        .as_ref()
+                        .context("detached candidate missing path")?,
+                ),
+            },
+        };
+        let plan = match repo.prepare_worktree_removal(
+            target,
+            BranchDeletionMode::SafeDelete,
+            false,
+            config,
+        ) {
+            Ok(plan) => plan,
+            Err(_) => {
+                // prepare_worktree_removal is the gate: if the worktree can't
+                // be removed (dirty, locked, etc.), it's simply not selected.
+                return Ok(false);
+            }
+        };
+        handle_remove_output(&plan, !foreground, run_hooks, true)?;
+        Ok(true)
+    }
 
     for wt in &worktrees {
         // Track branches so the orphan scan doesn't re-discover them
@@ -1375,13 +1476,26 @@ pub fn step_prune(dry_run: bool, yes: bool, min_age: &str, foreground: bool) -> 
                 let (effective_target, reason) =
                     repo.integration_reason(branch, &integration_target)?;
                 if let Some(reason) = reason {
-                    candidates.push(Candidate {
+                    let candidate = Candidate {
                         label: branch.clone(),
                         branch: Some(branch.clone()),
                         path: None,
                         kind: CandidateKind::BranchOnly,
-                        reason_desc: format!("{} {}", reason.description(), effective_target),
-                    });
+                    };
+                    if dry_run {
+                        eprintln!(
+                            "{}",
+                            info_message(cformat!(
+                                "<bold>{}</> (stale) — {} {}",
+                                branch,
+                                reason.description(),
+                                effective_target
+                            ))
+                        );
+                        candidates.push(candidate);
+                    } else if try_remove(&candidate, &repo, &config, foreground, run_hooks)? {
+                        removed.push(candidate);
+                    }
                 }
             }
             continue;
@@ -1434,7 +1548,7 @@ pub fn step_prune(dry_run: bool, yes: bool, min_age: &str, foreground: bool) -> 
 
         let wt_path = dunce::canonicalize(&wt.path).unwrap_or(wt.path.clone());
         let is_current = wt_path == current_root;
-        candidates.push(Candidate {
+        let candidate = Candidate {
             branch: if wt.detached { None } else { wt.branch.clone() },
             label,
             path: Some(wt.path.clone()),
@@ -1443,8 +1557,23 @@ pub fn step_prune(dry_run: bool, yes: bool, min_age: &str, foreground: bool) -> 
             } else {
                 CandidateKind::Other
             },
-            reason_desc: format!("{} {}", reason.description(), effective_target),
-        });
+        };
+        if dry_run {
+            eprintln!(
+                "{}",
+                info_message(cformat!(
+                    "<bold>{}</> — {} {}",
+                    candidate.label,
+                    reason.description(),
+                    effective_target
+                ))
+            );
+            candidates.push(candidate);
+        } else if is_current {
+            deferred_current = Some(candidate);
+        } else if try_remove(&candidate, &repo, &config, foreground, run_hooks)? {
+            removed.push(candidate);
+        }
     }
 
     // Also scan local branches that don't have a worktree entry
@@ -1474,27 +1603,30 @@ pub fn step_prune(dry_run: bool, yes: bool, min_age: &str, foreground: bool) -> 
                     }
                 }
             }
-            candidates.push(Candidate {
+            let candidate = Candidate {
                 label: branch.clone(),
                 branch: Some(branch),
                 path: None,
                 kind: CandidateKind::BranchOnly,
-                reason_desc: format!("{} {}", reason.description(), effective_target),
-            });
+            };
+            if dry_run {
+                eprintln!(
+                    "{}",
+                    info_message(cformat!(
+                        "<bold>{}</> (branch only) — {} {}",
+                        candidate.label,
+                        reason.description(),
+                        effective_target
+                    ))
+                );
+                candidates.push(candidate);
+            } else if try_remove(&candidate, &repo, &config, foreground, run_hooks)? {
+                removed.push(candidate);
+            }
         }
     }
 
-    if candidates.is_empty() {
-        let msg = if skipped_young.is_empty() {
-            "No merged worktrees to remove".to_string()
-        } else {
-            let names = skipped_young.join(", ");
-            format!("No merged worktrees to remove (skipped {names}, younger than {min_age})")
-        };
-        eprintln!("{}", info_message(msg));
-        return Ok(());
-    }
-
+    // Report skipped worktrees
     if !skipped_young.is_empty() {
         let names = skipped_young.join(", ");
         eprintln!(
@@ -1504,63 +1636,39 @@ pub fn step_prune(dry_run: bool, yes: bool, min_age: &str, foreground: bool) -> 
     }
 
     if dry_run {
-        for c in &candidates {
-            eprintln!(
-                "{}",
-                info_message(cformat!("<bold>{}</> — {}", c.label, c.reason_desc,))
-            );
+        if candidates.is_empty() {
+            if skipped_young.is_empty() {
+                eprintln!("{}", info_message("No merged worktrees to remove"));
+            }
+            return Ok(());
         }
-        let summary = count_summary(&candidates);
         eprintln!(
             "{}",
-            hint_message(format!("{summary} would be removed (dry run)"))
+            hint_message(format!(
+                "{} would be removed (dry run)",
+                prune_summary(&candidates)
+            ))
         );
         return Ok(());
     }
 
-    // Approve hooks
-    let env = CommandEnv::for_action_branchless()?;
-    let ctx = env.context(yes);
-    let run_hooks = approve_hooks(
-        &ctx,
-        &[
-            HookType::PreRemove,
-            HookType::PostRemove,
-            HookType::PostSwitch,
-        ],
-    )?;
-    if !run_hooks {
-        eprintln!("{}", info_message("Commands declined, continuing removal"));
+    // Remove deferred current worktree last (cd-to-primary happens here)
+    if let Some(current) = deferred_current
+        && try_remove(&current, &repo, &config, foreground, run_hooks)?
+    {
+        removed.push(current);
     }
 
-    // Sort: current worktree last so cd-to-primary happens after other removals
-    candidates.sort_by_key(|c| matches!(c.kind, CandidateKind::Current));
-
-    // Prepare removal plans
-    let mut plans: Vec<super::worktree::RemoveResult> = Vec::new();
-    for c in &candidates {
-        let target = match c.kind {
-            CandidateKind::Current => RemoveTarget::Current,
-            CandidateKind::BranchOnly => {
-                RemoveTarget::Branch(c.branch.as_ref().expect("BranchOnly has branch"))
-            }
-            CandidateKind::Other => match &c.branch {
-                Some(branch) => RemoveTarget::Branch(branch),
-                None => RemoveTarget::Path(c.path.as_ref().expect("detached has path")),
-            },
-        };
-        let plan =
-            repo.prepare_worktree_removal(target, BranchDeletionMode::SafeDelete, false, &config)?;
-        plans.push(plan);
+    if removed.is_empty() {
+        if skipped_young.is_empty() {
+            eprintln!("{}", info_message("No merged worktrees to remove"));
+        }
+    } else {
+        eprintln!(
+            "{}",
+            success_message(format!("Pruned {}", prune_summary(&removed)))
+        );
     }
-
-    // Execute removals (current worktree is last due to sort above)
-    for result in &plans {
-        handle_remove_output(result, !foreground, run_hooks)?;
-    }
-
-    let summary = count_summary(&candidates);
-    eprintln!("{}", success_message(format!("Pruned {summary}")));
 
     Ok(())
 }

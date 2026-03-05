@@ -653,9 +653,10 @@ pub fn configure_completion_invocation_for_shell(cmd: &mut Command, words: &[&st
             let index = words.len().saturating_sub(1);
             cmd.env("_CLAP_COMPLETE_INDEX", index.to_string());
         }
-        "fish" => {
-            // Fish doesn't set _CLAP_COMPLETE_INDEX - it appends the current token
-            // as the last argument, so the completion handler uses args.len() - 1
+        "fish" | "nu" => {
+            // Fish and Nushell don't set _CLAP_COMPLETE_INDEX - they append the
+            // current token as the last argument, so the completion handler uses
+            // args.len() - 1
         }
         _ => {}
     }
@@ -682,6 +683,9 @@ pub fn configure_cli_command(cmd: &mut Command) {
             cmd.env_remove(&key);
         }
     }
+    // Prevent host environment from disabling ANSI in snapshots.
+    // NO_COLOR can override CLICOLOR_FORCE in downstream output handling.
+    cmd.env_remove("NO_COLOR");
     // Set to non-existent path to prevent loading user's real config.
     // Tests that need config should use TestRepo::configure_wt_cmd() which overrides this.
     // Note: env_remove above may cause insta-cmd to capture empty values in snapshots,

@@ -99,34 +99,38 @@ unused branches after the run).
 
 ## Shell Quoting in `gh` Commands
 
-Claude tends to mangle shell quoting in CI. Two common failure modes:
+Shell expansion corrupts `$` and `!` in command arguments. When a `gh` argument
+contains either character, write it to a temp file or heredoc variable first:
 
-1. **`$` in GraphQL queries** — `gh api graphql -f query='...$var...'` fails
-   because Claude corrupts the `$` signs. Write queries to a temp file instead:
+```bash
+# GraphQL with $ — write query to a file, pass with -F
+cat > /tmp/query.graphql << 'GRAPHQL'
+query($owner: String!, $repo: String!) { ... }
+GRAPHQL
+gh api graphql -F query=@/tmp/query.graphql -f owner="$OWNER"
 
-   ```bash
-   cat > /tmp/query.graphql << 'GRAPHQL'
-   query($owner: String!, $repo: String!, $name: String!) {
-     repository(owner: $owner, name: $name) { ... }
-   }
-   GRAPHQL
+# jq/body text with ! — capture in a heredoc variable
+jq_filter=$(cat <<'EOF'
+select(.status != "COMPLETED")
+EOF
+)
+gh api ... --jq "$jq_filter"
+```
 
-   gh api graphql -F query=@/tmp/query.graphql -f owner="$OWNER" -f name="$NAME"
-   ```
+## Keeping PR Titles and Descriptions Current
 
-2. **`!` in comment/body text** — `gh issue comment N --body "Thanks!"` gets
-   over-escaped to `Thanks\!` because `!` is a bash history expansion character.
-   Use a heredoc:
+When you revise a PR's code in response to review feedback, check whether the
+title and description still accurately describe the changes. If the approach
+changed (e.g., from "exclude all X" to "add targeted exclusions for X"), update
+the title and body to match. A reviewer reading the description before the diff
+should not be confused by stale framing.
 
-   ```bash
-   gh issue comment N --body "$(cat <<'EOF'
-   Comment text here — no escaping needed.
-   EOF
-   )"
-   ```
+Use the GitHub API to update:
 
-**General rule:** When a `gh` command argument contains `$` or `!`, use either
-a temp file (`-F field=@file`) or a heredoc with a quoted delimiter (`<<'EOF'`).
+```bash
+gh api repos/{owner}/{repo}/pulls/{number} -X PATCH \
+  -f title="new title" -F body=@/tmp/updated-body.md
+```
 
 ## Atomic PRs
 

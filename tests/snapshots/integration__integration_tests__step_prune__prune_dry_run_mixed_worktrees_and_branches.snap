@@ -31,7 +31,7 @@ info:
     WORKTRUNK_SYSTEM_CONFIG_PATH: "[TEST_SYSTEM_CONFIG]"
     WORKTRUNK_TEST_CLAUDE_INSTALLED: "0"
     WORKTRUNK_TEST_DELAYED_STREAM_MS: "-1"
-    WORKTRUNK_TEST_EPOCH: "1735776000"
+    WORKTRUNK_TEST_EPOCH: "1893456000"
     WORKTRUNK_TEST_NUSHELL_ENV: "0"
     WORKTRUNK_TEST_POWERSHELL_ENV: "0"
     WORKTRUNK_TEST_SKIP_URL_HEALTH_CHECK: "1"
@@ -42,4 +42,7 @@ exit_code: 0
 ----- stdout -----
 
 ----- stderr -----
-[2m○[22m Skipped young-branch (younger than 1h)
+[2m○[22m [1mmerged-a[22m — same commit as main
+[2m○[22m [1mmerged-b[22m — same commit as main
+[2m○[22m [1morphan-integrated[22m (branch only) — same commit as main
+[2m↳[22m [2m2 worktrees (with branches), 1 branch would be removed (dry run)[22m
