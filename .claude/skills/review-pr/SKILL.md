@@ -359,6 +359,9 @@ description: new text here
 
 If you stayed silent (self-authored PR, no concerns) → **done, stop here.**
 
+If you posted a COMMENT (concerns without approving) → **done, stop here.**
+There is no approval to dismiss on CI failure, so monitoring adds no value.
+
 After approving, monitor CI using the poll approach from `/running-in-ci`.
 Exclude the current workflow's own check to avoid a circular wait:
 
