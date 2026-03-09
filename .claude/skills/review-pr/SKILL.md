@@ -380,14 +380,32 @@ gh pr view <number> --json statusCheckRollup \
 ```
 
 - **All checks passed** → done, no further action.
-- **A check failed** → if it's a flaky test or unrelated infrastructure
-  failure, no action needed. If the failure is related to the PR changes:
-  1. Investigate the failure and post a follow-up review (COMMENT) with
-     analysis, inline suggestions, and an offer to fix. Same rules as
-     step 4 — no repeated points from previous reviews. **Post the analysis
-     first** — if the session times out before dismissing, a stale approval
-     (contradicted by red CI) is better than a bare dismissal with no context.
-  2. Dismiss the bot's approval if one exists. Use a short dismiss message
+- **A check failed** → investigate before characterizing. **Never call a
+  failure "flaky", "transient", or "unrelated" without evidence.** Before
+  dismissing any non-codecov failure, check main branch CI:
+  ```bash
+  gh api "repos/$REPO/actions/runs?branch=main&status=completed&per_page=5" \
+    --jq '[.workflow_runs[] | {name: .name, conclusion: .conclusion}]'
+  ```
+  If the same check fails on main, it's pre-existing. If not, assume the PR
+  caused it until proven otherwise.
+
+  If the failure is genuinely unrelated (verified above), no action needed.
+  If the failure is related to the PR changes:
+  1. Before posting a CI failure comment, check for an existing one to avoid
+     duplicates (the dismiss-and-recomment flow can cause double posts):
+     ```bash
+     EXISTING_CI_COMMENT=$(gh api "repos/$REPO/pulls/<number>/reviews" \
+       --jq "[.[] | select(.user.login == \"$BOT_LOGIN\" and .commit_id == \"$HEAD_SHA\" and .state == \"COMMENTED\")] | last | .submitted_at // empty")
+     ```
+     If `EXISTING_CI_COMMENT` is non-empty, the comment is already posted —
+     skip to the dismiss step.
+  2. Post a follow-up review (COMMENT) with analysis, inline suggestions,
+     and an offer to fix. Same rules as step 4 — no repeated points from
+     previous reviews. **Post the analysis first** — if the session times out
+     before dismissing, a stale approval (contradicted by red CI) is better
+     than a bare dismissal with no context.
+  3. Dismiss the bot's approval if one exists. Use a short dismiss message
      summarizing the CI failure (e.g., "CI failed — snapshot tests need
      updating"). The GitHub API rejects empty dismiss messages, so always
      provide one. Skip if already dismissed — redundant dismissals create
