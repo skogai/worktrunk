@@ -238,12 +238,20 @@ with empty body) or stay silent.
 Decide how confident you are in the change:
 
 ```bash
-PR_AUTHOR=$(gh pr view <number> --json author --jq '.author.login')
+PR_AUTHOR=$(gh pr view <number> --json author,isCrossRepository \
+  --jq '{author: .author.login, isFork: .isCrossRepository}')
 ```
 
 **Self-authored PRs:** If `PR_AUTHOR == BOT_LOGIN`, you cannot approve — GitHub
 rejects self-approvals. Submit as COMMENT when there are concerns, or stay
 silent if there are none.
+
+**Cross-repository (fork) PRs:** If `isCrossRepository` is true, **defer
+approval until after CI passes** (step 5). GitHub's dismiss API returns 404 on
+fork PRs, so the bot cannot undo an approval if CI fails. By waiting for green
+CI before approving, there is no stale-approval window. During step 4, post a
+COMMENT review with any feedback (or stay silent if none). The actual approval
+happens in step 5 after CI passes.
 
 - **Confident** (small, mechanical, well-tested): Approve.
 - **Moderately confident** (non-trivial but looks correct): Approve.
@@ -359,8 +367,9 @@ description: new text here
 
 If you stayed silent (self-authored PR, no concerns) → **done, stop here.**
 
-After approving, monitor CI using the poll approach from `/running-in-ci`.
-Exclude the current workflow's own check to avoid a circular wait:
+After posting your review (approval or comment), monitor CI using the poll
+approach from `/running-in-ci`. Exclude the current workflow's own check to
+avoid a circular wait:
 
 ```bash
 gh pr checks <number> --required
@@ -376,7 +385,12 @@ Then verify final status:
 gh pr checks <number> --required
 ```
 
-- **All required checks passed** → done, no further action.
+- **All required checks passed:**
+  - If you already approved in step 4 → done, no further action.
+  - If you deferred approval (fork PR) → approve now:
+    ```bash
+    gh pr review <number> --approve -b ""
+    ```
 - **A check failed** → if it's a flaky test or unrelated infrastructure
   failure, no action needed. If the failure is related to the PR changes:
   1. Investigate the failure and post a follow-up review (COMMENT) with
@@ -388,7 +402,9 @@ gh pr checks <number> --required
      summarizing the CI failure (e.g., "CI failed — snapshot tests need
      updating"). The GitHub API rejects empty dismiss messages, so always
      provide one. Skip if already dismissed — redundant dismissals create
-     timeline noise.
+     timeline noise. **Note:** Dismiss will fail (404) on cross-repository
+     PRs — this is expected. The deferred-approval pattern above avoids this
+     situation entirely for fork PRs.
 
 ### 6. Resolve handled suggestions
 
