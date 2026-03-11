@@ -280,6 +280,11 @@ Decreases confidence: new algorithms, concurrency, error handling changes,
 untested paths, author hasn't contributed to the affected module before,
 LLM-generated code (may duplicate existing APIs or miss design intent).
 
+**Form your own opinion independently.** Do not factor in other reviewers'
+comments or approvals when deciding whether to approve. The value of this review
+is as an uncorrelated signal — reflecting others' opinions back adds no
+information. Evaluate the code on its own merits.
+
 **LLM-generated PRs** have a high rate of
 duplicating existing internal APIs because the author lacks codebase context.
 Always run the duplication check above, and read the existing modules that the
