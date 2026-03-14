@@ -74,7 +74,8 @@ gh api "repos/$REPO/issues/<number>/comments" --paginate \
 ```
 
 **Do not repeat any point from previous reviews.** If a previous review already
-noted an issue, don't raise it again.
+noted an issue, don't raise it again. Before posting inline comments,
+cross-reference against previous bot comments — skip if same file, same point.
 
 If a conversation comment asks the bot a question (mentions `$BOT_LOGIN`,
 replies to a bot comment, or is clearly directed at the reviewer), check whether
