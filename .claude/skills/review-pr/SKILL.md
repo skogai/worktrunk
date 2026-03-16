@@ -202,8 +202,10 @@ review as a COMMENT.
 
 **Self-authored PRs** (`PR_AUTHOR == BOT_LOGIN`): Do NOT attempt
 `gh pr review --approve` — GitHub rejects self-approvals. Submit as COMMENT
-when there are concerns, or stay silent and skip to step 5. Always post CI
-failure analysis as a COMMENT, even on self-authored PRs.
+when there are concerns, or stay silent. If staying silent, **skip directly to
+step 6** (resolve threads) — do NOT monitor CI in step 5, since there is no
+approval to dismiss on failure. Always post CI failure analysis as a COMMENT,
+even on self-authored PRs.
 
 **Not confident enough to approve** (unfamiliar module, subtle logic): Add a
 `+1` reaction instead — no review needed unless there are specific observations.
@@ -281,7 +283,11 @@ array indices to object keys, which GitHub rejects.
 
 ### 5. Monitor CI
 
-After approving or staying silent, monitor CI using the approach from
+If you stayed silent on a self-authored PR (no concerns) → **done, skip to
+step 6.** There is no approval to dismiss on failure, so monitoring adds no
+value. Do NOT enter a polling loop.
+
+After approving or posting a COMMENT review, monitor CI using the approach from
 /running-in-ci.
 
 - **All required checks passed** → done.
