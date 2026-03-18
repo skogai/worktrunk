@@ -282,9 +282,11 @@ array indices to object keys, which GitHub rejects.
 ### 5. Monitor CI
 
 After approving or staying silent, monitor CI using the approach from
-/running-in-ci.
+/running-in-ci. This includes **both** the required-checks loop **and** the
+`codecov/patch` polling loop — do not skip the codecov step or replace the
+loop with a single `grep`.
 
-- **All required checks passed** → done.
+- **All required checks AND `codecov/patch` passed** → done.
 - **A check failed** and it's related to the PR → post a follow-up COMMENT
   review with analysis and inline suggestions, then dismiss the bot's approval:
   ```bash

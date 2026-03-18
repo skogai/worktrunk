@@ -85,10 +85,12 @@ exit 1
    checks complete (up to ~10 minutes). Ignore non-required checks (benchmarks).
 2. If a required check fails, diagnose with `gh run view <run-id> --log-failed`,
    fix, commit, push, repeat.
-3. After required checks pass, poll `codecov/patch` separately — it is
-   mandatory despite being marked non-required. Use a polling loop (up to
-   ~5 minutes) since codecov often reports after the required checks finish:
+3. **CRITICAL: Poll `codecov/patch` in a loop — NEVER do a single check.**
+   `codecov/patch` is mandatory despite being marked non-required. It often
+   reports minutes after required checks finish. A single `grep 'codecov'` call
+   is **not sufficient** — you MUST use the polling loop below (up to ~5 min):
    ```bash
+   # Run with Bash tool's run_in_background: true
    for i in $(seq 1 5); do
      CODECOV=$(gh pr checks <number> 2>&1 | grep 'codecov/patch' || true)
      if echo "$CODECOV" | grep -q 'pass'; then
@@ -100,6 +102,11 @@ exit 1
    done
    echo "codecov/patch not reported after 5 minutes"
    exit 1
+   ```
+   **Anti-pattern** (do NOT do this):
+   ```bash
+   # BAD — single check, wrong grep pattern, misses late-reporting codecov
+   gh pr checks <number> 2>&1 | grep 'codecov'
    ```
    If it fails, investigate with `task coverage` and
    `cargo llvm-cov report --show-missing-lines | grep <file>`.
