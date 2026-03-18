@@ -29,6 +29,11 @@ gh issue view <number> --json title,body,comments,state
 Read the triggering comment, the PR/issue description, the diff (for PRs), and
 recent comments to understand the full conversation before taking action.
 
+When the repo owner pushes back on a PR you authored and the direction is clear,
+make the change in this session rather than just posting an acknowledgment. Each
+CI run is independent — if you only comment "good point, I'll fix that", a
+separate run must be triggered to do the actual work.
+
 ## Security
 
 NEVER run commands that could expose secrets (`env`, `printenv`, `set`,
@@ -268,6 +273,19 @@ log lines, file paths, commit SHAs. Trace causation — if two things co-occur,
 find the mechanism rather than saying "this may be related." Never claim a
 failure is "pre-existing" without checking main branch CI history. Distinguish
 what you verified from what you inferred.
+
+**Self-consistency:** Before posting an opinion or recommendation, read your own
+prior comments on the thread. If your new response contradicts something you
+said earlier, explicitly acknowledge the change and explain what new evidence
+changed your position. Never post a recommendation that silently reverses a
+prior one — readers see both comments and will lose trust.
+
+**Research before recommending:** Don't jump to strong recommendations (e.g.,
+"revert this PR") based on a single data point. When the question involves
+multiple interacting systems (e.g., GitHub secret masking + action warnings),
+research all relevant mechanisms before concluding. A hedged observation ("this
+warning suggests risk, but I haven't verified the masking behavior") is better
+than a premature recommendation you'll reverse later.
 
 ## Tone
 
