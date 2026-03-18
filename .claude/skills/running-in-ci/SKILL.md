@@ -63,10 +63,12 @@ post code inline.
 
 After pushing, wait for CI before reporting completion.
 
-**Use `run_in_background: true`** for the polling loop so it does not block the
-session. When the background task completes you will be notified — check the
-result and take any follow-up action (dismiss approval, post analysis) at that
-point.
+**CRITICAL: Use `run_in_background: true`** for the polling loop so it does not
+block the session. **NEVER** use sequential `sleep N && gh pr checks` calls —
+this wastes tool calls and session time. Put the entire polling loop in a single
+Bash call with `run_in_background: true`. When the background task completes you
+will be notified — check the result and take any follow-up action (dismiss
+approval, post analysis) at that point.
 
 ```bash
 # Run with Bash tool's run_in_background: true
