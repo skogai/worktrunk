@@ -390,6 +390,17 @@ impl RepositoryCliExt for Repository {
     }
 }
 
+/// Check if the current worktree is the primary worktree (should not be removed).
+///
+/// Returns true for the main worktree in normal repos and the default branch
+/// worktree in bare repos. Used by `wt merge` to skip removal silently, and
+/// by `prepare_worktree_removal` Phase 2 (which errors instead of skipping).
+pub(crate) fn is_primary_worktree(repo: &Repository) -> anyhow::Result<bool> {
+    let current_root = repo.current_worktree().root()?;
+    let primary = repo.primary_worktree()?;
+    Ok(primary.as_deref() == Some(current_root.as_path()))
+}
+
 /// Compute integration reason for branch deletion.
 ///
 /// Returns `None` if:
@@ -400,7 +411,7 @@ impl RepositoryCliExt for Repository {
 ///
 /// Note: Integration is computed even for `Keep` mode so we can inform the user
 /// if the flag had an effect (branch was integrated) or not (branch was unmerged).
-fn compute_integration_reason(
+pub(crate) fn compute_integration_reason(
     repo: &Repository,
     branch_name: Option<&str>,
     target_branch: Option<&str>,
@@ -421,7 +432,7 @@ fn compute_integration_reason(
 ///
 /// The default branch is the integration target — checking it against itself is
 /// tautological (same logic as `wt list`'s `is_main` guard in `check_integration_state`).
-fn check_not_default_branch(
+pub(crate) fn check_not_default_branch(
     repo: &Repository,
     branch: &str,
     deletion_mode: &BranchDeletionMode,
