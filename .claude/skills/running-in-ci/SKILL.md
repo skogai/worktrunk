@@ -103,6 +103,11 @@ exit 1
    ```
    If it fails, investigate with `task coverage` and
    `cargo llvm-cov report --show-missing-lines | grep <file>`.
+   If it doesn't report within 5 minutes, do **not** assume it won't run —
+   codecov often takes 10+ minutes on code-changing PRs. Post a PR comment
+   warning that codecov hasn't reported yet and the PR should not be merged
+   until it does. Never conclude "codecov may not run" on a PR that changes
+   source code.
 4. Report completion only after all required checks **and** `codecov/patch` pass.
 
 Never report "done" before CI passes — CI runs on Linux, Windows, and macOS.
