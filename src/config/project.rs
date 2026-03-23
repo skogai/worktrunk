@@ -140,9 +140,26 @@ impl ProjectConfig {
             .map_err(|e| ConfigError::Message(format!("Failed to get worktree root: {}", e)))?;
         let config_path = repo_root.join(".config").join("wt.toml");
 
-        if !config_path.exists() {
+        // For bare repos, if the current location doesn't have a config file,
+        // fall back to the primary worktree (default branch worktree). This
+        // handles the common case where the user runs commands from the bare
+        // repo root but the config lives in the primary worktree (#1691).
+        let config_path = if config_path.exists() {
+            config_path
+        } else if repo.is_bare().unwrap_or(false) {
+            let primary = repo
+                .primary_worktree()
+                .ok()
+                .flatten()
+                .map(|p| p.join(".config").join("wt.toml"))
+                .filter(|p| p.exists());
+            match primary {
+                Some(path) => path,
+                None => return Ok(None),
+            }
+        } else {
             return Ok(None);
-        }
+        };
 
         // Load directly with toml crate to preserve insertion order (with preserve_order feature)
         let contents = std::fs::read_to_string(&config_path)
