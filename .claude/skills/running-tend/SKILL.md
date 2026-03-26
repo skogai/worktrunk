@@ -60,40 +60,24 @@ If surrounding lines also need updating, note that in your reply.
 
 When a bug may already be fixed, ask the reporter: `wt --version`
 
-### Feature requests addressable with aliases
+### Suggesting Aliases for Feature Requests
 
-When triaging a feature request, check whether the requested behavior can be
-composed from existing commands using a `wt step` alias or a shell
-function/alias. Worktrunk intentionally keeps its flag surface small — aliases
-let users test workflows before features are added natively.
+When a feature request can be addressed with a shell alias or `wt step` alias,
+compose and test one before responding. This lets users try workflows
+immediately rather than waiting for a native flag.
 
-If the feature can be addressed with an alias:
+**When to suggest an alias:**
+- The request is for a behavioral variant of an existing command (e.g.,
+  idempotent create-or-switch, auto-push after merge)
+- The behavior can be composed from existing `wt` commands
+- A shell one-liner or `wt step` alias covers the use case
 
-1. **Draft the alias** — Write a `wt step` alias (in `[aliases]` config) or
-   shell function that achieves the requested behavior.
-2. **Test it** — Set up a temporary repo, configure the alias, and verify it
-   works for both the happy path and edge cases (e.g., branch exists vs.
-   doesn't exist).
-3. **Post the alias in your comment** — Include both the config snippet and
-   usage example. Link to the [aliases documentation](https://worktrunk.dev/step/#aliases)
-   so the user can learn more.
-4. **Mention the shell alternative** — A shell function is often more ergonomic
-   for commands that need positional arguments (aliases use `--var name=value`).
-
-Example comment structure:
-
-> This can be done today with a `wt step` alias. Add to `~/.config/worktrunk/config.toml`:
->
-> ```toml
-> [aliases]
-> sw = "wt switch -c {{ name }} 2>/dev/null || wt switch {{ name }}"
-> ```
->
-> Then: `wt step sw --var name=my-branch`
->
-> Or as a shell function: `wts() { wt switch -c "$1" 2>/dev/null || wt switch "$1"; }`
->
-> See [Aliases](https://worktrunk.dev/step/#aliases) for more details.
+**How to respond:**
+1. Draft the alias (shell function or `wt step` alias, whichever fits better)
+2. Test it in a scratch repo — verify it works for both the happy path and the
+   fallback case
+3. Post the tested alias in the issue with usage examples
+4. Link to the [aliases docs](https://worktrunk.dev/step/#aliases) for context
 
 ## Per-Workflow References
 
