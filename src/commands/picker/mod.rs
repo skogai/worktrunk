@@ -27,12 +27,14 @@ use super::branch_deletion::delete_branch_if_safe;
 use super::handle_switch::{
     approve_switch_hooks, run_pre_switch_hooks, spawn_switch_background_hooks, switch_extra_vars,
 };
+use super::hooks::{HookFailureStrategy, execute_hook, spawn_background_hooks};
 use super::list::collect;
 use super::repository_ext::{RemoveTarget, RepositoryCliExt};
 use super::worktree::{
     BranchDeletionMode, RemoveResult, SwitchBranchInfo, SwitchResult, execute_removal,
     execute_switch, offer_bare_repo_worktree_path_fix, path_mismatch, plan_switch,
 };
+use crate::commands::command_executor::CommandContext;
 use crate::output::handle_switch_output;
 
 use items::{HeaderSkimItem, PreviewCache, WorktreeSkimItem};
@@ -66,7 +68,12 @@ struct PickerCollector {
 }
 
 impl PickerCollector {
-    /// Execute removal silently: worktree + branch, or branch-only.
+    /// Execute removal in background: pre-remove hooks + worktree + branch + post-remove hooks.
+    ///
+    /// Called from a background thread after the picker optimistically removes the item
+    /// from the list. The entire operation runs off skim's event loop so the TUI stays
+    /// responsive. If pre-remove hooks fail, the removal is aborted (but the item is
+    /// already gone from the picker — a tradeoff until we can show in-progress state).
     ///
     /// `repo` is only used for `BranchOnly` deletion. `RemovedWorktree` constructs
     /// its own from `main_path` (which may differ from the picker's startup repo in
@@ -80,9 +87,37 @@ impl PickerCollector {
                 deletion_mode,
                 target_branch,
                 force_worktree,
+                removed_commit,
                 ..
             } => {
                 let repo = Repository::at(main_path)?;
+                let config = repo.user_config();
+                let hook_branch = branch_name.as_deref().unwrap_or("HEAD");
+
+                // Run pre-remove hooks (synchronously in this background thread).
+                // Non-zero exit aborts the removal, matching `wt remove` semantics.
+                let target_ref = repo
+                    .worktree_at(main_path)
+                    .branch()
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let target_path_str = worktrunk::path::to_posix_path(&main_path.to_string_lossy());
+                let extra_vars: Vec<(&str, &str)> = vec![
+                    ("target", &target_ref),
+                    ("target_worktree_path", &target_path_str),
+                ];
+                let pre_ctx =
+                    CommandContext::new(&repo, config, Some(hook_branch), worktree_path, false);
+                execute_hook(
+                    &pre_ctx,
+                    worktrunk::HookType::PreRemove,
+                    &extra_vars,
+                    HookFailureStrategy::FailFast,
+                    None,
+                    None, // no display path in TUI context
+                )?;
+
                 let output = execute_removal(
                     &repo,
                     worktree_path,
@@ -93,6 +128,19 @@ impl PickerCollector {
                 )?;
                 if let Some(staged) = output.staged_path {
                     let _ = std::fs::remove_dir_all(&staged);
+                }
+
+                // Spawn post-remove hooks in background (log to files, no terminal output).
+                let post_ctx =
+                    CommandContext::new(&repo, config, Some(hook_branch), main_path, false);
+                let post_hooks = post_ctx.prepare_post_remove_commands(
+                    hook_branch,
+                    worktree_path,
+                    removed_commit.as_deref(),
+                    None, // no display path in TUI context
+                )?;
+                if !post_hooks.is_empty() {
+                    spawn_background_hooks(&post_ctx, post_hooks)?;
                 }
             }
             RemoveResult::BranchOnly {
