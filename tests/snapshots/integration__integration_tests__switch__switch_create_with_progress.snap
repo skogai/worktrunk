@@ -1,6 +1,5 @@
 ---
 source: tests/integration_tests/switch.rs
-assertion_line: 74
 info:
   program: wt
   args:
