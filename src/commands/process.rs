@@ -196,15 +196,15 @@ fn posix_command_separator(command: &str) -> &'static str {
 ///
 /// # Returns
 /// Path to the log file where output is being written
-pub fn spawn_detached(
+/// Create the log directory and file for a detached process.
+///
+/// Returns `(log_path, log_file)`. Shared by `spawn_detached` and
+/// `spawn_detached_exec`.
+fn create_detach_log(
     repo: &Repository,
-    worktree_path: &Path,
-    command: &str,
     branch: &str,
     hook_log: &HookLog,
-    context_json: Option<&str>,
-) -> anyhow::Result<std::path::PathBuf> {
-    // Create log directory in the common git directory
+) -> anyhow::Result<(PathBuf, fs::File)> {
     let log_dir = repo.wt_logs_dir();
     fs::create_dir_all(&log_dir).with_context(|| {
         format!(
@@ -213,16 +213,26 @@ pub fn spawn_detached(
         )
     })?;
 
-    // Generate log path using the HookLog specification
     let log_path = hook_log.path(&log_dir, branch);
-
-    // Create log file
     let log_file = fs::File::create(&log_path).with_context(|| {
         format!(
             "Failed to create log file {}",
             format_path_for_display(&log_path)
         )
     })?;
+
+    Ok((log_path, log_file))
+}
+
+pub fn spawn_detached(
+    repo: &Repository,
+    worktree_path: &Path,
+    command: &str,
+    branch: &str,
+    hook_log: &HookLog,
+    context_json: Option<&str>,
+) -> anyhow::Result<std::path::PathBuf> {
+    let (log_path, log_file) = create_detach_log(repo, branch, hook_log)?;
 
     log::debug!(
         "$ {} (detached, logging to {})",
@@ -394,21 +404,7 @@ pub fn spawn_detached_exec(
     hook_log: &HookLog,
     stdin_bytes: &[u8],
 ) -> anyhow::Result<std::path::PathBuf> {
-    let log_dir = repo.wt_logs_dir();
-    fs::create_dir_all(&log_dir).with_context(|| {
-        format!(
-            "Failed to create log directory {}",
-            format_path_for_display(&log_dir)
-        )
-    })?;
-
-    let log_path = hook_log.path(&log_dir, branch);
-    let log_file = fs::File::create(&log_path).with_context(|| {
-        format!(
-            "Failed to create log file {}",
-            format_path_for_display(&log_path)
-        )
-    })?;
+    let (log_path, log_file) = create_detach_log(repo, branch, hook_log)?;
 
     log::debug!(
         "$ {} {} (detached, logging to {})",
