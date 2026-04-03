@@ -15,32 +15,7 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use wt_perf::{RepoConfig, run_git, setup_fake_remote};
-
-fn release_binary() -> &'static Path {
-    Path::new(env!("CARGO_BIN_EXE_wt"))
-}
-
-/// Isolate a command from host environment (mirrors test configure_cli_command).
-fn isolate_cmd(cmd: &mut Command, user_config_path: &Path) {
-    // Remove host GIT_* and WORKTRUNK_* vars
-    for (key, _) in std::env::vars() {
-        if key.starts_with("GIT_") || key.starts_with("WORKTRUNK_") {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.env_remove("NO_COLOR");
-    cmd.env("WORKTRUNK_CONFIG_PATH", user_config_path);
-    cmd.env(
-        "WORKTRUNK_SYSTEM_CONFIG_PATH",
-        "/nonexistent/bench/system-config.toml",
-    );
-    cmd.env(
-        "WORKTRUNK_APPROVALS_PATH",
-        "/nonexistent/bench/approvals.toml",
-    );
-    cmd.env_remove("SHELL");
-}
+use wt_perf::{RepoConfig, isolate_cmd, run_git, run_git_ok, setup_fake_remote};
 
 /// Create a benchmark repo at a specific path with optional hooks.
 fn create_bench_repo(base_path: &Path, with_hooks: bool) -> PathBuf {
@@ -84,10 +59,10 @@ fn recreate_worktree(repo_path: &Path) {
         let _ = std::fs::remove_dir_all(&trash_dir);
     }
 
-    // Prune stale worktree metadata
+    // Prune stale worktree metadata (best-effort)
     let _ = run_git_ok(repo_path, &["worktree", "prune"]);
 
-    // Delete branch if it exists (may or may not have been deleted by removal)
+    // Delete branch if it exists (may already be deleted by removal)
     let _ = run_git_ok(repo_path, &["branch", "-D", "feature-wt-1"]);
 
     // Recreate branch + worktree
@@ -104,21 +79,9 @@ fn recreate_worktree(repo_path: &Path) {
     );
 }
 
-/// Run git, returning true if successful.
-fn run_git_ok(path: &Path, args: &[&str]) -> bool {
-    use worktrunk::shell_exec::Cmd;
-    Cmd::new("git")
-        .args(args.iter().copied())
-        .current_dir(path)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .run()
-        .is_ok_and(|o| o.status.success())
-}
-
 fn bench_remove_e2e(c: &mut Criterion) {
     let mut group = c.benchmark_group("remove_e2e");
-    let binary = release_binary();
+    let binary = Path::new(env!("CARGO_BIN_EXE_wt"));
 
     // Persistent temp dirs (kept alive for the benchmark group)
     let temp_no_hooks = tempfile::tempdir().unwrap();
@@ -151,7 +114,7 @@ fn bench_remove_e2e(c: &mut Criterion) {
             let mut cmd = Command::new(binary);
             cmd.args(["remove", "--yes", "--no-verify", "--force", "feature-wt-1"]);
             cmd.current_dir(&repo_no_hooks);
-            isolate_cmd(&mut cmd, &user_config_no_hooks);
+            isolate_cmd(&mut cmd, Some(&user_config_no_hooks));
             cmd.env("WORKTRUNK_FIRST_OUTPUT", "1");
             let output = cmd.output().unwrap();
             assert!(
@@ -171,7 +134,7 @@ fn bench_remove_e2e(c: &mut Criterion) {
                 let mut cmd = Command::new(binary);
                 cmd.args(["remove", "--yes", "--no-verify", "--force"]);
                 cmd.current_dir(&wt_path);
-                isolate_cmd(&mut cmd, &user_config_no_hooks);
+                isolate_cmd(&mut cmd, Some(&user_config_no_hooks));
                 let output = cmd.output().unwrap();
                 assert!(
                     output.status.success(),
@@ -192,7 +155,7 @@ fn bench_remove_e2e(c: &mut Criterion) {
                 let mut cmd = Command::new(binary);
                 cmd.args(["remove", "--yes", "--force"]);
                 cmd.current_dir(&wt_path);
-                isolate_cmd(&mut cmd, &user_config_with_hooks);
+                isolate_cmd(&mut cmd, Some(&user_config_with_hooks));
                 let output = cmd.output().unwrap();
                 assert!(
                     output.status.success(),
