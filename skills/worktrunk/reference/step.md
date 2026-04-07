@@ -727,7 +727,7 @@ Options:
 
 Automation:
   -y, --yes
-          Skip approval prompts
+          Skip confirmation and hook approval prompts
 
 Global Options:
   -C <path>

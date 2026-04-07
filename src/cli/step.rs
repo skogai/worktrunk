@@ -547,7 +547,7 @@ $ wt step prune
         #[arg(long)]
         dry_run: bool,
 
-        /// Skip approval prompts
+        /// Skip confirmation and hook approval prompts
         #[arg(short, long, help_heading = "Automation")]
         yes: bool,
 

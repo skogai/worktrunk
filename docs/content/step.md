@@ -688,7 +688,7 @@ Usage: <b><span class=c>wt step prune</span></b> <span class=c>[OPTIONS]</span>
 
 <b><span class=g>Automation:</span></b>
   <b><span class=c>-y</span></b>, <b><span class=c>--yes</span></b>
-          Skip approval prompts
+          Skip confirmation and hook approval prompts
 
 <b><span class=g>Global Options:</span></b>
   <b><span class=c>-C</span></b><span class=c> &lt;path&gt;</span>

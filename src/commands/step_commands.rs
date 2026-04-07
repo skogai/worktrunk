@@ -43,6 +43,7 @@ use super::hooks::{
 use super::repository_ext::{RemoveTarget, RepositoryCliExt};
 use super::worktree::BranchDeletionMode;
 use crate::output::handle_remove_output;
+use crate::output::prompt::{PromptResponse, prompt_yes_no_preview};
 
 /// Handle `wt step commit` command
 ///
@@ -1300,7 +1301,7 @@ pub fn step_prune(dry_run: bool, yes: bool, min_age: &str, foreground: bool) -> 
     ///
     /// Worktree + branch is the default pair (matching progress messages'
     /// "worktree & branch" pattern). Unpaired items listed separately.
-    fn prune_summary(candidates: &[Candidate]) -> String {
+    fn prune_summary_iter<'a>(candidates: impl Iterator<Item = &'a Candidate>) -> String {
         let mut worktree_with_branch = 0usize;
         let mut detached_worktree = 0usize;
         let mut branch_only = 0usize;
@@ -1341,6 +1342,14 @@ pub fn step_prune(dry_run: bool, yes: bool, min_age: &str, foreground: bool) -> 
             parts.push(format!("{branch_only} {noun}"));
         }
         parts.join(", ")
+    }
+
+    fn prune_summary(candidates: &[Candidate]) -> String {
+        prune_summary_iter(candidates.iter())
+    }
+
+    fn prune_summary_refs(candidates: &[&Candidate]) -> String {
+        prune_summary_iter(candidates.iter().copied())
     }
 
     // For non-dry-run, approve hooks upfront so we can remove inline.
@@ -1688,14 +1697,31 @@ pub fn step_prune(dry_run: bool, yes: bool, min_age: &str, foreground: bool) -> 
         );
     }
 
-    // Phase 2: Parallel batch removal of confirmed candidates.
+    // Confirmation prompt: show candidates and ask before removing.
     //
-    // Sort by original check order so output is deterministic when rayon
-    // happens to process items sequentially (small candidate counts). With
-    // many candidates, printed output from handle_remove_output may arrive
-    // in completion order — each eprintln! is line-atomic so messages don't
-    // interleave within a line.
+    // Without --yes, the user must confirm before any worktrees are deleted.
+    // Sort candidates first so the preview list is deterministic.
     candidates.sort_by_key(|c| c.check_idx);
+    {
+        let all: Vec<&Candidate> = candidates.iter().chain(deferred_current.iter()).collect();
+        if !yes && !all.is_empty() {
+            let summary = prune_summary_refs(&all);
+            let labels: Vec<&str> = all.iter().map(|c| c.label.as_str()).collect();
+            let prompt_text = cformat!("Remove {summary}?");
+            let labels = labels.join(", ");
+            let preview = move || {
+                eprintln!("{}", info_message(format!("Would remove: {labels}")));
+            };
+            match prompt_yes_no_preview(&prompt_text, preview)? {
+                PromptResponse::Accepted => {}
+                PromptResponse::Declined => {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    // Phase 2: Parallel batch removal of confirmed candidates.
     let mut removed: Vec<Candidate> = if candidates.is_empty() {
         Vec::new()
     } else {

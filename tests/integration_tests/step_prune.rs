@@ -52,6 +52,35 @@ fn test_prune_dry_run(mut repo: TestRepo) {
     );
 }
 
+/// Without --yes, prune prompts for confirmation and does not remove on decline.
+///
+/// When stdin is piped (empty), the prompt defaults to decline (N).
+#[rstest]
+fn test_prune_requires_confirmation(mut repo: TestRepo) {
+    repo.commit("initial");
+
+    // Create a worktree at same commit as main (integrated)
+    repo.add_worktree("merged-branch");
+
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "step",
+        &["prune", "--min-age=0s"],
+        None
+    ));
+
+    // Worktree should NOT have been removed (user declined)
+    let worktree_path = repo
+        .root_path()
+        .parent()
+        .unwrap()
+        .join("repo.merged-branch");
+    assert!(
+        worktree_path.exists(),
+        "Worktree should not be removed without confirmation"
+    );
+}
+
 /// Prune actually removes merged worktrees
 #[rstest]
 fn test_prune_removes_merged(mut repo: TestRepo) {
