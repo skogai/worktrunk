@@ -1702,21 +1702,21 @@ pub fn step_prune(dry_run: bool, yes: bool, min_age: &str, foreground: bool) -> 
     // Without --yes, the user must confirm before any worktrees are deleted.
     // Sort candidates first so the preview list is deterministic.
     candidates.sort_by_key(|c| c.check_idx);
-    {
+    if !yes {
         let all: Vec<&Candidate> = candidates.iter().chain(deferred_current.iter()).collect();
-        if !yes && !all.is_empty() {
+        if !all.is_empty() {
             let summary = prune_summary_refs(&all);
-            let labels: Vec<&str> = all.iter().map(|c| c.label.as_str()).collect();
+            let labels: String = all
+                .iter()
+                .map(|c| c.label.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
             let prompt_text = cformat!("Remove {summary}?");
-            let labels = labels.join(", ");
-            let preview = move || {
+            let response = prompt_yes_no_preview(&prompt_text, || {
                 eprintln!("{}", info_message(format!("Would remove: {labels}")));
-            };
-            match prompt_yes_no_preview(&prompt_text, preview)? {
-                PromptResponse::Accepted => {}
-                PromptResponse::Declined => {
-                    return Ok(());
-                }
+            })?;
+            if response == PromptResponse::Declined {
+                return Ok(());
             }
         }
     }
