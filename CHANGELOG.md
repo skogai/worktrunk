@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.35.1
+
+### Fixed
+
+- **PR lookup on forks respects `gh repo set-default`**: `wt switch pr:N` now checks the gh-configured default repo when origin points to a fork, instead of always querying the fork's repo (which returns 404). The error message is also context-aware based on the configured default. Fixes [#2002](https://github.com/max-sixty/worktrunk/issues/2002). ([#2004](https://github.com/max-sixty/worktrunk/pull/2004), thanks @JustinPierce for reporting)
+
+- **JSON output stability**: `config show --format=json` log file sort is now deterministic (filename tiebreaker for identical timestamps). `step for-each --format=json` includes a consistent `error` field on all failure variants. ([#2001](https://github.com/max-sixty/worktrunk/pull/2001))
+
+### Internal
+
+- Continued `TestRepo` consolidation: `bare()` constructor, `at(path)` constructor, removed lifetime guard field. ([#2000](https://github.com/max-sixty/worktrunk/pull/2000), [#2005](https://github.com/max-sixty/worktrunk/pull/2005), [#2007](https://github.com/max-sixty/worktrunk/pull/2007))
+
 ## 0.35.0
 
 ### Improved
