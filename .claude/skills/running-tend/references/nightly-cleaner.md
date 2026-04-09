@@ -1,11 +1,5 @@
 # Nightly Sweep — Worktrunk Specifics
 
-## Survey Script
-
-```bash
-.github/scripts/todays-survey-files.sh
-```
-
 ## Survey Checklist
 
 For each `.rs` file in the survey, also check:
