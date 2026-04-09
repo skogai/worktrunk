@@ -28,3 +28,9 @@ Only the repo owner (`@max-sixty`, admin) can merge to `main`.
 `CARGO_REGISTRY_TOKEN` and `AUR_SSH_PRIVATE_KEY` are in a protected GitHub
 Environment (`release`) requiring deployment approval from `@max-sixty`,
 restricted to `v*` tags.
+
+## Build environment
+
+`Swatinem/rust-cache` hashes `CARGO*` and `RUST*` env vars into the cache key.
+All workflows sharing a cache must set the same env vars, or they'll get
+different keys and miss each other's caches.
