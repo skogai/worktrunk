@@ -417,6 +417,103 @@ branches = "not-a-bool"
     });
 }
 
+/// When a WORKTRUNK_* env var override fails (e.g. a string value for a typed
+/// field), the warning must blame env vars — not the config file — and list
+/// the override vars currently set.
+#[rstest]
+fn test_list_config_env_override_bad_value_warns_on_stderr(repo: TestRepo) {
+    let settings = setup_snapshot_settings(&repo);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        repo.configure_wt_cmd(&mut cmd);
+        // `list.branches` is Option<bool>; "not-a-bool" can't coerce.
+        cmd.env("WORKTRUNK__LIST__BRANCHES", "not-a-bool");
+        cmd.arg("list").current_dir(repo.root_path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// Bad values in non-section fields (projects, skip-*-prompt) must still be
+/// attributed to the file, not to env vars. These fields are NOT caught by
+/// the OverridableConfig pre-validation (which only covers section fields) —
+/// the UserConfig fallback validation catches them.
+#[rstest]
+fn test_list_config_malformed_non_section_field_warns_on_stderr(repo: TestRepo) {
+    fs::write(
+        repo.test_config_path(),
+        "skip-shell-integration-prompt = \"not-a-bool\"\n",
+    )
+    .unwrap();
+
+    let mut settings = setup_snapshot_settings(&repo);
+    settings.add_filter(r"_PARENT_/[^\s,]*test-config\.toml", "[TEST_CONFIG]");
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        repo.configure_wt_cmd(&mut cmd);
+        cmd.arg("list").current_dir(repo.root_path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// Validation errors (e.g. empty worktree-path) are neither file parse
+/// errors nor env-var errors — they fire after successful deserialization.
+#[rstest]
+fn test_list_config_validation_error_warns_on_stderr(repo: TestRepo) {
+    fs::write(repo.test_config_path(), "worktree-path = \"\"\n").unwrap();
+
+    let settings = setup_snapshot_settings(&repo);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        repo.configure_wt_cmd(&mut cmd);
+        cmd.arg("list").current_dir(repo.root_path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// System config with a section-field error (caught by OverridableConfig).
+#[rstest]
+fn test_list_config_malformed_system_config_warns_on_stderr(repo: TestRepo) {
+    let system_config = repo.root_path().join("system-config.toml");
+    fs::write(&system_config, "[list]\nbranches = \"not-a-bool\"\n").unwrap();
+
+    let mut settings = setup_snapshot_settings(&repo);
+    settings.add_filter(r"_REPO_/system-config\.toml", "[TEST_SYSTEM_CONFIG_FILE]");
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        repo.configure_wt_cmd(&mut cmd);
+        cmd.env("WORKTRUNK_SYSTEM_CONFIG_PATH", &system_config);
+        cmd.arg("list").current_dir(repo.root_path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// System config with a non-section field error (skips OverridableConfig,
+/// caught by the UserConfig fallback validation).
+#[rstest]
+fn test_list_config_malformed_system_config_non_section_field(repo: TestRepo) {
+    let system_config = repo.root_path().join("system-config.toml");
+    fs::write(
+        &system_config,
+        "skip-shell-integration-prompt = \"not-a-bool\"\n",
+    )
+    .unwrap();
+
+    let mut settings = setup_snapshot_settings(&repo);
+    settings.add_filter(r"_REPO_/system-config\.toml", "[TEST_SYSTEM_CONFIG_FILE]");
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        repo.configure_wt_cmd(&mut cmd);
+        cmd.env("WORKTRUNK_SYSTEM_CONFIG_PATH", &system_config);
+        cmd.arg("list").current_dir(repo.root_path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
 /// Test that --full disables the task timeout.
 #[rstest]
 fn test_list_config_timeout_disabled_with_full(repo: TestRepo) {
