@@ -667,8 +667,15 @@ pub fn collect(
             format!("Showing {} worktree{}", num_worktrees, plural)
         };
 
-    // Create progressive table if showing progress
+    // Create progressive table if showing progress.
+    //
+    // Skeleton renders with `PLACEHOLDER_BLANK` (space) so commands that finish
+    // under ~200ms never flash the `·` loading indicator. After
+    // `PLACEHOLDER_REVEAL_DELAY` the placeholder is promoted to `·` via the
+    // drain tick below.
     let mut progressive_table = if show_progress {
+        layout.placeholder.set(super::render::PLACEHOLDER_BLANK);
+
         let dim = Style::new().dimmed();
 
         // Build skeleton rows for both worktrees and branches
@@ -693,6 +700,19 @@ pub fn collect(
     } else {
         None
     };
+
+    /// Delay before the `·` loading indicator replaces blank placeholders.
+    /// Tuned so commands that finish promptly never flash the dots.
+    /// Overridable at runtime via `WORKTRUNK_PLACEHOLDER_REVEAL_MS` (milliseconds)
+    /// for interactive testing — useful to inflate the delay high enough to see
+    /// the reveal visually (e.g. `WORKTRUNK_PLACEHOLDER_REVEAL_MS=2000 wt list`).
+    const PLACEHOLDER_REVEAL_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+    let reveal_delay = std::env::var("WORKTRUNK_PLACEHOLDER_REVEAL_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(PLACEHOLDER_REVEAL_DELAY);
+    let placeholder_reveal_at = std::time::Instant::now() + reveal_delay;
 
     // Early exit for benchmarking skeleton render time / time-to-first-output
     if std::env::var_os("WORKTRUNK_SKELETON_ONLY").is_some()
@@ -774,9 +794,6 @@ pub fn collect(
 
     // Note: URL template expansion is deferred to task spawning (in collect_worktree_progressive
     // and collect_branch_progressive). This parallelizes the work and minimizes time-to-skeleton.
-
-    // Cache last rendered (unclamped) message per row to avoid redundant updates.
-    let mut last_rendered_lines: Vec<String> = vec![String::new(); all_items.len()];
 
     // Create channel for task results
     let (tx, rx) = chan::unbounded::<Result<TaskResult, TaskError>>();
@@ -861,14 +878,60 @@ pub fn collect(
     // Drop the original sender so drain_results knows when all spawned threads are done
     drop(tx);
 
-    // Track completed results for footer progress
-    let mut completed_results = 0;
-    let mut progress_overflow = false;
-    let mut first_result_traced = false;
+    // Drain task results with conditional progressive rendering.
+    //
+    // Progressive mutable state (table, row cache, counters) is owned by a
+    // `RefCell` so the `on_result` callback and the one-shot 200ms tick can
+    // both mutate it. They never run concurrently — the tick fires between
+    // channel recvs — so the runtime borrow checks are an invariant formalism,
+    // never a source of panics.
+    struct ProgressiveState {
+        table: ProgressiveTable,
+        last_rendered_lines: Vec<String>,
+        completed_results: usize,
+        progress_overflow: bool,
+        first_result_traced: bool,
+    }
 
-    // Drain task results with conditional progressive rendering
+    let n_items = all_items.len();
+    let progressive_state = progressive_table.take().map(|table| {
+        std::cell::RefCell::new(ProgressiveState {
+            table,
+            last_rendered_lines: vec![String::new(); n_items],
+            completed_results: 0,
+            progress_overflow: false,
+            first_result_traced: false,
+        })
+    });
+
     let drain_deadline =
         collect_deadline.unwrap_or_else(|| std::time::Instant::now() + results::DRAIN_TIMEOUT);
+
+    // Tick closure: at T+200ms, promote placeholder from blank to `·` and
+    // re-render every row so still-pending cells pick up the dot. Rows that
+    // have already received a result use `format_list_item_line`; untouched
+    // rows use `render_skeleton_row` (which avoids surfacing seeded defaults
+    // like "55y" for skipped tasks).
+    let tick_entry: Option<results::DrainTick<'_>> = progressive_state.as_ref().map(|state_cell| {
+        let f: results::DrainTickFn<'_> = Box::new(|items: &mut [ListItem]| {
+            layout.placeholder.set(super::render::PLACEHOLDER);
+            let mut s = state_cell.borrow_mut();
+            for (idx, item) in items.iter().enumerate() {
+                let rendered = if s.last_rendered_lines[idx].is_empty() {
+                    layout.render_skeleton_row(item).render()
+                } else {
+                    layout.format_list_item_line(item)
+                };
+                if rendered != s.last_rendered_lines[idx] {
+                    s.last_rendered_lines[idx] = rendered.clone();
+                    s.table.update_row(idx, rendered);
+                }
+            }
+            let _ = s.table.flush();
+        });
+        (placeholder_reveal_at, f)
+    });
+
     let drain_outcome = drain_results(
         rx,
         &mut all_items,
@@ -877,54 +940,61 @@ pub fn collect(
         drain_deadline,
         integration_target.as_deref(),
         |item_idx, item| {
-            // Trace first result arrival
-            if !first_result_traced {
-                first_result_traced = true;
+            let Some(state_cell) = progressive_state.as_ref() else {
+                return;
+            };
+            let mut s = state_cell.borrow_mut();
+
+            if !s.first_result_traced {
+                s.first_result_traced = true;
                 worktrunk::shell_exec::trace_instant("First result received");
             }
 
-            // Progressive mode only: update UI. `status_symbols` is set by
-            // `drain_results` itself (once all status-feeding tasks for this
-            // item have arrived successfully); here we only re-render.
-            if let Some(ref mut table) = progressive_table {
-                let dim = Style::new().dimmed();
+            let dim = Style::new().dimmed();
+            s.completed_results += 1;
+            let total_results = expected_results.count();
 
-                completed_results += 1;
-                let total_results = expected_results.count();
-
-                // Catch counting bugs: completed should never exceed expected
-                debug_assert!(
-                    completed_results <= total_results,
-                    "completed ({completed_results}) > expected ({total_results}): \
-                     task result sent without registering expectation"
-                );
-                if completed_results > total_results {
-                    progress_overflow = true;
-                }
-
-                // Update footer progress
-                let footer_msg = format!(
-                    "{INFO_SYMBOL} {dim}{footer_base} ({completed_results}/{total_results} loaded){dim:#}"
-                );
-                table.update_footer(footer_msg);
-
-                // Re-render the row with caching (now includes status if computed)
-                let rendered = layout.format_list_item_line(item);
-
-                // Compare using full line so changes beyond the clamp (e.g., CI) still refresh.
-                if rendered != last_rendered_lines[item_idx] {
-                    last_rendered_lines[item_idx] = rendered.clone();
-                    table.update_row(item_idx, rendered);
-                }
-
-                // Flush updates to terminal
-                if let Err(e) = table.flush() {
-                    log::debug!("Progressive table flush failed: {}", e);
-                }
+            debug_assert!(
+                s.completed_results <= total_results,
+                "completed ({}) > expected ({}): task result sent without registering expectation",
+                s.completed_results,
+                total_results
+            );
+            if s.completed_results > total_results {
+                s.progress_overflow = true;
             }
+
+            let completed = s.completed_results;
+            let footer_msg = format!(
+                "{INFO_SYMBOL} {dim}{footer_base} ({completed}/{total_results} loaded){dim:#}"
+            );
+            s.table.update_footer(footer_msg);
+
+            let rendered = layout.format_list_item_line(item);
+            if rendered != s.last_rendered_lines[item_idx] {
+                s.last_rendered_lines[item_idx] = rendered.clone();
+                s.table.update_row(item_idx, rendered);
+            }
+
+            let _ = s.table.flush();
         },
+        tick_entry,
     );
     worktrunk::shell_exec::trace_instant("All results drained");
+
+    // Extract progressive state back out. `progressive_table` is re-bound so
+    // post-drain code (finalize / error rendering) works unchanged.
+    let (progressive_table, progress_overflow) = match progressive_state {
+        Some(cell) => {
+            let s = cell.into_inner();
+            (Some(s.table), s.progress_overflow)
+        }
+        None => (None, false),
+    };
+    // Reveal the placeholder synchronously for any path where the drain
+    // finished before the tick could fire — keeps subsequent renders
+    // (including `finalize`) consistent with the post-reveal placeholder.
+    layout.placeholder.set(super::render::PLACEHOLDER);
 
     // Handle timeout if it occurred.
     // Budget-based deadlines (collect_deadline) are intentional truncation — don't warn.
@@ -1244,6 +1314,7 @@ pub fn populate_item(
         std::time::Instant::now() + results::DRAIN_TIMEOUT,
         target.as_deref(),
         |_item_idx, _item| {},
+        None,
     );
 
     // Handle timeout (silent for statusline - just log it)

@@ -24,6 +24,15 @@ use super::super::model::{ItemKind, ListItem};
 use super::execution::ExpectedResults;
 use super::types::{DrainOutcome, MissingResult, TaskError, TaskKind, TaskResult};
 
+/// Boxed one-shot tick closure. Factored out so the inferred closure can
+/// coerce to `dyn FnMut` at the `Box::new` site.
+pub(super) type DrainTickFn<'a> = Box<dyn FnMut(&mut [ListItem]) + 'a>;
+
+/// One-shot tick scheduled against [`drain_results`]. When `Instant` elapses,
+/// the boxed closure fires once with the full item slice — used by `wt list`
+/// to reveal the `·` loading indicator at T+200ms.
+pub(super) type DrainTick<'a> = (Instant, DrainTickFn<'a>);
+
 /// Drain task results from the channel and apply them to items.
 ///
 /// This is the shared logic between progressive and buffered collection modes.
@@ -41,6 +50,7 @@ use super::types::{DrainOutcome, MissingResult, TaskError, TaskKind, TaskResult}
 /// Callers decide how to handle timeout:
 /// - `collect()`: Shows user-facing diagnostic (interactive command)
 /// - `populate_item()`: Logs silently (used by statusline)
+#[allow(clippy::too_many_arguments)]
 pub(super) fn drain_results(
     rx: chan::Receiver<Result<TaskResult, TaskError>>,
     items: &mut [ListItem],
@@ -49,13 +59,29 @@ pub(super) fn drain_results(
     deadline: Instant,
     integration_target: Option<&str>,
     mut on_result: impl FnMut(usize, &mut ListItem),
+    mut tick: Option<DrainTick<'_>>,
 ) -> DrainOutcome {
     // Track which result kinds we've received per item (for timeout diagnostics)
     let mut received_by_item: Vec<Vec<TaskKind>> = vec![Vec::new(); items.len()];
 
     // Process task results as they arrive (with deadline)
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        // Fire the one-shot tick when its deadline has passed. The tick fires
+        // between channel recvs, so it never races with `on_result`.
+        if let Some((tick_at, _)) = tick.as_ref()
+            && Instant::now() >= *tick_at
+        {
+            let (_, mut tick_fn) = tick.take().unwrap();
+            tick_fn(items);
+        }
+
+        let now = Instant::now();
+        let remaining = deadline.saturating_duration_since(now);
+        // Clamp recv timeout so we wake at the tick deadline (earliest of the two).
+        let recv_timeout_dur = match tick.as_ref() {
+            Some((tick_at, _)) => remaining.min(tick_at.saturating_duration_since(now)),
+            None => remaining,
+        };
         if remaining.is_zero() {
             // Deadline exceeded - build diagnostic info showing MISSING results
             let received_count: usize = received_by_item.iter().map(|v| v.len()).sum();
@@ -100,9 +126,9 @@ pub(super) fn drain_results(
             };
         }
 
-        let outcome = match rx.recv_timeout(remaining) {
+        let outcome = match rx.recv_timeout(recv_timeout_dur) {
             Ok(outcome) => outcome,
-            Err(chan::RecvTimeoutError::Timeout) => continue, // Check deadline in next iteration
+            Err(chan::RecvTimeoutError::Timeout) => continue, // Check tick/deadline next iteration
             Err(chan::RecvTimeoutError::Disconnected) => break, // All senders dropped - done
         };
 
@@ -340,6 +366,7 @@ mod tests {
             Instant::now() + DRAIN_TIMEOUT,
             None,
             |_, _| {},
+            None,
         );
         assert!(matches!(outcome, DrainOutcome::Complete));
         assert_eq!(items[0].summary, Some(Some("Add feature".into())));
@@ -418,6 +445,7 @@ mod tests {
             Instant::now() + DRAIN_TIMEOUT,
             Some("main"),
             |_, _| {},
+            None,
         );
 
         assert!(matches!(outcome, DrainOutcome::Complete));
@@ -461,6 +489,7 @@ mod tests {
             Instant::now() + DRAIN_TIMEOUT,
             Some("main"),
             |_, _| {},
+            None,
         );
 
         assert!(matches!(outcome, DrainOutcome::Complete));
@@ -501,6 +530,7 @@ mod tests {
             Instant::now() + DRAIN_TIMEOUT,
             Some("main"),
             |_, _| {},
+            None,
         );
 
         assert!(matches!(outcome, DrainOutcome::Complete));
@@ -531,6 +561,7 @@ mod tests {
             Instant::now(),
             None,
             |_, _| {},
+            None,
         );
 
         let DrainOutcome::TimedOut {
@@ -554,5 +585,48 @@ mod tests {
                 .missing_kinds
                 .contains(&TaskKind::AheadBehind)
         );
+    }
+
+    #[test]
+    fn test_drain_results_tick_fires_when_deadline_passes() {
+        // A tick whose deadline has already elapsed should fire exactly once
+        // with a mutable view of the items, then stop (no re-fire on subsequent
+        // loop iterations). The drain loop wakes at the tick deadline even
+        // without any channel traffic, so this also exercises the
+        // recv_timeout-clamping path.
+        let (tx, rx) = crossbeam_channel::unbounded::<Result<TaskResult, TaskError>>();
+        let mut items = vec![ListItem::new_branch("abc123".into(), "feat".into())];
+        let mut errors = Vec::new();
+        let expected = ExpectedResults::default();
+
+        // Send one result so the drain exits promptly after the tick.
+        tx.send(Ok(TaskResult::SummaryGenerate {
+            item_idx: 0,
+            summary: None,
+        }))
+        .unwrap();
+        drop(tx);
+
+        let mut tick_fires = 0usize;
+        let tick_fn: DrainTickFn<'_> = Box::new(|items: &mut [ListItem]| {
+            tick_fires += 1;
+            // Mutate an item to prove we got a live mutable reference.
+            items[0].branch = Some("touched-by-tick".into());
+        });
+
+        let outcome = drain_results(
+            rx,
+            &mut items,
+            &mut errors,
+            &expected,
+            Instant::now() + DRAIN_TIMEOUT,
+            None,
+            |_, _| {},
+            Some((Instant::now(), tick_fn)),
+        );
+
+        assert!(matches!(outcome, DrainOutcome::Complete));
+        assert_eq!(tick_fires, 1, "tick should fire exactly once");
+        assert_eq!(items[0].branch.as_deref(), Some("touched-by-tick"));
     }
 }
