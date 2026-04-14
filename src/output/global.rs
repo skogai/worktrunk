@@ -607,7 +607,14 @@ pub fn pre_hook_display_path(hooks_run_at: &std::path::Path) -> Option<&std::pat
 /// }
 /// ```
 pub fn post_hook_display_path(destination: &std::path::Path) -> Option<&std::path::Path> {
-    if is_shell_integration_active() {
+    post_hook_display_path_with(destination, is_shell_integration_active())
+}
+
+fn post_hook_display_path_with(
+    destination: &std::path::Path,
+    shell_integration_active: bool,
+) -> Option<&std::path::Path> {
+    if shell_integration_active {
         None // Shell will cd user to destination
     } else {
         pre_hook_display_path(destination)
@@ -655,12 +662,12 @@ mod tests {
 
     #[test]
     fn test_post_hook_display_path_no_shell_integration() {
-        // Without shell integration, post_hook_display_path behaves like pre_hook_display_path
-        // (This test runs without WORKTRUNK_DIRECTIVE_FILE set)
+        // Without shell integration, post_hook_display_path behaves like pre_hook_display_path.
+        // Use the explicit-arg variant so the test is independent of process-wide
+        // OUTPUT_STATE, which may be pre-initialized to shell-integration-active when tests
+        // are spawned under `wt` (which inherits WORKTRUNK_DIRECTIVE_* env vars).
         let elsewhere = PathBuf::from("/some/destination");
-        let result = post_hook_display_path(&elsewhere);
-        // If cwd != elsewhere, should return Some
-        // If cwd == elsewhere (unlikely), should return None
+        let result = post_hook_display_path_with(&elsewhere, false);
         let cwd = std::env::current_dir().unwrap();
         if cwd == elsewhere {
             assert!(result.is_none());
@@ -671,13 +678,22 @@ mod tests {
 
     #[test]
     fn test_post_hook_display_path_at_cwd_no_shell_integration() {
-        // Without shell integration, if destination == cwd, no path needed
+        // Without shell integration, if destination == cwd, no path needed.
         let cwd = std::env::current_dir().unwrap();
-        let result = post_hook_display_path(&cwd);
+        let result = post_hook_display_path_with(&cwd, false);
         assert!(
             result.is_none(),
             "Should return None when destination is cwd (no shell integration)"
         );
+    }
+
+    #[test]
+    fn test_post_hook_display_path_with_shell_integration() {
+        // With shell integration active, the shell cds the user to destination,
+        // so no annotation is needed.
+        let elsewhere = PathBuf::from("/some/destination");
+        let result = post_hook_display_path_with(&elsewhere, true);
+        assert!(result.is_none());
     }
 
     #[test]

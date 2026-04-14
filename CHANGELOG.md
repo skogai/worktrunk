@@ -34,11 +34,27 @@
 
 - **Per-variable env var type resolution**: When multiple `WORKTRUNK_*` env vars target fields of different types (e.g., a numeric and a string field), each is resolved independently against the file config. Previously one incompatible var would drop every env override and the file config. ([#2111](https://github.com/max-sixty/worktrunk/pull/2111))
 
-- **Clearer deprecation warnings**: Structural deprecation warnings follow a consistent `{label}: X is deprecated in favor of Y` pattern with a single proposed-diff preview — no more redundant current-config dump. Template variable renames and the `approved-commands` removal use the same pattern. Deprecation warnings are also suppressed in non-diagnostic contexts (tab completion, picker, `wt list statusline`) to keep prompts quiet. ([#2147](https://github.com/max-sixty/worktrunk/pull/2147), [#2148](https://github.com/max-sixty/worktrunk/pull/2148), [#2153](https://github.com/max-sixty/worktrunk/pull/2153))
+- **Clearer deprecation warnings**: Structural deprecation warnings follow a consistent `{label}: X is deprecated in favor of Y` pattern with a single proposed-diff preview — no more redundant current-config dump. Template variable renames and the `approved-commands` removal use the same pattern. Every command (not just `wt config show`) now emits the same per-kind warnings, with a single dedup'd hint per process pointing to `wt config show` for details and `wt config update` to apply. Deprecation warnings are suppressed in non-diagnostic contexts (tab completion, picker, `wt list statusline`) to keep prompts quiet. ([#2147](https://github.com/max-sixty/worktrunk/pull/2147), [#2148](https://github.com/max-sixty/worktrunk/pull/2148), [#2153](https://github.com/max-sixty/worktrunk/pull/2153), [#2171](https://github.com/max-sixty/worktrunk/pull/2171))
 
-- **`wt config state logs --format=json` works without the `get` subcommand**: `--format` is now a global flag on `state logs`, `state hints`, `state ci-status`, and `state marker` — ordering no longer matters. Logs JSON entries include an absolute `path` field alongside the relative `file`. ([#2156](https://github.com/max-sixty/worktrunk/pull/2156))
+- **Structured JSON for `wt config state logs`**: `--format` is now a global flag on `state logs`, `state hints`, `state ci-status`, and `state marker` — ordering no longer matters. Logs JSON entries gain first-class `branch`, `source`, `hook_type`, `name`, `size`, `modified_at`, and absolute `path` fields alongside the existing relative `file`, so filtering works with `jq` directly. (Breaking: the `--hook` and `--branch` filters on `wt config state logs get` were removed in favor of `jq`; piping the JSON through `jq 'select(.branch == "...")'` replaces them.) ([#2156](https://github.com/max-sixty/worktrunk/pull/2156), [#2161](https://github.com/max-sixty/worktrunk/pull/2161))
 
 - **Cleaner log filenames**: Background hook log files skip the collision-avoidance hash suffix when the input is already a safe filename. `main/project/post-merge/clippy.log` instead of `main-vfz/project/post-merge/clippy-vif.log`. Names containing invalid path characters still get the hash. ([#2157](https://github.com/max-sixty/worktrunk/pull/2157))
+
+- **`wt list` stall visibility**: When `wt list` hangs for 5+ seconds, the progressive footer now names the blocked task and worktree (e.g. `○ Showing 13 worktrees (253/254 loaded, no recent progress; waiting on ci-status for feat)`), with a pending count when multiple tasks are outstanding. On full timeout, the warning joins the blocked-tasks list onto a single gutter-prefixed line: `▲ wt list timed out after 120s (151 results received); blocked tasks: …`. ([#2203](https://github.com/max-sixty/worktrunk/pull/2203), [#2205](https://github.com/max-sixty/worktrunk/pull/2205), [#2207](https://github.com/max-sixty/worktrunk/pull/2207))
+
+- **`-vv` logs full subprocess output to disk; drop `-vvv`**: Captured subprocess stdout/stderr now fan out to two log targets — a bounded preview on stderr mirrored to `.git/wt/logs/trace.log` (renamed from `verbose.log`), and the uncapped body to a new `.git/wt/logs/output.log`. Large captures (e.g. `git log -p | patch-id` during `wt list`) no longer flood stderr with elision markers and force a rerun — the full body is always on disk. Any `-v` count above 2 collapses to `-vv`. ([#2201](https://github.com/max-sixty/worktrunk/pull/2201))
+
+- **Clap-native errors for unrecognized subcommands**: `wt s` and `wt step sqush` now show clap's formatted `error: unrecognized subcommand 'X'` with typo suggestions and Usage block, rather than a custom git-style single-line message. The `#[command(external_subcommand)]` path added in 0.36.0 for `wt-<name>` dispatch is preserved. ([#2212](https://github.com/max-sixty/worktrunk/pull/2212), [#2215](https://github.com/max-sixty/worktrunk/pull/2215))
+
+- **Quieter `wt list` loading placeholders**: The `·` loading indicator no longer appears for commands that finish within 200ms — short renders never flash the dots. The Status column's loading/timeout glyph collapses from `⋯` to a dim `·`, and the working-tree gate's loading placeholder collapses from `···` to a single `·`, matching the visual weight of neighbouring gates. ([#2177](https://github.com/max-sixty/worktrunk/pull/2177), [#2181](https://github.com/max-sixty/worktrunk/pull/2181), [#2199](https://github.com/max-sixty/worktrunk/pull/2199))
+
+- **Fewer `wt list statusline` subprocesses**: Statusline rendering dropped four duplicate git subprocesses per render (`rev-parse --git-common-dir` ×2, `--show-toplevel` ×3, `--git-dir` ×2) by adding a process-wide `rev-parse --git-common-dir` cache and canonicalizing input paths in `Repository::worktree_at()`. ([#2209](https://github.com/max-sixty/worktrunk/pull/2209))
+
+- **Signals named in background pipeline errors**: Killed hook children now report which signal: `pipeline step terminated by signal 15 (SIGTERM): <step>` instead of the generic `command failed with signal`. ([#2193](https://github.com/max-sixty/worktrunk/pull/2193))
+
+- **Nested config typos surface as warnings**: Mistyped keys nested inside a known table (e.g. `[merge] squas = true`) now produce `Unknown field merge.squas` rather than going unnoticed. Built on a unified top-level + nested unknown-key analysis that also powers on-save preservation. ([#2195](https://github.com/max-sixty/worktrunk/pull/2195))
+
+- **`sanitize_hash` minijinja filter**: New template filter that wraps `sanitize_for_filename` — produces a filesystem-safe name with a 3-char hash suffix so distinct originals never collide, while already-safe inputs pass through unchanged. Useful for matching on-disk hook log filenames from `wt config state logs --format=json`. ([#2172](https://github.com/max-sixty/worktrunk/pull/2172))
 
 ### Fixed
 
@@ -54,6 +70,20 @@
 
 - **Redundant "To configure" hint for outdated shell wrappers**: When a shell's integration file exists but is stale, `wt config show` no longer prints both a specific `wt config shell install <shell>` hint and the generic "To configure" summary. The summary now appears only when a shell is genuinely not configured. ([#2152](https://github.com/max-sixty/worktrunk/pull/2152))
 
+- **Ctrl-C aborts `wt` command loops**: Signal-derived child exits (SIGINT/SIGTERM) now abort hook pipelines, alias steps, concurrent groups, and the `wt step for-each` worktree loop. Previously, wt's signal handler forwarded SIGINT/SIGTERM to the current child but wt itself survived, and `FailureStrategy::Warn` silently swallowed each interrupt — a single Ctrl-C against `wt merge` could charge through remaining hook steps. ([#2174](https://github.com/max-sixty/worktrunk/pull/2174), [#2182](https://github.com/max-sixty/worktrunk/pull/2182))
+
+- **Nested unknown config keys preserved on save**: Any unknown key nested inside a known table (e.g. `future-option = true` under `[merge]`) was silently deleted on any config save triggered by other mutations (first-run prompt, interactive path customization). Preservation is now computed recursively, so unknown keys survive at every nesting level. ([#2180](https://github.com/max-sixty/worktrunk/pull/2180))
+
+- **`wt step --help` honors `-C` and `--config`**: Help previously resolved aliases before applying global flags, so `wt -C other step --help` listed aliases from the process cwd and `--config custom.toml` was ignored. Globals are now parsed in a single early pass. ([#2176](https://github.com/max-sixty/worktrunk/pull/2176))
+
+- **`wt step --help` no longer triggers config side effects**: Rendering the alias listing in help output no longer emits deprecation warnings to stderr or writes a migration file next to the user config. ([#2179](https://github.com/max-sixty/worktrunk/pull/2179))
+
+- **`wt step <alias> --dry-run` with lazy vars**: Dry-run previously expanded every command eagerly, so pipelines that read `{{ vars.foo }}` set by an earlier step failed with an "undefined vars" error even when the non-dry-run command would succeed. Dry-run now mirrors the hook pattern: templates that reference `vars.*` are syntax-validated (catching typos like `{{ vars..foo }}`) and shown raw, while other templates expand eagerly. ([#2170](https://github.com/max-sixty/worktrunk/pull/2170))
+
+- **`wt config show` fish completions and false-negative gating**: A missing fish completions file used to print a confusing nested hint under "Already configured shell extension" and flip the generic "To configure" summary. It now prints a warning with specific remediation, mirroring the "Outdated shell extension" pattern. The "report a false negative" link is no longer gated on `!has_any_configured`, so a detector miss in one shell still offers the link when other shells are detected. ([#2163](https://github.com/max-sixty/worktrunk/pull/2163))
+
+- **Nix build meets Rust 1.93 MSRV**: `flake.lock` updated to ship a newer nixpkgs rustc. ([#2185](https://github.com/max-sixty/worktrunk/pull/2185), thanks @Lysanleo)
+
 ### Documentation
 
 - **"Extending Worktrunk" page**: Dedicated docs page collecting recipes for custom workflows via hooks and aliases, including a "move staged changes to a new worktree" recipe closing [#938](https://github.com/max-sixty/worktrunk/issues/938). ([#2079](https://github.com/max-sixty/worktrunk/pull/2079), [#2083](https://github.com/max-sixty/worktrunk/pull/2083), [#2088](https://github.com/max-sixty/worktrunk/pull/2088), [#2094](https://github.com/max-sixty/worktrunk/pull/2094))
@@ -64,6 +94,10 @@
 
 - **FAQ updates**: Qualified the "no background processes" claim; clarified coverage includes shell-integration-tests; config key location uses `git config worktrunk.*`. ([#2080](https://github.com/max-sixty/worktrunk/pull/2080), [#2086](https://github.com/max-sixty/worktrunk/pull/2086), [#2126](https://github.com/max-sixty/worktrunk/pull/2126))
 
+- **Troubleshooting: `wt list` fsmonitor hang**: Noted the interaction with core.fsmonitor daemons. ([#2194](https://github.com/max-sixty/worktrunk/pull/2194))
+
+- **README installation command formatting**: Fixed code-block formatting around installation commands. ([#2187](https://github.com/max-sixty/worktrunk/pull/2187), thanks @MahmoudMabrok)
+
 ### Internal
 
 - **Shell wrapper directive file split**: The shell integration now writes `cd` paths to a separate file from `--execute` shell payloads, with the `cd` path read literally (`cd -- "$(< file)"`, no shell parsing) and the exec file scrubbed from alias and hook child environments. Hardens against shell injection from hook/alias bodies into the parent session. The legacy single-file form is honored through 0.38; nushell users need `wt config shell install` to pick up the new wrapper. ([#2118](https://github.com/max-sixty/worktrunk/pull/2118))
@@ -73,6 +107,8 @@
 - **Centralized `[wt-trace]` emitter**: Trace records are now owned by `src/trace/emit.rs` rather than ad-hoc `log::debug!` format strings, and `-vv` log verbosity is fixed. ([#2146](https://github.com/max-sixty/worktrunk/pull/2146))
 
 - **Unified hook and alias execution paths**: Hooks and aliases share the same foreground execution, shell invocation, template expansion, and priority-spawning code. ([#2089](https://github.com/max-sixty/worktrunk/pull/2089), [#2128](https://github.com/max-sixty/worktrunk/pull/2128), [#2140](https://github.com/max-sixty/worktrunk/pull/2140), [#2095](https://github.com/max-sixty/worktrunk/pull/2095), [#2113](https://github.com/max-sixty/worktrunk/pull/2113))
+
+- **Config migration is now in-memory; no more `.new` files**: `wt config show` renders the deprecation diff from in-memory migrated content rather than writing a `.new` file next to the user's config. `wt config update` owns the sole filesystem mutation; a new `--print` flag emits migrated TOML to stdout without writing. ([#2184](https://github.com/max-sixty/worktrunk/pull/2184))
 
 ## 0.36.0
 
