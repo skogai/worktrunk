@@ -269,6 +269,38 @@ fn worktree_branch_set(worktrees: &[WorktreeInfo]) -> HashSet<&str> {
         .collect()
 }
 
+/// Progressive callback used by the picker to mirror `wt list`'s skeleton-first
+/// rendering into the skim TUI.
+///
+/// `collect()` owns the layout and re-renders each row as task results land.
+/// The handler receives pre-rendered strings so it doesn't need to share the
+/// layout across threads (`LayoutConfig` is `!Sync` via an interior
+/// `Cell<&'static str>`).
+#[cfg_attr(not(unix), allow(dead_code))]
+pub trait PickerProgressHandler: Send + Sync {
+    /// Fired once after items are initialized and layout is computed, but
+    /// before any task results arrive. `rendered` is one entry per item,
+    /// with fast fields (branch, path, head) populated and blank
+    /// placeholders for slow cells. `header` is the column-header line;
+    /// the handler calls `render()` / `plain_text()` as needed.
+    fn on_skeleton(
+        &self,
+        items: Vec<super::model::ListItem>,
+        rendered: Vec<String>,
+        header: worktrunk::styling::StyledLine,
+    );
+
+    /// Fired after a single task result updates row `idx`. `rendered` is the
+    /// new line — write it through the item's shared state so skim picks it
+    /// up on the next heartbeat.
+    fn on_update(&self, idx: usize, rendered: String);
+
+    /// Fired at the 200ms reveal deadline. Entry per row: `Some(line)` for
+    /// rows still at skeleton state (placeholder needs promoting to `·`),
+    /// `None` for rows that already received real data via `on_update`.
+    fn on_reveal(&self, rendered: Vec<Option<String>>);
+}
+
 /// Controls how show flags (branches/remotes/full) are determined in [`collect`].
 #[cfg_attr(not(unix), allow(dead_code))]
 pub enum ShowConfig {
@@ -281,6 +313,14 @@ pub enum ShowConfig {
         /// Wall-clock deadline for the collect phase. `None` uses the default
         /// [`DRAIN_TIMEOUT`](results::DRAIN_TIMEOUT) and shows a warning on timeout.
         collect_deadline: Option<std::time::Instant>,
+        /// Width used when computing the layout. `None` falls back to the
+        /// terminal width; the picker passes an explicit width because the
+        /// list only gets part of the terminal (the rest is preview).
+        list_width: Option<usize>,
+        /// Progressive callback for the picker. When set, `collect` emits
+        /// skeleton + per-update events through it. Results still flow into
+        /// the returned `ListData` as usual.
+        progressive_handler: Option<std::sync::Arc<dyn PickerProgressHandler>>,
     },
     /// Raw CLI flags; config resolution deferred to collect's parallel phase
     /// so project_identifier runs concurrently with other git operations.
@@ -290,6 +330,66 @@ pub enum ShowConfig {
         cli_remotes: bool,
         cli_full: bool,
     },
+}
+
+/// Per-row render cache shared by the `wt list` progressive table and the
+/// picker's `PickerProgressHandler`. Both sinks write through the same dedup
+/// path so one rendering pass serves both.
+///
+/// `set_result` records a new render and returns `Some(line)` only when it
+/// differs from the cached value.
+///
+/// `set_reveal` runs after `layout.placeholder` is promoted from blank to
+/// `·`. Every row is re-rendered (skeleton for rows with no data yet to
+/// avoid surfacing seeded defaults like "55y"; `format_list_item_line` for
+/// rows that received at least one result, so still-pending cells pick up
+/// the promoted `·`). Dedup against the cache keeps emitted updates minimal.
+struct RowCache {
+    last: Vec<String>,
+    has_data: Vec<bool>,
+}
+
+impl RowCache {
+    fn new(n: usize) -> Self {
+        Self {
+            last: vec![String::new(); n],
+            has_data: vec![false; n],
+        }
+    }
+
+    fn set_result(&mut self, idx: usize, rendered: String) -> Option<String> {
+        self.has_data[idx] = true;
+        if self.last[idx] == rendered {
+            None
+        } else {
+            self.last[idx] = rendered.clone();
+            Some(rendered)
+        }
+    }
+
+    fn set_reveal(
+        &mut self,
+        items: &[super::model::ListItem],
+        layout: &super::layout::LayoutConfig,
+    ) -> Vec<Option<String>> {
+        items
+            .iter()
+            .enumerate()
+            .map(|(idx, item)| {
+                let new = if self.has_data[idx] {
+                    layout.format_list_item_line(item)
+                } else {
+                    layout.render_skeleton_row(item).render()
+                };
+                if self.last[idx] == new {
+                    None
+                } else {
+                    self.last[idx] = new.clone();
+                    Some(new)
+                }
+            })
+            .collect()
+    }
 }
 
 /// Build the progressive-table footer shown while the drain is stalled.
@@ -420,58 +520,71 @@ pub fn collect(
     let url_template = url_template_cell.into_inner().unwrap();
 
     // Resolve show flags: merge CLI overrides with config (warmed in parallel phase)
-    let (show_branches, show_remotes, skip_tasks, command_timeout, collect_deadline) =
-        match show_config {
-            ShowConfig::Resolved {
+    let (
+        show_branches,
+        show_remotes,
+        skip_tasks,
+        command_timeout,
+        collect_deadline,
+        list_width,
+        progressive_handler,
+    ) = match show_config {
+        ShowConfig::Resolved {
+            show_branches,
+            show_remotes,
+            skip_tasks,
+            command_timeout,
+            collect_deadline,
+            list_width,
+            progressive_handler,
+        } => (
+            show_branches,
+            show_remotes,
+            skip_tasks,
+            command_timeout,
+            collect_deadline,
+            list_width,
+            progressive_handler,
+        ),
+        ShowConfig::DeferredToParallel {
+            cli_branches,
+            cli_remotes,
+            cli_full,
+        } => {
+            let config = repo.config();
+            let show_branches = cli_branches || config.list.branches();
+            let show_remotes = cli_remotes || config.list.remotes();
+            let show_full = cli_full || config.list.full();
+            let skip_tasks: HashSet<TaskKind> = if show_full {
+                HashSet::new()
+            } else {
+                [
+                    TaskKind::BranchDiff,
+                    TaskKind::CiStatus,
+                    TaskKind::SummaryGenerate,
+                ]
+                .into_iter()
+                .collect()
+            };
+            // Resolve timeouts from merged config (--full disables both)
+            let (command_timeout, collect_deadline) = if show_full {
+                (None, None)
+            } else {
+                let task_timeout = config.list.task_timeout();
+                let deadline = config.list.timeout().map(|d| std::time::Instant::now() + d);
+                (task_timeout, deadline)
+            };
+            (
                 show_branches,
                 show_remotes,
                 skip_tasks,
                 command_timeout,
                 collect_deadline,
-            } => (
-                show_branches,
-                show_remotes,
-                skip_tasks,
-                command_timeout,
-                collect_deadline,
-            ),
-            ShowConfig::DeferredToParallel {
-                cli_branches,
-                cli_remotes,
-                cli_full,
-            } => {
-                let config = repo.config();
-                let show_branches = cli_branches || config.list.branches();
-                let show_remotes = cli_remotes || config.list.remotes();
-                let show_full = cli_full || config.list.full();
-                let skip_tasks: HashSet<TaskKind> = if show_full {
-                    HashSet::new()
-                } else {
-                    [
-                        TaskKind::BranchDiff,
-                        TaskKind::CiStatus,
-                        TaskKind::SummaryGenerate,
-                    ]
-                    .into_iter()
-                    .collect()
-                };
-                // Resolve timeouts from merged config (--full disables both)
-                let (command_timeout, collect_deadline) = if show_full {
-                    (None, None)
-                } else {
-                    let task_timeout = config.list.task_timeout();
-                    let deadline = config.list.timeout().map(|d| std::time::Instant::now() + d);
-                    (task_timeout, deadline)
-                };
-                (
-                    show_branches,
-                    show_remotes,
-                    skip_tasks,
-                    command_timeout,
-                    collect_deadline,
-                )
-            }
-        };
+                None,
+                None,
+            )
+        }
+    };
 
     // Filter local branches to those without worktrees (CPU-only, no git commands)
     let branches_without_worktrees = if show_branches {
@@ -651,19 +764,29 @@ pub fn collect(
         effective_skip_tasks.insert(TaskKind::SummaryGenerate);
     }
 
-    // Calculate layout from items (worktrees, local branches, and remote branches)
-    let layout = super::layout::calculate_layout_from_basics(
-        &all_items,
-        &effective_skip_tasks,
-        &main_worktree.path,
-        url_template.as_deref(),
-    );
+    // Calculate layout from items (worktrees, local branches, and remote branches).
+    // The picker passes an explicit width because the list only gets part of the
+    // terminal — the rest belongs to the preview pane.
+    let layout = match list_width {
+        Some(width) => super::layout::calculate_layout_with_width(
+            &all_items,
+            &effective_skip_tasks,
+            width,
+            &main_worktree.path,
+            url_template.as_deref(),
+        ),
+        None => super::layout::calculate_layout_from_basics(
+            &all_items,
+            &effective_skip_tasks,
+            &main_worktree.path,
+            url_template.as_deref(),
+        ),
+    };
 
     // Single-line invariant: use safe width to prevent line wrapping
     let max_width = crate::display::terminal_width();
 
     // Create collection options from skip set
-    let returned_skip_tasks = effective_skip_tasks.clone();
     let options = CollectOptions {
         skip_tasks: effective_skip_tasks,
         url_template: url_template.clone(),
@@ -727,6 +850,26 @@ pub fn collect(
     } else {
         None
     };
+
+    // Picker mirrors `wt list`'s blank→`·` reveal. The placeholder starts
+    // blank so fast completions don't flash loading dots; the Reveal event
+    // below promotes it to `·` at 200ms. `show_progress=false` (the picker
+    // path today) skips the block above, so set it here unconditionally
+    // when a handler is present.
+    if progressive_handler.is_some() {
+        layout.placeholder.set(super::render::PLACEHOLDER_BLANK);
+    }
+
+    // Deliver the skeleton to the picker handler. Rendered strings use the
+    // blank placeholder so skim's initial render mirrors the `wt list`
+    // pre-reveal look.
+    if let Some(handler) = progressive_handler.as_ref() {
+        let skeletons: Vec<String> = all_items
+            .iter()
+            .map(|item| layout.render_skeleton_row(item).render())
+            .collect();
+        handler.on_skeleton(all_items.clone(), skeletons, layout.render_header_line());
+    }
 
     /// Delay before the `·` loading indicator replaces blank placeholders.
     /// Tuned so commands that finish promptly never flash the dots.
@@ -912,9 +1055,11 @@ pub fn collect(
     // reveal, and stall hints) can mutate it. Events never run concurrently —
     // they fire between channel recvs — so the runtime borrow checks are an
     // invariant formalism, never a source of panics.
+    // Table-specific state: footer progress counter, overflow guard,
+    // first-result tracing. `ProgressiveTable` itself owns stdout so the
+    // whole thing is local and non-`Send`.
     struct ProgressiveState {
         table: ProgressiveTable,
-        last_rendered_lines: Vec<String>,
         completed_results: usize,
         progress_overflow: bool,
         first_result_traced: bool,
@@ -924,17 +1069,19 @@ pub fn collect(
     let progressive_state = progressive_table.take().map(|table| {
         std::cell::RefCell::new(ProgressiveState {
             table,
-            last_rendered_lines: vec![String::new(); n_items],
             completed_results: 0,
             progress_overflow: false,
             first_result_traced: false,
         })
     });
+    let mut row_cache = RowCache::new(n_items);
 
     let drain_deadline =
         collect_deadline.unwrap_or_else(|| std::time::Instant::now() + results::DRAIN_TIMEOUT);
 
-    let reveal_at = progressive_state.as_ref().map(|_| placeholder_reveal_at);
+    // Reveal fires only when a downstream consumer is listening.
+    let reveal_at = (progressive_state.is_some() || progressive_handler.is_some())
+        .then_some(placeholder_reveal_at);
 
     let drain_outcome = drain_results(
         rx,
@@ -944,69 +1091,71 @@ pub fn collect(
         drain_deadline,
         integration_target.as_deref(),
         |event| {
-            let Some(state_cell) = progressive_state.as_ref() else {
-                return;
-            };
-            let mut s = state_cell.borrow_mut();
             let dim = Style::new().dimmed();
             let total_results = expected_results.count();
 
             match event {
                 results::DrainEvent::Result { item_idx, item } => {
-                    if !s.first_result_traced {
-                        s.first_result_traced = true;
-                        worktrunk::shell_exec::trace_instant("First result received");
-                    }
-
-                    s.completed_results += 1;
-
-                    debug_assert!(
-                        s.completed_results <= total_results,
-                        "completed ({}) > expected ({}): task result sent without registering expectation",
-                        s.completed_results,
-                        total_results
-                    );
-                    if s.completed_results > total_results {
-                        s.progress_overflow = true;
-                    }
-
-                    let completed = s.completed_results;
-                    let footer_msg = format!(
-                        "{INFO_SYMBOL} {dim}{footer_base} ({completed}/{total_results} loaded){dim:#}"
-                    );
-                    s.table.update_footer(footer_msg);
-
                     let rendered = layout.format_list_item_line(item);
-                    if rendered != s.last_rendered_lines[item_idx] {
-                        s.last_rendered_lines[item_idx] = rendered.clone();
-                        s.table.update_row(item_idx, rendered);
+                    let changed = row_cache.set_result(item_idx, rendered);
+
+                    if let Some(state_cell) = progressive_state.as_ref() {
+                        let mut s = state_cell.borrow_mut();
+                        if !s.first_result_traced {
+                            s.first_result_traced = true;
+                            worktrunk::shell_exec::trace_instant("First result received");
+                        }
+
+                        s.completed_results += 1;
+                        debug_assert!(
+                            s.completed_results <= total_results,
+                            "completed ({}) > expected ({}): task result sent without registering expectation",
+                            s.completed_results,
+                            total_results
+                        );
+                        if s.completed_results > total_results {
+                            s.progress_overflow = true;
+                        }
+
+                        let completed = s.completed_results;
+                        let footer_msg = format!(
+                            "{INFO_SYMBOL} {dim}{footer_base} ({completed}/{total_results} loaded){dim:#}"
+                        );
+                        s.table.update_footer(footer_msg);
+
+                        if let Some(line) = &changed {
+                            s.table.update_row(item_idx, line.clone());
+                        }
+
+                        if let Err(e) = s.table.flush() {
+                            log::debug!("Progressive table flush failed: {}", e);
+                        }
                     }
 
-                    if let Err(e) = s.table.flush() {
-                        log::debug!("Progressive table flush failed: {}", e);
+                    if let Some(handler) = progressive_handler.as_ref()
+                        && let Some(line) = changed
+                    {
+                        handler.on_update(item_idx, line);
                     }
                 }
                 results::DrainEvent::Reveal { items } => {
-                    // T+200ms reveal: promote blank placeholders to `·` and
-                    // re-render every row so still-pending cells pick up
-                    // the dot. Rows that received a result use
-                    // `format_list_item_line`; untouched rows use
-                    // `render_skeleton_row` (which avoids surfacing seeded
-                    // defaults like "55y" for skipped tasks).
                     layout.placeholder.set(super::render::PLACEHOLDER);
-                    for (idx, item) in items.iter().enumerate() {
-                        let rendered = if s.last_rendered_lines[idx].is_empty() {
-                            layout.render_skeleton_row(item).render()
-                        } else {
-                            layout.format_list_item_line(item)
-                        };
-                        if rendered != s.last_rendered_lines[idx] {
-                            s.last_rendered_lines[idx] = rendered.clone();
-                            s.table.update_row(idx, rendered);
+                    let updates = row_cache.set_reveal(items, &layout);
+
+                    if let Some(state_cell) = progressive_state.as_ref() {
+                        let mut s = state_cell.borrow_mut();
+                        for (idx, update) in updates.iter().enumerate() {
+                            if let Some(line) = update {
+                                s.table.update_row(idx, line.clone());
+                            }
+                        }
+                        if let Err(e) = s.table.flush() {
+                            log::debug!("Progressive table reveal flush failed: {}", e);
                         }
                     }
-                    if let Err(e) = s.table.flush() {
-                        log::debug!("Progressive table reveal flush failed: {}", e);
+
+                    if let Some(handler) = progressive_handler.as_ref() {
+                        handler.on_reveal(updates);
                     }
                 }
                 results::DrainEvent::Stall {
@@ -1018,19 +1167,23 @@ pub fn collect(
                     // Name the signal (silence) rather than claiming "stalled":
                     // the event fires on any 5s lull and reports outstanding
                     // work, not a root cause.
-                    let footer_msg = format_stall_footer(
-                        &footer_base,
-                        s.completed_results,
-                        total_results,
-                        pending_count,
-                        first_kind,
-                        first_name,
-                    );
-                    if s.table.update_footer(footer_msg)
-                        && let Err(e) = s.table.flush()
-                    {
-                        log::debug!("Progressive table flush failed: {}", e);
+                    if let Some(state_cell) = progressive_state.as_ref() {
+                        let mut s = state_cell.borrow_mut();
+                        let footer_msg = format_stall_footer(
+                            &footer_base,
+                            s.completed_results,
+                            total_results,
+                            pending_count,
+                            first_kind,
+                            first_name,
+                        );
+                        if s.table.update_footer(footer_msg)
+                            && let Err(e) = s.table.flush()
+                        {
+                            log::debug!("Progressive table flush failed: {}", e);
+                        }
                     }
+                    // Picker has no stall UI; heartbeat keeps it responsive.
                 }
             }
         },
@@ -1185,11 +1338,7 @@ pub fn collect(
     // JSON mode (render_table=false): no rendering, data returned for serialization
     worktrunk::shell_exec::trace_instant("List collect complete");
 
-    Ok(Some(super::model::ListData {
-        items,
-        main_worktree_path: main_worktree.path.clone(),
-        skip_tasks: returned_skip_tasks,
-    }))
+    Ok(Some(super::model::ListData { items }))
 }
 
 // ============================================================================
@@ -1449,5 +1598,59 @@ mod tests {
             strip_ansi(&rendered),
             @"○ Showing 3 worktrees (5/12 loaded, no recent progress; waiting on 3 tasks, including ci-status for feat)"
         );
+    }
+
+    /// `set_result` marks the row as having data and dedups by comparing
+    /// against the cached render; `set_reveal` picks skeleton-vs-format
+    /// per row based on `has_data` and also dedups. These two behaviors
+    /// are load-bearing for the picker's partial-row reveal correctness
+    /// (see the RowCache doc comment).
+    #[test]
+    fn test_row_cache_dedup_and_reveal() {
+        use super::super::layout::calculate_layout_with_width;
+        use super::super::model::ListItem;
+        use std::collections::HashSet;
+        use std::path::Path;
+
+        let items = vec![
+            ListItem::new_branch("aaa".into(), "row-zero".into()),
+            ListItem::new_branch("bbb".into(), "row-one".into()),
+        ];
+        let skip_tasks: HashSet<TaskKind> = HashSet::new();
+        let layout = calculate_layout_with_width(&items, &skip_tasks, 80, Path::new("/tmp"), None);
+
+        let mut cache = RowCache::new(2);
+
+        // First set_result: cache was empty, so the new line is emitted.
+        let first = cache.set_result(0, "row-zero-line-v1".into());
+        assert_eq!(first.as_deref(), Some("row-zero-line-v1"));
+
+        // Same render again → dedup: None.
+        let dup = cache.set_result(0, "row-zero-line-v1".into());
+        assert_eq!(dup, None);
+
+        // Different render → Some again.
+        let changed = cache.set_result(0, "row-zero-line-v2".into());
+        assert_eq!(changed.as_deref(), Some("row-zero-line-v2"));
+
+        // set_reveal after the placeholder flip. Row 0 has data: use
+        // format_list_item_line; the result is different from the cached
+        // synthetic string above so it's emitted as Some. Row 1 has no
+        // data: use render_skeleton_row; cache was empty so it's emitted.
+        layout.placeholder.set(super::super::render::PLACEHOLDER);
+        let updates = cache.set_reveal(&items, &layout);
+        assert_eq!(updates.len(), 2);
+        assert!(
+            updates[0].is_some(),
+            "row 0 had data but cached string was synthetic; reveal must emit new render"
+        );
+        assert!(
+            updates[1].is_some(),
+            "row 1 had no data; reveal must emit skeleton render"
+        );
+
+        // Second reveal with no intervening changes: both rows dedup to None.
+        let updates2 = cache.set_reveal(&items, &layout);
+        assert_eq!(updates2, vec![None, None]);
     }
 }
