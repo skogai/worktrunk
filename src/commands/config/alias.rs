@@ -18,14 +18,16 @@
 //! natural home alongside `show`.
 
 use std::collections::{BTreeSet, HashMap};
+use std::io::Write;
 
 use anyhow::Context;
+use clap::error::{ContextKind, ContextValue, ErrorKind};
 use color_print::cformat;
 use worktrunk::config::{
     ALIAS_ARGS_KEY, CommandConfig, ProjectConfig, UserConfig, append_aliases,
     referenced_vars_for_config, template_references_var, validate_template_syntax,
 };
-use worktrunk::git::Repository;
+use worktrunk::git::{Repository, WorktrunkError};
 use worktrunk::styling::{format_bash_with_gutter, info_message, println};
 
 use crate::commands::alias::{AliasOptions, AliasSource, TOP_LEVEL_BUILTINS};
@@ -50,6 +52,7 @@ pub fn handle_alias_show(name: String) -> anyhow::Result<()> {
             &user_config,
             project_config.as_ref(),
             &name,
+            "show",
         ));
     }
 
@@ -100,6 +103,7 @@ pub fn handle_alias_dry_run(name: String, args: Vec<String>) -> anyhow::Result<(
             &user_config,
             project_config.as_ref(),
             &name,
+            "dry-run",
         ));
     }
 
@@ -228,16 +232,35 @@ fn entries_for_name(
     entries
 }
 
-/// Build an anyhow error for an unknown alias, with a clap-style "did you mean"
-/// tail pulled from the merged alias name set.
+/// Print an "unrecognized alias 'X'" error matching clap's `InvalidSubcommand`
+/// layout — same `error:` / `tip:` / `Usage:` block and exit code 2 as
+/// `wt <typo>` and `wt step <typo>`. `sub` is `"show"` or `"dry-run"`,
+/// anchoring the error on the real clap subcommand so the Usage line reads
+/// `Usage: wt config alias <sub> <NAME>`.
 ///
-/// Uses `anyhow::Error::context` so the top-level handler formats the first
-/// line as a header and the suggestion list in the error gutter.
+/// Built as a real `clap::Error` with `ErrorKind::InvalidSubcommand`, rendered
+/// by clap, then string-substituted to say "alias" instead of "subcommand" —
+/// the positional is an alias name, not a subcommand, so the tighter wording
+/// reads more honestly at this surface. Going through clap's rendering gets
+/// NO_COLOR / TTY detection, singular-vs-plural "similar" phrasing, and
+/// styling correct automatically; modifying the final string is cheaper than
+/// reimplementing those.
+///
+/// Substitutions are scoped to clap's fixed phrases, never the bare word
+/// "subcommand" — otherwise an alias or typo containing the literal string
+/// `subcommand` (e.g. `my-subcommand`) would be mangled when echoed into
+/// the error. Plural `subcommands` is rewritten before singular `subcommand`
+/// because `"similar subcommand"` is a prefix of `"similar subcommands"`.
+///
+/// Returns `AlreadyDisplayed { exit_code: 2 }` rather than calling
+/// `process::exit`, so `main`'s `finish_command` still runs `terminate_output`
+/// (ANSI reset for shell integration) and `diagnostic::write_if_verbose`.
 fn unknown_alias_error(
     repo: &Repository,
     user_config: &UserConfig,
     project_config: Option<&ProjectConfig>,
     name: &str,
+    sub: &str,
 ) -> anyhow::Error {
     let project_id = repo.project_identifier().ok();
     let mut merged = user_config.aliases(project_id.as_deref());
@@ -245,16 +268,45 @@ fn unknown_alias_error(
         append_aliases(&mut merged, &pc.aliases);
     }
     let suggestions = did_you_mean(name, merged.into_keys());
-    let header = format!("unknown alias '{name}'");
-    if suggestions.is_empty() {
-        anyhow::anyhow!(header)
-    } else {
-        let mut detail = String::from("a similar alias exists:");
-        for s in &suggestions {
-            detail.push_str(&format!("\n  {s}"));
-        }
-        anyhow::Error::msg(detail).context(header)
+
+    let mut top = crate::cli::build_command();
+    let sub_cmd = top
+        .find_subcommand_mut("config")
+        .expect("`config` subcommand is defined in the CLI")
+        .find_subcommand_mut("alias")
+        .expect("`config alias` subcommand is defined in the CLI")
+        .find_subcommand_mut(sub)
+        .unwrap_or_else(|| panic!("`config alias {sub}` subcommand is defined in the CLI"));
+    // `render_usage` needs `bin_name`; clap only sets it on match, so when we
+    // synthesize the error ahead of that, set it to the display_name
+    // `apply_help_template_recursive` would apply.
+    sub_cmd.set_bin_name(format!("wt config alias {sub}"));
+    let usage = sub_cmd.render_usage();
+
+    let mut err = clap::Error::new(ErrorKind::InvalidSubcommand).with_cmd(sub_cmd);
+    err.insert(
+        ContextKind::InvalidSubcommand,
+        ContextValue::String(name.to_string()),
+    );
+    if !suggestions.is_empty() {
+        err.insert(
+            ContextKind::SuggestedSubcommand,
+            ContextValue::Strings(suggestions),
+        );
     }
+    err.insert(ContextKind::Usage, ContextValue::StyledStr(usage));
+
+    let rewritten = err
+        .render()
+        .ansi()
+        .to_string()
+        .replace("unrecognized subcommand", "unrecognized alias")
+        .replace("similar subcommands", "similar aliases")
+        .replace("similar subcommand", "similar alias");
+
+    let mut stream = anstream::AutoStream::auto(std::io::stderr());
+    let _ = write!(stream, "{rewritten}");
+    WorktrunkError::AlreadyDisplayed { exit_code: 2 }.into()
 }
 
 /// Format one alias entry: `○ Alias <name> (<source>)[ <verb>]:` header

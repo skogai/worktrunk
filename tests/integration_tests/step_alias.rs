@@ -1338,7 +1338,9 @@ deploy = "make deploy BRANCH={{ branch }}"
     ));
 }
 
-/// Unknown alias name triggers a did-you-mean suggestion.
+/// Unknown alias name triggers a did-you-mean suggestion. Format mirrors
+/// `wt <typo>` and `wt step <typo>`: clap-native `InvalidSubcommand` with a
+/// `tip:` line — same shape at every alias-typo surface.
 #[rstest]
 fn test_config_alias_show_unknown_suggests(mut repo: TestRepo) {
     repo.write_project_config(
@@ -1358,6 +1360,83 @@ hello = "echo hi"
         &repo,
         "config",
         &["alias", "show", "deplyo"],
+        Some(&feature_path),
+    ));
+}
+
+/// Aliases or typos that literally contain `subcommand` must be echoed
+/// verbatim — the word-substitution pass that rewrites clap's
+/// "unrecognized subcommand" to "unrecognized alias" must only touch
+/// clap's fixed phrases, not the user's input.
+#[rstest]
+fn test_config_alias_show_unknown_preserves_user_input(mut repo: TestRepo) {
+    repo.write_project_config(
+        r#"
+[aliases]
+"my-subcommand" = "echo hi"
+"#,
+    );
+    repo.commit("Add alias config");
+    let feature_path = repo.add_worktree("feature");
+
+    let settings = setup_snapshot_settings(&repo);
+    let _guard = settings.bind_to_scope();
+
+    // Typo `my-subcommond` is close enough to `my-subcommand` to suggest it —
+    // both the echoed typo and the suggestion must keep `subcommand` intact.
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "config",
+        &["alias", "show", "my-subcommond"],
+        Some(&feature_path),
+    ));
+}
+
+/// Single-match case: tip phrasing switches to the singular form
+/// ("a similar alias exists") — mirrors clap's own singular rendering.
+#[rstest]
+fn test_config_alias_show_unknown_singular_suggestion(mut repo: TestRepo) {
+    repo.write_project_config(
+        r#"
+[aliases]
+deploy = "make deploy"
+"#,
+    );
+    repo.commit("Add alias config");
+    let feature_path = repo.add_worktree("feature");
+
+    let settings = setup_snapshot_settings(&repo);
+    let _guard = settings.bind_to_scope();
+
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "config",
+        &["alias", "show", "deplyo"],
+        Some(&feature_path),
+    ));
+}
+
+/// `wt config alias dry-run <typo>` produces the same clap-native typo error
+/// as `show` — consistent format across both introspection subcommands.
+#[rstest]
+fn test_config_alias_dry_run_unknown_suggests(mut repo: TestRepo) {
+    repo.write_project_config(
+        r#"
+[aliases]
+deploy = "make deploy"
+hello = "echo hi"
+"#,
+    );
+    repo.commit("Add alias config");
+    let feature_path = repo.add_worktree("feature");
+
+    let settings = setup_snapshot_settings(&repo);
+    let _guard = settings.bind_to_scope();
+
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "config",
+        &["alias", "dry-run", "deplyo"],
         Some(&feature_path),
     ));
 }
