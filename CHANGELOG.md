@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.40.0
+
+### Improved
+
+- **Aliases route `--KEY=VALUE` to template variables and forward everything else as `{{ args }}`**: `--KEY=VALUE` (or `--KEY VALUE`) binds `KEY` whenever the template references `{{ KEY }}` — `wt deploy --env=staging` sets `{{ env }}` to `staging`. Everything else joins `{{ args }}`, a space-joined, shell-escaped sequence ready to splice into a command. With `s = "wt switch {{ args }}"`, `wt s some-branch` expands to `wt switch some-branch`. Index with `{{ args[0] }}`, loop with `{% for a in args %}…`, count with `{{ args | length }}`; each element is escaped individually, so `wt run 'a b' 'c;d'` renders as `'a b' 'c;d'` — no shell injection. Tokens after `--` forward unconditionally, bypassing any binding. Hyphens in keys become underscores: `--my-var=x` binds `{{ my_var }}`. Built-in vars can be overridden inside the template — `--branch=foo` sets `{{ branch }}` for the invocation, but the worktree's actual branch doesn't move. (Breaking: `--var KEY=VALUE` and `--var=KEY=VALUE` removed; `wt <alias>` no longer errors on unrecognized flags — they forward to `{{ args }}`.) ([#2280](https://github.com/max-sixty/worktrunk/pull/2280), [#2287](https://github.com/max-sixty/worktrunk/pull/2287), [#2304](https://github.com/max-sixty/worktrunk/pull/2304))
+
+- **`-y, --yes` is a top-level global flag**: Lives once on `Cli` instead of being duplicated across switch, remove, merge, commit, squash, prune, the ten hook subcommands, shell install/uninstall, plugin install/uninstall, and config update. `wt -y <anything>`, `wt <anything> --yes`, and `wt --yes <anything>` all skip approval and confirmation prompts for that invocation. (Breaking: post-alias `--yes` removed — use the global form `wt -y <alias>`.) ([#2279](https://github.com/max-sixty/worktrunk/pull/2279), [#2290](https://github.com/max-sixty/worktrunk/pull/2290))
+
+- **`wt config alias show` and `wt config alias dry-run`**: `show` prints the configured template tagged by source (user/project). `dry-run` previews what an invocation would run without executing — `wt config alias dry-run s -- target-branch` renders exactly what `wt s target-branch` would produce. Output annotates routing with `# bound:` and `# args:` comments so you can see how each token was interpreted. Both warn when the alias name shadows a top-level built-in (e.g. `list`, `switch`); the alias is only reachable via `wt step <name>`. `wt <alias> --help` / `-h` prints a hint pointing at these subcommands rather than silently forwarding the flag into `{{ args }}`; use `wt <alias> -- --help` to forward. (Breaking: `wt <alias> --dry-run` and `wt step <alias> --dry-run` retired — use the new subcommand.) ([#2291](https://github.com/max-sixty/worktrunk/pull/2291), [#2304](https://github.com/max-sixty/worktrunk/pull/2304))
+
+- **`wt config approvals` replaces `wt hook approvals`**: Approvals cover both project hooks and project aliases, so the old namespace under `hook` mis-scoped the command. `add` now walks both hook and alias commands — a project that only declares aliases can bulk-pre-approve in one shot. `wt hook approvals` remains as a hidden alias that emits a deprecation warning and forwards. ([#2282](https://github.com/max-sixty/worktrunk/pull/2282))
+
+- **Scope-aware template variable validation**: A new `ValidationScope` (`Hook(HookType)`, `SwitchExecute`, `Alias`) drives validation across every template surface. `{{ args }}` only validates inside aliases; `{{ target }}` only in switch/start/merge contexts; `{{ pr_number }}` only in PR-aware switch hooks. A typo like `{{ target }}` in a `pre-start` hook is caught at validation time instead of failing at runtime with an undefined-var error after the worktree was created. ([#2288](https://github.com/max-sixty/worktrunk/pull/2288))
+
+- **`pr_number` and `pr_url` template variables for PR/MR worktree hooks**: Available in `pre-switch`, `post-switch`, `pre-start`, and `post-start` when the worktree was created via `wt switch pr:N` / `mr:N`. One canonical pair for both GitHub and GitLab — no separate `mr_*` aliases. Previously the runtime injected these in `pre-start` only and the validator rejected them, so the feature was unreachable. ([#2300](https://github.com/max-sixty/worktrunk/pull/2300))
+
+- **`target` template variable injected symmetrically on switch/create/start**: `pre-switch` already injected `target` (and conditionally `target_worktree_path`); `post-switch`, `pre-start`, and `post-start` now do too. A user writing `{{ target }}` in `post-start` no longer hits an undefined-var error at runtime. ([#2295](https://github.com/max-sixty/worktrunk/pull/2295))
+
+- **Single announce line for combined background hooks**: When user and project hooks both fire on post-merge, post-commit, post-start/post-switch, or post-remove, output collapses into one `◎ Running <hook>: user:…, project:… @ <path>` line instead of one per source. Extracted a shared `spawn_background_hooks` so every site uses the same path. ([#2294](https://github.com/max-sixty/worktrunk/pull/2294), [#2298](https://github.com/max-sixty/worktrunk/pull/2298))
+
+- **`wt config state get` shows trash and git commands cache**: Two categories that `wt config state clear` sweeps (`.git/wt/trash/` staged worktree directories and `.git/wt/cache/` SHA-keyed caches) were missing from `state get`, so users could clear state without ever knowing those entries existed. ([#2292](https://github.com/max-sixty/worktrunk/pull/2292))
+
+### Fixed
+
+- **Reject underscore in `vars` keys with a clear error**: `wt config state vars set db_suffix=foo` previously passed validation and then failed with a cryptic `error: invalid key: worktrunk.state.main.vars.db_suffix` from git (git config variable names must match `[a-zA-Z][a-zA-Z0-9-]*`). Now rejected at `validate_vars_key` with a message pointing users to use hyphens instead. ([#2285](https://github.com/max-sixty/worktrunk/pull/2285), thanks @Mziserman)
+
+- **Surface the full anyhow error chain in spawn and ref-update messages**: `Failed to spawn pipeline: Failed to spawn detached process` previously dropped the underlying `io::Error` (errno + OS description). Three sites switched from `{err}` to `{err:#}` so the full source chain renders — affects pipeline spawn warnings, `wt switch` LLM-summary preview errors, and `git push` failure messages. ([#2251](https://github.com/max-sixty/worktrunk/pull/2251))
+
+- **Template parse errors in aliases now surface before flag routing**: A syntax error in any alias step previously caused that step to silently contribute no names to the referenced-var set, which could change how `--KEY=VALUE` tokens bound vs. forwarded as positionals; the syntax error only surfaced later at expansion time. Now errors propagate up front so flag routing isn't determined by malformed templates. ([#2299](https://github.com/max-sixty/worktrunk/pull/2299))
+
+### Documentation
+
+- **Hook template variables grouped by kind**: Variables in help text and docs now follow a consistent ordering (worktree, base, target, PR/MR, hook infrastructure) instead of mixed kinds. ([#2303](https://github.com/max-sixty/worktrunk/pull/2303))
+
+- **Aliases section rewrite**: Replaced the "How arguments are routed" table with a concrete `fly deploy` example, restored the `up` rebase-every-worktree recipe, added a `since-main` example, and reorganized so the simpler "Passing values" section comes before the routing mechanism. ([#2304](https://github.com/max-sixty/worktrunk/pull/2304))
+
+- **Trim filler in prose and help text**: Removed redundant qualifiers and parenthetical hedges across `extending.md`, `faq.md`, `tips-patterns.md`, and the `list` / `step` help text. ([#2277](https://github.com/max-sixty/worktrunk/pull/2277), [#2289](https://github.com/max-sixty/worktrunk/pull/2289))
+
+- **Drop stale `[experimental]` from aliases docstring** ([#2283](https://github.com/max-sixty/worktrunk/pull/2283)) and **expand the worktrunk skill description with lexical triggers** so Claude finds it more reliably ([#2301](https://github.com/max-sixty/worktrunk/pull/2301)).
+
+### Internal
+
+- **Move approval handlers to config module**: Reflects the new `wt config approvals` home. ([#2286](https://github.com/max-sixty/worktrunk/pull/2286))
+
+- **Nix flake reads Rust channel from `rust-toolchain.toml`**: Single source of truth instead of duplicating the toolchain version. ([#2188](https://github.com/max-sixty/worktrunk/pull/2188))
+
 ## 0.39.0
 
 ### Improved
