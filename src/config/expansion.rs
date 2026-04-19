@@ -498,25 +498,32 @@ fn setup_template_env(repo: &Repository) -> Environment<'static> {
     env
 }
 
-/// Check if a template references a specific top-level variable.
+/// Top-level variables referenced by a single template.
 ///
 /// Uses minijinja's AST analysis rather than string matching, avoiding false
-/// positives from literal text like `template_vars.txt`.
-pub fn template_references_var(template: &str, var: &str) -> bool {
-    let env = minijinja::Environment::new();
-    let Ok(tmpl) = env.template_from_str(template) else {
-        return false;
-    };
-    tmpl.undeclared_variables(false).contains(var)
+/// positives from literal text like `template_vars.txt`. Templates that fail
+/// to parse contribute nothing — a syntax error surfaces later at expansion
+/// time with a richer message.
+fn referenced_vars(template: &str) -> std::collections::HashSet<String> {
+    minijinja::Environment::new()
+        .template_from_str(template)
+        .map(|tmpl| tmpl.undeclared_variables(false))
+        .unwrap_or_default()
 }
 
-/// Union of top-level variables referenced by every command in a `CommandConfig`.
+/// Check if a template references a specific top-level variable.
+pub fn template_references_var(template: &str, var: &str) -> bool {
+    referenced_vars(template).contains(var)
+}
+
+/// Union of top-level variables referenced across every command in `cfg`.
 ///
 /// Drives alias-arg routing in `AliasOptions::parse`: a `--KEY=VALUE` token
 /// binds to `{{ KEY }}` only when KEY appears in this set; otherwise it
-/// forwards as a positional. A syntax error in any template fails here so the
-/// user sees it before flags are routed — a silent skip could mask a typo and
-/// silently change how subsequent CLI args bind.
+/// forwards as a positional. A var referenced in any step of a pipeline is
+/// a binding candidate for the whole invocation. A syntax error in any
+/// template fails here so the user sees it before flags are routed — a
+/// silent skip could mask a typo and change how subsequent CLI args bind.
 pub fn referenced_vars_for_config(cfg: &super::CommandConfig) -> anyhow::Result<BTreeSet<String>> {
     let env = minijinja::Environment::new();
     let mut out = BTreeSet::new();
