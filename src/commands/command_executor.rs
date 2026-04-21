@@ -5,8 +5,9 @@ use anyhow::{Context, Result, bail};
 use color_print::cformat;
 use worktrunk::HookType;
 use worktrunk::config::{
-    Command, CommandConfig, HookStep, UserConfig, expand_template, format_hook_variables,
-    referenced_vars_for_config, template_references_var, validate_template_syntax,
+    Command, CommandConfig, HookStep, TemplateExpandError, UserConfig, ValidationScope,
+    expand_template, format_hook_variables, referenced_vars_for_config, template_references_var,
+    validate_template_syntax, vars_available_in,
 };
 use worktrunk::git::{Repository, WorktrunkError, interrupt_exit_code};
 use worktrunk::path::{format_path_for_display, to_posix_path};
@@ -287,17 +288,48 @@ pub fn wait_first_error<E>(
 /// shell string. Used by the three execution paths — foreground hooks,
 /// background pipelines, and aliases — that defer `vars.*` expansion until
 /// just before the command runs so prior steps can set vars via git config.
+///
+/// When `scope` is provided, an undefined-variable error lists every var
+/// available in that scope (via [`vars_available_in`]) rather than only the
+/// keys currently populated in `context`. This matters under lazy hook-context
+/// gating: `build_hook_context` may skip populating vars the pipeline doesn't
+/// reference, and without the override the error hint would omit vars the user
+/// could legitimately have typed.
 pub fn expand_shell_template(
     template: &str,
     context: &HashMap<String, String>,
     repo: &Repository,
     label: &str,
+    scope: Option<ValidationScope>,
 ) -> Result<String> {
     let vars: HashMap<&str, &str> = context
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
-    Ok(expand_template(template, &vars, true, repo, label)?)
+    expand_template(template, &vars, true, repo, label)
+        .map_err(|err| override_available_vars(err, scope).into())
+}
+
+/// Replace a template error's `available_vars` with the full scope list.
+///
+/// Only applies when an undefined-value hint is already being shown (the
+/// original `available_vars` is non-empty) and a scope was provided. Syntax
+/// errors carry no hint to preserve.
+fn override_available_vars(
+    mut err: TemplateExpandError,
+    scope: Option<ValidationScope>,
+) -> TemplateExpandError {
+    if let Some(scope) = scope
+        && !err.available_vars.is_empty()
+    {
+        let mut names: Vec<String> = vars_available_in(scope)
+            .into_iter()
+            .map(String::from)
+            .collect();
+        names.sort();
+        err.available_vars = names;
+    }
+    err
 }
 
 /// Short summary name: "user:name" for named commands, "user" otherwise.
@@ -305,6 +337,15 @@ pub(crate) fn command_summary_name(name: Option<&str>, source: HookSource) -> St
     match name {
         Some(n) => format!("{source}:{n}"),
         None => source.to_string(),
+    }
+}
+
+/// The template scope implied by a command's origin — used by
+/// [`expand_shell_template`] to list scope-accurate vars in error hints.
+fn origin_scope(origin: &CommandOrigin) -> ValidationScope {
+    match origin {
+        CommandOrigin::Hook { hook_type, .. } => ValidationScope::Hook(*hook_type),
+        CommandOrigin::Alias { .. } => ValidationScope::Alias,
     }
 }
 
@@ -405,7 +446,10 @@ fn run_concurrent_group(
             let label = expansion_label(cmd, origin);
             let context: HashMap<String, String> = serde_json::from_str(&cmd.context_json)
                 .context("failed to deserialize context_json")?;
-            expanded.push(expand_shell_template(template, &context, repo, &label)?);
+            let scope = Some(origin_scope(origin));
+            expanded.push(expand_shell_template(
+                template, &context, repo, &label, scope,
+            )?);
         } else {
             expanded.push(cmd.expanded.clone());
         }
@@ -476,7 +520,8 @@ fn run_one_command(
         let label = expansion_label(cmd, origin);
         let context: HashMap<String, String> = serde_json::from_str(&cmd.context_json)
             .context("failed to deserialize context_json")?;
-        lazy_expanded = expand_shell_template(template, &context, repo, &label)?;
+        let scope = Some(origin_scope(origin));
+        lazy_expanded = expand_shell_template(template, &context, repo, &label, scope)?;
         &lazy_expanded
     } else {
         &cmd.expanded
@@ -665,7 +710,13 @@ fn expand_commands(
             (tpl.clone(), Some(tpl))
         } else {
             (
-                expand_shell_template(&cmd.template, &cmd_context, ctx.repo, &template_name)?,
+                expand_shell_template(
+                    &cmd.template,
+                    &cmd_context,
+                    ctx.repo,
+                    &template_name,
+                    Some(ValidationScope::Hook(hook_type)),
+                )?,
                 None,
             )
         };

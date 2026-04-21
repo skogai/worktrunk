@@ -209,7 +209,13 @@ fn render_preview(
             .map_err(|e| anyhow::anyhow!("syntax error in alias {alias_name}: {e}"))?;
         Ok(template.to_string())
     } else {
-        Ok(expand_shell_template(template, context, repo, alias_name)?)
+        Ok(expand_shell_template(
+            template,
+            context,
+            repo,
+            alias_name,
+            Some(worktrunk::config::ValidationScope::Alias),
+        )?)
     }
 }
 

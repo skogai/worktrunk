@@ -76,9 +76,16 @@ pub fn step_for_each(args: Vec<String>, format: crate::cli::SwitchFormat) -> any
         // also JSON-piped to stdin for scripts, so the extra vars are expected.
         let context_map = build_hook_context(&ctx, &[], None)?;
 
-        // Expand template with full context (shell-escaped)
-        let command =
-            expand_shell_template(&command_template, &context_map, &repo, "for-each command")?;
+        // Expand template with full context (shell-escaped). No scope
+        // override — `for-each` uses the eager context so `vars.keys()` is
+        // accurate as the error hint.
+        let command = expand_shell_template(
+            &command_template,
+            &context_map,
+            &repo,
+            "for-each command",
+            None,
+        )?;
 
         // Build JSON context for stdin
         let context_json = serde_json::to_string(&context_map)
