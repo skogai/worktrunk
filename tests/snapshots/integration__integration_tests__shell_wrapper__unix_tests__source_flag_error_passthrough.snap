@@ -3,6 +3,9 @@ source: tests/integration_tests/shell_wrapper.rs
 expression: "&output.combined"
 ---
 
+[33m▲[39m [33mProject config: [1mpost-start[22m hook is deprecated in favor of [1mpost-create[22m[39m
+[2m↳[22m [2mTo see details, run [4mwt config show[24m; to apply updates, run [4mwt config update[24m[22m
+[33m▲[39m [33mProject config has unknown field [1mpost-start[22m (will be ignored)[39m
 [1m[31merror:[0m unrecognized subcommand '[1m[33mfoo[0m'
 
   [1m[32mtip:[0m a similar subcommand exists: '[1m[32mhook[0m'

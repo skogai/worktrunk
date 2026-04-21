@@ -771,11 +771,11 @@ approved-commands = ["{}"]
     )
     .unwrap();
 
-    // With --no-hooks, the post-start command should be skipped
+    // With --no-hooks, the post-create command should be skipped
     snapshot_switch(
         "switch_no_hooks_skips_post_start",
         &repo,
-        &["--create", "no-post-start", "--no-hooks"],
+        &["--create", "no-post-create", "--no-hooks"],
     );
 }
 
@@ -1475,25 +1475,25 @@ fn test_switch_post_hook_no_path_with_shell_integration(repo: TestRepo) {
     );
 }
 
-/// When both post-switch and post-start hooks are configured, they should be combined
-/// into a single output line with format: "Running post-switch: {names}; post-start: {names} @ path"
+/// When both post-switch and post-create hooks are configured, they should be combined
+/// into a single output line with format: "Running post-switch: {names}; post-create: {names} @ path"
 #[rstest]
 fn test_switch_combined_post_switch_and_post_start_hooks(repo: TestRepo) {
-    // Create project config with both post-switch and post-start hooks
+    // Create project config with both post-switch and post-create hooks
     let config_dir = repo.root_path().join(".config");
     fs::create_dir_all(&config_dir).unwrap();
     fs::write(
         config_dir.join("wt.toml"),
         r#"post-switch = "echo switched"
-post-start = "echo started"
+post-create = "echo started"
 "#,
     )
     .unwrap();
 
     repo.commit("Add config");
 
-    // Run switch --create (triggers both post-switch and post-start)
-    // Should show a single combined line: "Running post-switch: project; post-start: project @ path"
+    // Run switch --create (triggers both post-switch and post-create)
+    // Should show a single combined line: "Running post-switch: project; post-create: project @ path"
     snapshot_switch(
         "switch_combined_hooks",
         &repo,
@@ -2012,7 +2012,7 @@ fn test_switch_pr_fork(#[from(repo_with_remote)] repo: TestRepo) {
     });
 }
 
-/// `pre-start`, `post-start`, and `post-switch` hooks on PR/MR-created worktrees
+/// `pre-create`, `post-create`, and `post-switch` hooks on PR/MR-created worktrees
 /// see `pr_number` and `pr_url` in their template context. Both GitHub PRs and
 /// GitLab MRs canonicalize to the same `pr_*` names — hook authors don't need
 /// to branch on platform. Pre-switch fires before PR resolution and never sees
@@ -2077,11 +2077,11 @@ fn test_switch_pr_hooks_see_pr_vars(#[from(repo_with_remote)] repo: TestRepo) {
     let mock_bin = setup_mock_gh_for_pr(&repo, Some(gh_response));
 
     // Each hook writes its own marker in the primary worktree so we can verify
-    // post-switch + post-start (background) populate pr_number/pr_url too.
+    // post-switch + post-create (background) populate pr_number/pr_url too.
     // {{ repo_path }} is always the main repo's working tree.
     repo.write_project_config(
-        r#"pre-start = "echo 'pr_number={{ pr_number }} pr_url={{ pr_url }}' > {{ repo_path }}/pre_start.txt"
-post-start = "echo 'pr_number={{ pr_number }} pr_url={{ pr_url }}' > {{ repo_path }}/post_start.txt"
+        r#"pre-create = "echo 'pr_number={{ pr_number }} pr_url={{ pr_url }}' > {{ repo_path }}/pre_create.txt"
+post-create = "echo 'pr_number={{ pr_number }} pr_url={{ pr_url }}' > {{ repo_path }}/post_create.txt"
 post-switch = "echo 'pr_number={{ pr_number }} pr_url={{ pr_url }}' > {{ repo_path }}/post_switch.txt"
 "#,
     );
@@ -2098,7 +2098,7 @@ post-switch = "echo 'pr_number={{ pr_number }} pr_url={{ pr_url }}' > {{ repo_pa
     );
 
     let expected = "pr_number=42 pr_url=https://github.com/owner/test-repo/pull/42";
-    for marker in ["pre_start.txt", "post_start.txt", "post_switch.txt"] {
+    for marker in ["pre_create.txt", "post_create.txt", "post_switch.txt"] {
         let path = repo.root_path().join(marker);
         // post-* hooks run in the background; poll until the file appears.
         wait_for_file_content(&path);

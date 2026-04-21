@@ -149,7 +149,7 @@
 # worktree-path = ".worktrees/{{ branch | sanitize }}"
 # list.full = true
 # merge.squash = false
-# pre-start.env = "cp .env.example .env"
+# pre-create.env = "cp .env.example .env"
 # step.copy-ignored.exclude = [".repo-local-cache/"]
 # aliases.deploy = "make deploy BRANCH={{ branch }}"
 #

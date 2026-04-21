@@ -5,7 +5,7 @@ info:
   args:
     - switch
     - "--create"
-    - no-post-start
+    - no-post-create
     - "--no-hooks"
   env:
     APPDATA: "[TEST_CONFIG_HOME]"
@@ -46,7 +46,7 @@ exit_code: 0
 ----- stdout -----
 
 ----- stderr -----
-[32m✓[39m [32mCreated branch [1mno-post-start[22m from [1mmain[22m and worktree @ [1m_REPO_.no-post-start[22m[39m
+[32m✓[39m [32mCreated branch [1mno-post-create[22m from [1mmain[22m and worktree @ [1m_REPO_.no-post-create[22m[39m
 [2m↳[22m [2mTo customize worktree locations, run [4mwt config create[24m[22m
 [33m▲[39m [33mCannot change directory — shell integration not installed[39m
 [2m↳[22m [2mTo enable automatic cd, run [4mwt config shell install[24m[22m

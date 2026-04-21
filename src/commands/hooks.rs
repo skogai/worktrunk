@@ -266,7 +266,7 @@ fn format_pipeline_summary(steps: &[SourcedStep]) -> String {
 /// spawns each source group as an independent pipeline. For a single hook
 /// type, prefer `spawn_background_hooks` — it wraps the prepare+announce
 /// step. Use this directly when multiple hook types fire together (e.g.,
-/// post-switch + post-start on create).
+/// post-switch + post-create on create).
 ///
 /// Each pipeline carries its own `CommandContext` so that different hook types
 /// can use different contexts (e.g., post-remove uses the removed branch while
@@ -276,7 +276,7 @@ fn format_pipeline_summary(steps: &[SourcedStep]) -> String {
 /// contexts (e.g., prune removing multiple worktrees):
 /// `Running post-remove for feature: docs; post-switch for feature: zellij-tab`
 ///
-/// Without `show_branch`: `Running post-switch: zellij-tab; post-start: deps, assets, docs`
+/// Without `show_branch`: `Running post-switch: zellij-tab; post-create: deps, assets, docs`
 pub fn announce_and_spawn_background_hooks(
     pipelines: Vec<(CommandContext<'_>, Vec<SourcedStep>)>,
     show_branch: bool,
@@ -290,14 +290,14 @@ pub fn announce_and_spawn_background_hooks(
     }
 
     // Build combined summary, merging groups with the same hook type:
-    // "post-switch: zellij-tab; post-start: deps, assets, docs"
+    // "post-switch: zellij-tab; post-create: deps, assets, docs"
     let display_path = non_empty
         .iter()
         .flat_map(|(_, g)| g.iter())
         .find_map(|s| s.display_path.as_ref());
 
     // Merge summaries by hook type so user+project for the same type
-    // shows "post-start: user_bg, project" not "post-start: user_bg; post-start: project".
+    // shows "post-create: user_bg, project" not "post-create: user_bg; post-create: project".
     let mut type_summaries: Vec<(HookType, Vec<String>)> = Vec::new();
     for (_, group) in &non_empty {
         let hook_type = group[0].hook_type;
@@ -767,7 +767,7 @@ mod tests {
         SourcedStep {
             step,
             source: HookSource::User,
-            hook_type: worktrunk::HookType::PostStart,
+            hook_type: worktrunk::HookType::PostCreate,
             display_path: None,
             is_pipeline: false,
         }
@@ -831,7 +831,7 @@ mod tests {
     #[test]
     fn test_format_pipeline_summary_concurrent_then_concurrent() {
         // The canonical pipeline: two concurrent groups in sequence.
-        // post-start = [
+        // post-create = [
         //     { install = "npm install", setup = "setup-db" },
         //     { build = "npm run build", lint = "npm run lint" },
         // ]

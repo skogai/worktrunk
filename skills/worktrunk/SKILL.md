@@ -1,6 +1,6 @@
 ---
 name: worktrunk
-description: Guidance for Worktrunk (the `wt` CLI) — git worktree management, hooks, and config. Load when editing .config/wt.toml or ~/.config/worktrunk/config.toml; adding, modifying, or debugging hooks (post-merge, post-start, pre-commit, pre-merge, post-switch, etc.); configuring commit message generation or command aliases; or troubleshooting wt behavior. Also answers general worktrunk/wt questions.
+description: Guidance for Worktrunk (the `wt` CLI) — git worktree management, hooks, and config. Load when editing .config/wt.toml or ~/.config/worktrunk/config.toml; adding, modifying, or debugging hooks (post-merge, post-create, pre-commit, pre-merge, post-switch, etc.); configuring commit message generation or command aliases; or troubleshooting wt behavior. Also answers general worktrunk/wt questions.
 version: 0.42.0
 license: MIT OR Apache-2.0
 compatibility: Requires worktrunk CLI (https://worktrunk.dev)
@@ -38,7 +38,7 @@ Worktrunk uses two separate config files with different scopes and behaviors:
 ### Project Config (`.config/wt.toml`)
 - **Scope**: Team-wide automation shared by all developers
 - **Location**: `<repo>/.config/wt.toml` (checked into git)
-- **Contains**: Hooks for worktree lifecycle (pre-start, pre-merge, etc.)
+- **Contains**: Hooks for worktree lifecycle (pre-create, pre-merge, etc.)
 - **Permission model**: Proactive (create directly, changes are reversible via git)
 - **See**: `reference/hook.md` for detailed guidance
 
@@ -106,9 +106,9 @@ Common request for workflow automation. Follow discovery process:
    - For Python: Check pyproject.toml
 
 3. **Design appropriate hooks** (7 hook types available)
-   - Dependencies (fast, must complete) → `pre-start`
+   - Dependencies (fast, must complete) → `pre-create`
    - Tests/linting (must pass) → `pre-commit` or `pre-merge`
-   - Long builds, dev servers → `post-start`
+   - Long builds, dev servers → `post-create`
    - Terminal/IDE updates → `post-switch`
    - Deployment → `post-merge`
    - Cleanup tasks → `pre-remove`
@@ -122,7 +122,7 @@ Common request for workflow automation. Follow discovery process:
 5. **Create `.config/wt.toml`**
    ```toml
    # Install dependencies when creating worktrees
-   pre-start = "npm install"
+   pre-create = "npm install"
 
    # Validate code quality before committing
    [pre-commit]
@@ -149,8 +149,8 @@ When users want to add automation to an existing project:
 1. **Read existing config**: `cat .config/wt.toml`
 
 2. **Determine hook type** - When should this run?
-   - Creating worktree (blocking) → `pre-start`
-   - Creating worktree (background) → `post-start`
+   - Creating worktree (blocking) → `pre-create`
+   - Creating worktree (background) → `post-create`
    - Every switch → `post-switch`
    - Before committing → `pre-commit`
    - Before merging → `pre-merge`
@@ -162,10 +162,10 @@ When users want to add automation to an existing project:
    Single command to named table:
    ```toml
    # Before
-   pre-start = "npm install"
+   pre-create = "npm install"
 
    # After (adding db:migrate)
-   [pre-start]
+   [pre-create]
    install = "npm install"
    migrate = "npm run db:migrate"
    ```
@@ -242,7 +242,7 @@ Load **reference files** for detailed configuration, hook specifications, and tr
 Find specific sections with grep:
 ```bash
 grep -A 20 "## Setup" reference/llm-commits.md
-grep -A 30 "### pre-start" reference/hook.md
+grep -A 30 "### pre-create" reference/hook.md
 grep -A 20 "## Warning Messages" reference/shell-integration.md
 ```
 

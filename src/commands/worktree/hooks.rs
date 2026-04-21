@@ -1,6 +1,6 @@
 //! Hook execution for worktree operations.
 //!
-//! CommandContext implementations for pre-start hooks, and PostRemoveContext
+//! CommandContext implementations for pre-create hooks, and PostRemoveContext
 //! for building template variables for post-remove hooks.
 
 use std::path::Path;
@@ -14,7 +14,7 @@ use crate::commands::command_executor::FailureStrategy;
 use crate::commands::hooks::execute_hook;
 
 impl<'a> CommandContext<'a> {
-    /// Execute pre-start commands sequentially (blocking)
+    /// Execute pre-create commands sequentially (blocking)
     ///
     /// Runs user hooks first, then project hooks.
     /// Shows path in hook announcements when shell integration isn't active (user's shell
@@ -24,7 +24,7 @@ impl<'a> CommandContext<'a> {
     pub fn execute_pre_start_commands(&self, extra_vars: &[(&str, &str)]) -> anyhow::Result<()> {
         execute_hook(
             self,
-            HookType::PreStart,
+            HookType::PreCreate,
             extra_vars,
             FailureStrategy::FailFast,
             &[],

@@ -229,7 +229,7 @@ fn test_clear_approvals_multiple_approvals(repo: TestRepo) {
     repo.write_project_config(
         r#"
 post-create = "echo 'first'"
-post-start = "echo 'second'"
+post-create = "echo 'second'"
 [pre-commit]
 lint = "echo 'third'"
 "#,

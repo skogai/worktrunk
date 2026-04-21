@@ -832,7 +832,7 @@ mod tests {
         let cmd = make_cmd(Some("lint"));
         let origin = CommandOrigin::Hook {
             source: HookSource::User,
-            hook_type: HookType::PostStart,
+            hook_type: HookType::PostCreate,
             display_path: None,
         };
         let result = handle_command_error(err, &cmd, &origin, FailureStrategy::Warn);
@@ -845,7 +845,7 @@ mod tests {
         let cmd = make_cmd(None);
         let origin = CommandOrigin::Hook {
             source: HookSource::User,
-            hook_type: HookType::PostStart,
+            hook_type: HookType::PostCreate,
             display_path: None,
         };
         let result = handle_command_error(err, &cmd, &origin, FailureStrategy::Warn);
@@ -876,7 +876,7 @@ mod tests {
         let cmd = make_cmd(Some("build"));
         let hook_origin = CommandOrigin::Hook {
             source: HookSource::Project,
-            hook_type: HookType::PreStart,
+            hook_type: HookType::PreCreate,
             display_path: None,
         };
         assert_eq!(expansion_label(&cmd, &hook_origin), "project:build");

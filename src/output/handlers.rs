@@ -849,7 +849,7 @@ fn handle_branch_only_output(
 /// Spawn post-remove and post-switch hooks as a single batch after worktree removal.
 ///
 /// Combines both hook types into one output line for consistency with how
-/// post-switch and post-start are combined during worktree creation.
+/// post-switch and post-create are combined during worktree creation.
 ///
 /// Post-remove template variables reflect the removed worktree (branch, path, commit).
 /// Post-switch hooks only run when `changed_directory` is true (user cd'd to main).

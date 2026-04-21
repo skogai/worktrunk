@@ -892,9 +892,9 @@ pub fn execute_switch(
                 .and_then(|b| repo.worktree_for_branch(b).ok().flatten())
                 .map(|p| worktrunk::path::to_posix_path(&p.to_string_lossy()));
 
-            // PR/MR identity travels into both the pre-start hook below and the
+            // PR/MR identity travels into both the pre-create hook below and the
             // SwitchResult — switch_extra_vars then forwards it to background
-            // post-switch / post-start hooks.
+            // post-switch / post-create hooks.
             let (pr_number, pr_url) = match &method {
                 CreationMethod::ForkRef {
                     number, ref_url, ..

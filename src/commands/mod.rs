@@ -200,7 +200,7 @@ mod tests {
         use insta::assert_snapshot;
         assert_snapshot!(format_command_label("post-create", Some("install")), @"Running post-create [1minstall[22m");
         assert_snapshot!(format_command_label("pre-merge", None), @"Running pre-merge");
-        assert_snapshot!(format_command_label("post-start", Some("build")), @"Running post-start [1mbuild[22m");
+        assert_snapshot!(format_command_label("post-create", Some("build")), @"Running post-create [1mbuild[22m");
         assert_snapshot!(format_command_label("pre-commit", None), @"Running pre-commit");
     }
 }

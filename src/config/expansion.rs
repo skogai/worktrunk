@@ -144,7 +144,7 @@ fn hook_extras(hook_type: HookType) -> &'static [&'static str] {
         // var — `target` is accepted for template portability with switch hooks.
         // `pr_number`/`pr_url` are populated when creating via `pr:N` / `mr:N`
         // (GitLab MRs reuse the same `pr_*` names).
-        PreStart | PostStart => &[
+        PreCreate | PostCreate => &[
             "base",
             "base_worktree_path",
             "target",
@@ -638,7 +638,7 @@ pub fn validate_template_syntax(template: &str, name: &str) -> Result<(), miniji
 /// available in `scope` (see [`vars_available_in`]). Catches syntax errors and
 /// undefined variable references *before* irreversible operations like worktree
 /// creation — including context-mismatch typos like `{{ args }}` in a hook or
-/// `{{ target }}` in a `pre-start` hook.
+/// `{{ target }}` in a `pre-create` hook.
 ///
 /// This is deliberately more permissive than real expansion: conditional vars
 /// like `upstream` are provided even when they may be absent at runtime. A
@@ -1736,7 +1736,7 @@ mod tests {
     #[test]
     fn test_validate_template_valid() {
         let test = test_repo();
-        let hook = ValidationScope::Hook(HookType::PostStart);
+        let hook = ValidationScope::Hook(HookType::PostCreate);
 
         // Static text
         assert!(validate_template("echo hello", hook, &test.repo, "test").is_ok());
@@ -1801,11 +1801,11 @@ mod tests {
             err.message
         );
 
-        // `base` is available in pre-start.
+        // `base` is available in pre-create.
         assert!(
             validate_template(
                 "{{ base }}",
-                ValidationScope::Hook(HookType::PreStart),
+                ValidationScope::Hook(HookType::PreCreate),
                 &test.repo,
                 "test"
             )
@@ -1823,18 +1823,18 @@ mod tests {
             .is_ok()
         );
 
-        // `pr_number`/`pr_url` are available in pre-start (populated when
+        // `pr_number`/`pr_url` are available in pre-create (populated when
         // creating via `pr:N` / `mr:N`).
         for var in ["pr_number", "pr_url"] {
             assert!(
                 validate_template(
                     &format!("{{{{ {var} }}}}"),
-                    ValidationScope::Hook(HookType::PreStart),
+                    ValidationScope::Hook(HookType::PreCreate),
                     &test.repo,
                     "test"
                 )
                 .is_ok(),
-                "{var} should validate in pre-start scope"
+                "{var} should validate in pre-create scope"
             );
         }
 
@@ -1856,7 +1856,7 @@ mod tests {
         assert!(
             validate_template(
                 "{{ args }}",
-                ValidationScope::Hook(HookType::PreStart),
+                ValidationScope::Hook(HookType::PreCreate),
                 &test.repo,
                 "test",
             )
@@ -1902,7 +1902,7 @@ mod tests {
 
         let err = validate_template(
             "{{ nonexistent_var }}",
-            ValidationScope::Hook(HookType::PostStart),
+            ValidationScope::Hook(HookType::PostCreate),
             &test.repo,
             "test",
         )

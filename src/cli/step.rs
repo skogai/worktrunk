@@ -249,7 +249,7 @@ Add to the project config:
 
 ```toml
 # .config/wt.toml
-[post-start]
+[post-create]
 copy = "wt step copy-ignored"
 ```
 
@@ -301,7 +301,7 @@ Reflink copies share disk blocks until modified — no data is actually copied. 
 
 Uses per-file reflink (like `cp -Rc`) — copy time scales with file count. On Unix, the process is automatically reniced to lowest priority (nice 19) so it yields to interactive work.
 
-Use the `post-start` hook so the copy runs in the background. Use `pre-start` instead if subsequent hooks or `--execute` command need the copied files immediately.
+Use the `post-create` hook so the copy runs in the background. Use `pre-create` instead if subsequent hooks or `--execute` command need the copied files immediately.
 
 ## Language-specific notes
 
@@ -314,7 +314,7 @@ The `target/` directory is huge (often 1-10GB). Copying with reflink cuts first 
 `node_modules/` is large but mostly static. If the project has no native dependencies, symlinks are even faster:
 
 ```toml
-[pre-start]
+[pre-create]
 deps = "ln -sf {{ primary_worktree_path }}/node_modules ."
 ```
 

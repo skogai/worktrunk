@@ -166,13 +166,13 @@ pub(crate) fn run_pre_switch_hooks(
 
 /// Hook types that apply after a switch operation.
 ///
-/// Creates trigger pre-start + post-start + post-switch hooks;
+/// Creates trigger pre-create + post-create + post-switch hooks;
 /// existing worktrees trigger only post-switch.
 fn switch_post_hook_types(is_create: bool) -> &'static [HookType] {
     if is_create {
         &[
-            HookType::PreStart,
-            HookType::PostStart,
+            HookType::PreCreate,
+            HookType::PostCreate,
             HookType::PostSwitch,
         ]
     } else {
@@ -249,7 +249,7 @@ pub(crate) fn switch_extra_vars<'a>(
     }
 }
 
-/// Spawn post-switch (and post-start for creates) background hooks.
+/// Spawn post-switch (and post-create for creates) background hooks.
 pub(crate) fn spawn_switch_background_hooks(
     repo: &Repository,
     config: &UserConfig,
@@ -277,7 +277,7 @@ pub(crate) fn spawn_switch_background_hooks(
         pipelines.extend(
             super::hooks::prepare_background_hooks(
                 &ctx,
-                HookType::PostStart,
+                HookType::PostCreate,
                 extra_vars,
                 hooks_display_path,
             )?
@@ -460,7 +460,7 @@ pub fn handle_switch(
 
     // Spawn background hooks after success message
     // - post-switch: runs on ALL switches (shows "@ path" when shell won't be there)
-    // - post-start: runs only when creating a NEW worktree
+    // - post-create: runs only when creating a NEW worktree
     // Batch hooks into a single message when both types are present
     if hooks_approved {
         spawn_switch_background_hooks(
@@ -474,7 +474,7 @@ pub fn handle_switch(
         )?;
     }
 
-    // Execute user command after post-start hooks have been spawned
+    // Execute user command after post-create hooks have been spawned
     // Note: execute_args requires execute via clap's `requires` attribute
     if let Some(cmd) = execute {
         // Build template context for expansion (includes base vars when creating)
@@ -543,7 +543,7 @@ pub fn handle_switch(
 /// Validates:
 /// - `--execute` command template (if present)
 /// - `--execute` trailing arg templates (if present)
-/// - Hook templates (post-create, post-start, post-switch) from user and project config
+/// - Hook templates (post-create, post-create, post-switch) from user and project config
 fn validate_switch_templates(
     repo: &Repository,
     config: &UserConfig,

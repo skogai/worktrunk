@@ -36,7 +36,7 @@ approved-commands = ["npm install"]
         config_dir.join("wt.toml"),
         r#"post-create = "npm install"
 
-[post-start]
+[post-create]
 server = "npm run dev"
 "#,
     )
@@ -1696,7 +1696,7 @@ fn test_fixing_deprecated_config_then_reintroducing_still_warns(
 
     fs::write(
         &project_config_path,
-        r#"pre-start = "ln -sf {{ repo }}/node_modules"
+        r#"pre-create = "ln -sf {{ repo }}/node_modules"
 "#,
     )
     .unwrap();
@@ -2648,7 +2648,7 @@ approved-commands = ["npm install", "npm test"]
 #[rstest]
 fn test_config_update_applies_project_config_migration(repo: TestRepo) {
     repo.write_project_config(
-        r#"post-create = "ln -sf {{ main_worktree }}/node_modules"
+        r#"pre-start = "ln -sf {{ main_worktree }}/node_modules"
 "#,
     );
     repo.commit("Add deprecated project config");
@@ -2666,9 +2666,9 @@ fn test_config_update_applies_project_config_migration(repo: TestRepo) {
     );
 
     let updated = fs::read_to_string(&project_config_path).unwrap();
-    assert!(updated.contains("pre-start"));
+    assert!(updated.contains("pre-create"));
     assert!(updated.contains("{{ repo }}"));
-    assert!(!updated.contains("post-create"));
+    assert!(!updated.contains("pre-start"));
 }
 
 /// `wt config update` with a clean project config (no deprecations) treats
@@ -2677,7 +2677,7 @@ fn test_config_update_applies_project_config_migration(repo: TestRepo) {
 #[rstest]
 fn test_config_update_clean_project_config_is_noop(repo: TestRepo) {
     repo.write_project_config(
-        r#"pre-start = "echo ready"
+        r#"pre-create = "echo ready"
 "#,
     );
     repo.commit("Add clean project config");
@@ -2748,7 +2748,7 @@ fn test_config_update_print_emits_both_configs(repo: TestRepo) {
     )
     .unwrap();
     repo.write_project_config(
-        r#"post-create = "ln -sf {{ main_worktree }}/node_modules"
+        r#"pre-start = "ln -sf {{ main_worktree }}/node_modules"
 "#,
     );
     repo.commit("Add deprecated project config");
@@ -2763,7 +2763,7 @@ fn test_config_update_print_emits_both_configs(repo: TestRepo) {
     assert!(stdout.contains("# User config"));
     assert!(stdout.contains("# Project config"));
     assert!(stdout.contains("{{ repo }}"));
-    assert!(stdout.contains("pre-start"));
+    assert!(stdout.contains("pre-create"));
 }
 
 /// `wt config update --print` on a clean config exits silently with empty
@@ -2906,7 +2906,7 @@ fn test_config_show_displays_pre_hook_table_form_deprecation(
 test = "cargo test"
 lint = "cargo clippy"
 
-[pre-start]
+[pre-create]
 install = "npm ci"
 env = "cp .env.example .env"
 "#,

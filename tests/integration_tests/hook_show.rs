@@ -31,7 +31,7 @@ user-lint = "pre-commit run --all-files"
     {test = "cargo test"},
 ]
 
-[post-start]
+[post-create]
 deps = "npm install"
 "#,
     );
@@ -88,7 +88,7 @@ fn setup_all_hook_types(repo: &TestRepo, temp_home: &TempDir) {
     {test = "cargo test"},
 ]
 
-[post-start]
+[post-create]
 deps = "npm install"
 
 [post-merge]

@@ -46,11 +46,8 @@ exit_code: 0
 ----- stdout -----
 
 ----- stderr -----
-[33m▲[39m [33mProject config: [1mpost-create[22m hook is deprecated in favor of [1mpre-start[22m[39m
-[2m↳[22m [2mTo see details, run [4mwt config show[24m; to apply updates, run [4mwt config update[24m[22m
-[36m◎[39m [36mRunning pre-start project hook @ [1m_REPO_.test-yes[22m[39m
-[107m [0m [2m[0m[2m[34mecho[0m[2m [0m[2m[32m'test command'[0m[2m [0m[2m[36m>[0m[2m output.txt
-[0m[32m✓[39m [32mCreated branch [1mtest-yes[22m from [1mmain[22m and worktree @ [1m_REPO_.test-yes[22m[39m
+[32m✓[39m [32mCreated branch [1mtest-yes[22m from [1mmain[22m and worktree @ [1m_REPO_.test-yes[22m[39m
 [2m↳[22m [2mTo customize worktree locations, run [4mwt config create[24m[22m
 [33m▲[39m [33mCannot change directory — shell integration not installed[39m
 [2m↳[22m [2mTo enable automatic cd, run [4mwt config shell install[24m[22m
+[36m◎[39m [36mRunning post-create: [1mproject[22m @ [1m_REPO_.test-yes[22m[39m

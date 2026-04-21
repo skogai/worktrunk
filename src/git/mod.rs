@@ -386,8 +386,8 @@ pub fn branch_tracks_ref(
 pub enum HookType {
     PreSwitch,
     PostSwitch,
-    PreStart,
-    PostStart,
+    PreCreate,
+    PostCreate,
     PreCommit,
     PostCommit,
     PreMerge,

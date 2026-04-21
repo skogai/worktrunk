@@ -895,10 +895,10 @@ fn setup_snapshot_settings_for_paths_with_home(
     add_standard_env_redactions(&mut settings);
 
     // Normalize timestamps in log filenames (format: YYYYMMDD-HHMMSS)
-    // Match: post-start-NAME-SHA-HHMMSS.log
+    // Match: post-create-NAME-SHA-HHMMSS.log
     settings.add_filter(
-        r"post-start-[^-]+-[0-9a-f]{7,40}-\d{6}\.log",
-        "post-start-[NAME]-[TIMESTAMP].log",
+        r"post-create-[^-]+-[0-9a-f]{7,40}-\d{6}\.log",
+        "post-create-[NAME]-[TIMESTAMP].log",
     );
 
     // Filter out Git hint messages that vary across Git versions
