@@ -51,6 +51,54 @@ Artifact paths: `-home-runner-work-worktrunk-worktrunk/<session-id>.jsonl`
 - `automated-fix` — fix PRs from triage and ci-fix workflows
 - `nightly-cleanup` — nightly sweep issues and PRs
 
+## Notifications: Skip When a Dedicated Run is Still In Progress
+
+Extends step 4a of the bundled notifications skill. The bundled dedup check
+finds comments, reviews, and timeline cross-references from *completed* bot
+runs. It misses the case where a dedicated workflow (`tend-mention`,
+`tend-review`, `tend-triage`) is **currently running** on the same subject
+but hasn't yet pushed its response — because tend-mention sessions that
+require real implementation can run 20–80 minutes, far longer than the
+bundled 10-minute freshness gate. On worktrunk this race has produced two
+expensive duplicates of in-flight dedicated work (run
+[24519963858](https://github.com/max-sixty/worktrunk/actions/runs/24519963858)
+at ~$9 / ~16 min duplicating PR #2263, and
+[24742688091](https://github.com/max-sixty/worktrunk/actions/runs/24742688091)
+at ~$25 / ~79 min duplicating PR #2361).
+
+For **same-repo stale notifications** (past the bundled skill's 10-min
+freshness gate), before doing any implementation work (branch creation,
+code edits, `gh pr create`), add this check to step 4a:
+
+```bash
+# $NOTIF_SUBJECT_URL is .subject.url from the notification record
+SUBJECT_TITLE=$(gh api "$NOTIF_SUBJECT_URL" --jq '.title')
+IN_PROGRESS=$(gh api \
+  "repos/$GITHUB_REPOSITORY/actions/runs?status=in_progress&per_page=50" \
+  | jq --arg title "$SUBJECT_TITLE" --argjson own "$GITHUB_RUN_ID" \
+      '[.workflow_runs[]
+        | select(.name | startswith("tend-"))
+        | select((.id == $own) | not)
+        | select(.display_title == $title)
+       ] | length')
+```
+
+`gh api --jq` does not accept `--arg`/`--argjson`, so pipe to a standalone
+`jq`. Avoid `!=` in jq filters authored in bash — the Bash tool rewrites `!`
+to `\!`, breaking the filter; use `. == X | not` instead.
+
+If `IN_PROGRESS > 0`, **skip without marking read** (same behavior as the
+bundled freshness gate). The next scheduled poll picks it up once the
+dedicated run either completes (existing dedup then finds its response and
+marks read) or fails (the stale-items path processes it).
+
+Match on `display_title` because `issue_comment` / `pull_request_review`
+events surface the issue or PR title there; the workflow_run payload
+doesn't expose the triggering issue number directly without a second API
+call per run. Title collisions across different subjects are rare enough
+that skipping one unrelated notification is cheaper than one duplicate
+implementation session.
+
 ## CI Fix: Prefer Rerun for Transient Infrastructure Failures
 
 Before opening a `fix/ci-*` PR, classify the failure:
