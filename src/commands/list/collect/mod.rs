@@ -769,7 +769,7 @@ pub fn collect(
 
     // Sort worktrees: current first, main second, then by timestamp descending
     let sorted_worktrees = sort_worktrees_with_cache(
-        worktrees.to_vec(),
+        worktrees,
         &main_worktree,
         current_worktree_path.as_ref(),
         &commit_details_map,
@@ -1516,14 +1516,14 @@ where
 /// Sort worktrees: current first, main second, then by timestamp descending.
 /// Uses the pre-fetched commit-details map for efficiency.
 fn sort_worktrees_with_cache(
-    worktrees: Vec<WorktreeInfo>,
+    worktrees: &[WorktreeInfo],
     main_worktree: &WorktreeInfo,
     current_path: Option<&std::path::PathBuf>,
     commit_details: &std::collections::HashMap<String, (i64, String)>,
 ) -> Vec<WorktreeInfo> {
     // Embed timestamp and priority in tuple to avoid parallel Vec and index lookups
     let mut with_sort_key: Vec<_> = worktrees
-        .into_iter()
+        .iter()
         .map(|wt| {
             let priority = if current_path.is_some_and(|cp| &wt.path == cp) {
                 0 // Current first
@@ -1538,7 +1538,10 @@ fn sort_worktrees_with_cache(
         .collect();
 
     with_sort_key.sort_by_key(|(_, priority, ts)| (*priority, std::cmp::Reverse(*ts)));
-    with_sort_key.into_iter().map(|(wt, _, _)| wt).collect()
+    with_sort_key
+        .into_iter()
+        .map(|(wt, _, _)| wt.clone())
+        .collect()
 }
 
 // ============================================================================
