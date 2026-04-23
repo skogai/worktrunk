@@ -796,7 +796,7 @@ pub fn handle_state_clear(key: &str, branch: Option<String>, all: bool) -> anyho
             }
         }
         "previous-branch" => {
-            if repo.unset_config("worktrunk.history").unwrap_or(false) {
+            if repo.unset_config("worktrunk.history")? {
                 eprintln!("{}", success_message("Cleared previous branch"));
             } else {
                 eprintln!("{}", info_message("No previous branch to clear"));
@@ -804,7 +804,7 @@ pub fn handle_state_clear(key: &str, branch: Option<String>, all: bool) -> anyho
         }
         "ci-status" => {
             if all {
-                let cleared = CachedCiStatus::clear_all(&repo);
+                let cleared = CachedCiStatus::clear_all(&repo)?;
                 if cleared == 0 {
                     eprintln!("{}", info_message("No CI cache entries to clear"));
                 } else {
@@ -822,7 +822,7 @@ pub fn handle_state_clear(key: &str, branch: Option<String>, all: bool) -> anyho
                     Some(b) => b,
                     None => repo.require_current_branch("clear ci-status for current branch")?,
                 };
-                if CachedCiStatus::clear_one(&repo, &branch_name) {
+                if CachedCiStatus::clear_one(&repo, &branch_name)? {
                     eprintln!(
                         "{}",
                         success_message(cformat!("Cleared CI cache for <bold>{branch_name}</>"))
@@ -837,18 +837,7 @@ pub fn handle_state_clear(key: &str, branch: Option<String>, all: bool) -> anyho
         }
         "marker" => {
             if all {
-                let output = repo
-                    .run_command(&["config", "--get-regexp", r"^worktrunk\.state\..+\.marker$"])
-                    .unwrap_or_default();
-
-                let mut cleared_count = 0;
-                for line in output.lines() {
-                    if let Some(config_key) = line.split_whitespace().next() {
-                        repo.unset_config(config_key)?;
-                        cleared_count += 1;
-                    }
-                }
-
+                let cleared_count = clear_all_markers(&repo)?;
                 if cleared_count == 0 {
                     eprintln!("{}", info_message("No markers to clear"));
                 } else {
@@ -867,7 +856,7 @@ pub fn handle_state_clear(key: &str, branch: Option<String>, all: bool) -> anyho
                 };
 
                 let config_key = format!("worktrunk.state.{branch_name}.marker");
-                if repo.unset_config(&config_key).unwrap_or(false) {
+                if repo.unset_config(&config_key)? {
                     eprintln!(
                         "{}",
                         success_message(cformat!("Cleared marker for <bold>{branch_name}</>"))
@@ -910,28 +899,19 @@ pub fn handle_state_clear_all() -> anyhow::Result<()> {
     let mut cleared_any = false;
 
     // Clear default branch cache
-    if matches!(repo.clear_default_branch_cache(), Ok(true)) {
+    if repo.clear_default_branch_cache()? {
         eprintln!("{}", success_message("Cleared default branch cache"));
         cleared_any = true;
     }
 
     // Clear previous branch
-    if repo.unset_config("worktrunk.history").unwrap_or(false) {
+    if repo.unset_config("worktrunk.history")? {
         eprintln!("{}", success_message("Cleared previous branch"));
         cleared_any = true;
     }
 
     // Clear all markers
-    let markers_output = repo
-        .run_command(&["config", "--get-regexp", r"^worktrunk\.state\..+\.marker$"])
-        .unwrap_or_default();
-    let mut markers_cleared = 0;
-    for line in markers_output.lines() {
-        if let Some(config_key) = line.split_whitespace().next() {
-            let _ = repo.unset_config(config_key);
-            markers_cleared += 1;
-        }
-    }
+    let markers_cleared = clear_all_markers(&repo)?;
     if markers_cleared > 0 {
         eprintln!(
             "{}",
@@ -944,7 +924,7 @@ pub fn handle_state_clear_all() -> anyhow::Result<()> {
     }
 
     // Clear all CI status cache
-    let ci_cleared = CachedCiStatus::clear_all(&repo);
+    let ci_cleared = CachedCiStatus::clear_all(&repo)?;
     if ci_cleared > 0 {
         eprintln!(
             "{}",
@@ -1409,7 +1389,7 @@ pub fn handle_vars_clear(
             let count = entries.len();
             for (key, _) in entries {
                 let config_key = format!("worktrunk.state.{branch_name}.vars.{key}");
-                let _ = repo.unset_config(&config_key);
+                repo.unset_config(&config_key)?;
             }
             eprintln!(
                 "{}",
@@ -1423,7 +1403,7 @@ pub fn handle_vars_clear(
         let key = key.expect("key required when --all not set");
         validate_vars_key(key)?;
         let config_key = format!("worktrunk.state.{branch_name}.vars.{key}");
-        if repo.unset_config(&config_key).unwrap_or(false) {
+        if repo.unset_config(&config_key)? {
             eprintln!(
                 "{}",
                 success_message(cformat!(
@@ -1442,6 +1422,27 @@ pub fn handle_vars_clear(
     Ok(())
 }
 
+/// Clear all branch markers. Used by `state clear marker --all` and
+/// `state clear --all`.
+///
+/// `git config --get-regexp` exits 1 when no keys match, which `run_command`
+/// surfaces as an error; `.unwrap_or_default()` absorbs that as the "nothing
+/// to clear" path. Errors from individual `unset_config` calls during the
+/// iteration (corrupt config, permission denied) propagate.
+fn clear_all_markers(repo: &Repository) -> anyhow::Result<usize> {
+    let output = repo
+        .run_command(&["config", "--get-regexp", r"^worktrunk\.state\..+\.marker$"])
+        .unwrap_or_default();
+    let mut cleared = 0;
+    for line in output.lines() {
+        if let Some(config_key) = line.split_whitespace().next() {
+            repo.unset_config(config_key)?;
+            cleared += 1;
+        }
+    }
+    Ok(cleared)
+}
+
 /// Clear all vars entries across all branches (used by handle_state_clear_all).
 fn clear_all_vars(repo: &Repository) -> anyhow::Result<usize> {
     let all_vars = repo.all_vars_entries();
@@ -1449,7 +1450,7 @@ fn clear_all_vars(repo: &Repository) -> anyhow::Result<usize> {
     for (branch, entries) in &all_vars {
         for key in entries.keys() {
             let config_key = format!("worktrunk.state.{branch}.vars.{key}");
-            let _ = repo.unset_config(&config_key);
+            repo.unset_config(&config_key)?;
             cleared += 1;
         }
     }
