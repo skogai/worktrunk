@@ -26,6 +26,7 @@ use rayon::prelude::*;
 use worktrunk::HookType;
 use worktrunk::config::{CopyIgnoredConfig, UserConfig};
 use worktrunk::copy::{copy_dir_recursive, copy_leaf};
+use worktrunk::copy_progress::{CopyProgress, format_bytes};
 use worktrunk::git::{Repository, WorktreeInfo};
 use worktrunk::path::format_path_for_display;
 use worktrunk::shell_exec::Cmd;
@@ -805,7 +806,15 @@ pub fn step_copy_ignored(
         }
     }
 
+    // `start` auto-detects the TTY; verbose/dry-run already print enough.
+    let progress = if verbose >= 1 || dry_run {
+        CopyProgress::disabled()
+    } else {
+        CopyProgress::start()
+    };
+
     let mut copied_count = 0usize;
+    let mut copied_bytes = 0u64;
     for (src_entry, is_dir) in &entries_to_copy {
         let relative = src_entry
             .strip_prefix(&source_path)
@@ -813,10 +822,12 @@ pub fn step_copy_ignored(
         let dest_entry = dest_path.join(relative);
 
         if *is_dir {
-            copied_count +=
-                copy_dir_recursive(src_entry, &dest_entry, force).with_context(|| {
+            let (n, b) = copy_dir_recursive(src_entry, &dest_entry, force, &progress)
+                .with_context(|| {
                     format!("copying directory {}", format_path_for_display(relative))
                 })?;
+            copied_count += n;
+            copied_bytes += b;
         } else {
             if let Some(parent) = dest_entry.parent() {
                 fs::create_dir_all(parent).with_context(|| {
@@ -826,17 +837,23 @@ pub fn step_copy_ignored(
                     )
                 })?;
             }
-            if copy_leaf(src_entry, &dest_entry, force)? {
+            if let Some(bytes) = copy_leaf(src_entry, &dest_entry, force)? {
                 copied_count += 1;
+                copied_bytes += bytes;
+                progress.file_copied(bytes);
             }
         }
     }
+    progress.finish();
 
     // Show summary
     let file_word = if copied_count == 1 { "file" } else { "files" };
     eprintln!(
         "{}",
-        success_message(format!("Copied {copied_count} {file_word}"))
+        success_message(format!(
+            "Copied {copied_count} {file_word} · {}",
+            format_bytes(copied_bytes)
+        ))
     );
 
     Ok(())
@@ -904,7 +921,7 @@ fn move_entry(src: &Path, dest: &Path, is_dir: bool) -> anyhow::Result<()> {
 /// Copy then delete — fallback when `rename` fails with EXDEV (cross-device).
 fn copy_and_remove(src: &Path, dest: &Path, is_dir: bool) -> anyhow::Result<()> {
     if is_dir {
-        copy_dir_recursive(src, dest, true)?;
+        copy_dir_recursive(src, dest, true, &CopyProgress::disabled())?;
         fs::remove_dir_all(src).context(format!("removing source directory {}", src.display()))?;
     } else {
         copy_leaf(src, dest, true)?;
