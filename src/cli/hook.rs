@@ -40,6 +40,7 @@ use std::ffi::OsString;
 
 use anyhow::{Context, bail};
 use clap::Subcommand;
+use clap::builder::PossibleValuesParser;
 use worktrunk::HookType;
 
 use super::config::ApprovalsCommand;
@@ -74,12 +75,18 @@ pub enum HookCommand {
     /// Lists user and project hooks. Project hooks show approval status (❓ = needs approval).
     Show {
         /// Hook type to show (default: all)
-        #[arg(value_parser = ["pre-switch", "post-switch", "pre-start", "post-start", "pre-commit", "post-commit", "pre-merge", "post-merge", "pre-remove", "post-remove"])]
+        #[arg(value_parser = PossibleValuesParser::new(HOOK_TYPE_NAMES))]
         hook_type: Option<String>,
 
         /// Show expanded commands with current variables
         #[arg(long)]
         expanded: bool,
+
+        /// Output format
+        ///
+        /// JSON prints structured result to stdout — one record per configured command.
+        #[arg(long, default_value = "text", help_heading = "Automation")]
+        format: crate::cli::SwitchFormat,
     },
 
     /// Internal: run a serialized pipeline from stdin
@@ -129,9 +136,10 @@ pub struct HookOptions {
 /// hint on typos (same `did_you_mean` helper used for unknown subcommands).
 ///
 /// `post-create` is the deprecated alias for `pre-start` — accepted here so
-/// scripted invocations keep working. The deprecation warning is emitted by
-/// the config loader when `[post-create]` appears in config; CLI invocations
-/// map silently to `pre-start`.
+/// scripted invocations keep working. The deprecation warning for the config
+/// section `[post-create]` is emitted by the config loader; the warning for
+/// the CLI invocation `wt hook post-create` is emitted by the dispatcher in
+/// `main.rs` before `HookOptions::parse` runs.
 pub fn parse_hook_type(name: &str) -> anyhow::Result<HookType> {
     match name {
         "pre-switch" => Ok(HookType::PreSwitch),

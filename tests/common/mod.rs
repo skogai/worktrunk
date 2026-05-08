@@ -580,6 +580,20 @@ fn add_snapshot_path_prelude_filters(settings: &mut insta::Settings) {
     // Normalize llvm-cov-target to target for coverage builds (cargo-llvm-cov)
     settings.add_filter(r"/target/llvm-cov-target/", "/target/");
 
+    // Normalize cargo-affected's instrumented build dir to target/. cargo-affected
+    // routes its instrumented build to target/affected/build/ to avoid invalidating
+    // the project's normal target/ — see max-sixty/cargo-affected#12.
+    settings.add_filter(r"/target/affected/build/", "/target/");
+
+    // Normalize cross-target build dirs (target/<triple>/) to target/ when tests
+    // run via `cargo nextest run --target <triple>` — used by the nightly
+    // `release-target` matrix (musl, intel-darwin). Anchored on the vendor
+    // field of a Rust target triple to avoid matching unrelated subdirs.
+    settings.add_filter(
+        r"/target/[a-z0-9_]+-(?:unknown|apple|pc|wasi)-[a-z0-9_-]+/",
+        "/target/",
+    );
+
     // Deliberately no global `\\` → `/` normalization here: it corrupts
     // intentional backslashes (JSON `\u001b` ANSI escapes, shell line
     // continuations) and worktrunk already emits forward-slash paths via
@@ -903,6 +917,13 @@ fn setup_snapshot_settings_for_paths_with_home(
 
     add_remove_stats_byte_filter(&mut settings);
 
+    // Normalize the platform shell basename so cross-platform snapshots match.
+    // `wt step {commit,squash} --dry-run` renders the LLM shell invocation,
+    // which is `sh` on Unix and `bash.exe` on Windows (Git Bash). No `\b`: the
+    // syntax-highlighted output puts an ANSI code (`...m`) immediately before
+    // `bash`, and `m` is a word char so `\bbash` wouldn't see a word boundary.
+    settings.add_filter(r"bash\.exe", "sh");
+
     // Filter out Git hint messages that vary across Git versions
     // These hints appear during rebase conflicts and can differ between versions
     // Pattern matches lines with gutter formatting + "hint:" + message + newline
@@ -1183,12 +1204,12 @@ pub fn add_pty_filters(settings: &mut insta::Settings) {
 ///
 /// Test binaries are run from the cargo target directory, which varies.
 pub fn add_pty_binary_path_filters(settings: &mut insta::Settings) {
-    // Match paths ending in target/debug/wt or target/release/wt
-    // Also handles llvm-cov-target used by cargo-llvm-cov
-    settings.add_filter(
-        r"[^\s]+/target/(?:llvm-cov-target/)?(?:debug|release)/wt",
-        "[BIN]",
-    );
+    // Match paths ending in target/.../{debug,release}/wt — covers the
+    // default layout (`target/debug/wt`), cargo-llvm-cov (`llvm-cov-target/`),
+    // cargo-affected (`affected/build/`, max-sixty/cargo-affected#12), and
+    // cross-target builds (e.g. `target/x86_64-unknown-linux-musl/debug/wt`
+    // from the nightly `release-target` matrix).
+    settings.add_filter(r"[^\s]+/target/(?:[^/\s]+/)*(?:debug|release)/wt", "[BIN]");
 }
 
 // =============================================================================

@@ -5,9 +5,9 @@ default-members = [".", "tests/helpers/mock-stub", "tests/helpers/wt-perf"]
 
 [package]
 name = "worktrunk"
-version = "0.44.0"
+version = "0.48.0"
 edition = "2024"
-rust-version = "1.93"
+rust-version = "1.94"
 build = "build.rs"
 repository = "https://github.com/max-sixty/worktrunk"
 homepage = "https://worktrunk.dev"
@@ -80,8 +80,8 @@ anyhow = "1.0"
 anstream = "1.0"
 anstyle = "1.0"
 ansi-str = "0.9"
-color-print = "0.3"
-askama = { version = "0.15", default-features = false, features = ["derive", "std"] }
+color-print = "0.3.7"
+askama = { version = "0.16", default-features = false, features = ["derive", "std"] }
 chrono = "0.4"
 clap = { version = "4.6", features = ["derive", "unstable-ext", "wrap_help"], optional = true }
 clap_complete = { version = "4.6", features = ["unstable-dynamic"], optional = true }
@@ -93,7 +93,7 @@ etcetera = "0.11"
 log = "0.4"
 # Only enable needed features - saves ~200KB by excluding debug, macros, multi_template
 minijinja = { version = "2.19", default-features = false, features = ["builtins", "serde", "std_collections"] }
-rayon = "1.11"
+rayon = "1.12"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 shell-escape = "0.1"

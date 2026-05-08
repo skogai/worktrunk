@@ -36,11 +36,13 @@ Use consistent terminology in documentation, help text, and code comments:
 
 ## Skills
 
-Check `.claude/skills/` for available skills and load those relevant to your task.
+**Load relevant skills before starting work, and reload when scope changes mid-session.**
 
-Key skills:
+Project-local skills in `.claude/skills/`:
 
-- **`writing-user-outputs`** — Required when modifying user-facing messages, hints, warnings, errors, or any terminal output formatting. Documents ANSI color nesting rules, message patterns, and output system architecture.
+- `writing-user-outputs` — load before editing any code that calls `warning_message`, `hint_message`, `error_message`, `info_message`, `eprintln`, or `println`, or that produces strings the user sees (CLI help, progress UI, snapshot text).
+- `running-tend` — operating in CI or writing tend workflows.
+- `release` — cutting a release.
 
 ## Testing
 
@@ -242,6 +244,14 @@ if msg.contains("no merge base") { return Ok(true); }
 
 When no structured alternative exists, document the fragility inline.
 
+### Network Access
+
+**Policy:** worktrunk is local-first. The network is touched only when the user asked for it. The single exception is the *first* call to `Repository::default_branch()` per repo, which may fall through to `git ls-remote` to discover the default branch name; the result caches in `worktrunk.default-branch` and every subsequent call is local. No other detection helper may add a similar fallback.
+
+**Why:** "lookup" paths that silently walk to the wire (alias dispatch, hook context build, `wt statusline`, recovery) stall commands the user wouldn't expect to do network work — most painfully on a fresh clone. Allowing the `default_branch()` bootstrap keeps worktrunk usable on a fresh clone while bounding the exception to one helper that fires at most once per repo.
+
+**Implementation:** before adding a new accessor that could fall through to the wire (`gh`, `glab`, `git fetch`, `git ls-remote`, HTTP), confirm the call site is one the user explicitly invoked. Background polling driven by a TTL cache counts — a CI-status check on every shell prompt is invisible to the user but still hits the wire, and is therefore not allowed.
+
 ### Signal Handling: Ctrl-C Cancels the Current Command
 
 **Policy:** when a child process exits from a signal (SIGINT, SIGTERM), every loop in the foreground execution path MUST abort rather than continue to the next iteration. This applies to worktree loops (`wt step for-each`), hook pipelines, alias steps, concurrent groups, and any future code that runs multiple child processes in sequence.
@@ -251,11 +261,11 @@ When no structured alternative exists, document the fragility inline.
 **Implementation:**
 
 - Signal-derived child exits surface as `WorktrunkError::ChildProcessExited { signal: Some(sig), .. }`. The `signal` field is the structured channel — never sniff `code >= 128` or parse error messages.
-- Use `worktrunk::git::interrupt_exit_code(&err)` to detect them. When it returns `Some(exit_code)`, propagate via `WorktrunkError::AlreadyDisplayed { exit_code }` (`128 + sig` by convention — 130 for SIGINT, 143 for SIGTERM) and break the loop.
+- Use `err.interrupt_exit_code()` (from the `worktrunk::git::ErrorExt` trait) to detect them. When it returns `Some(exit_code)`, propagate via `WorktrunkError::AlreadyDisplayed { exit_code }` (`128 + sig` by convention — 130 for SIGINT, 143 for SIGTERM) and break the loop.
 - The check happens **before** any `FailureStrategy` branch — Warn must NOT swallow signal-derived errors.
 - `handle_command_error` in `src/commands/command_executor.rs` enforces the policy for hook and alias pipelines (foreground and concurrent groups). `for_each.rs` enforces it directly for the worktree loop.
 
-When adding a new code path that loops over child processes, run `interrupt_exit_code` on per-iteration errors and break.
+When adding a new code path that loops over child processes, call `.interrupt_exit_code()` on per-iteration errors and break.
 
 ## Hook Output Logs
 
@@ -263,8 +273,9 @@ Hook output logs are centralized in `.git/wt/logs/` (main worktree's git directo
 
 - **Background hooks**: `{branch}/{source}/{hook-type}/{name}.log` (source: `user` or `project`)
 - **Background removal**: `{branch}/internal/remove.log`
+- **Repo-wide internal ops** (e.g. trash sweep): `internal/{op}.log` (no branch segment)
 
-Top-level *files* are shared logs (`commands.jsonl*`, `trace.log`, `output.log`, `diagnostic.md`); top-level *directories* are per-branch log trees. Branch and hook names are sanitized via `sanitize_for_filename`: already-safe names pass through unchanged; names with invalid characters have them replaced with `-` and a short collision-avoidance hash appended.
+Top-level *files* are shared logs (`commands.jsonl*`, `trace.log`, `output.log`, `diagnostic.md`). The top-level `internal/` directory holds repo-wide internal-op logs alongside those files; every other top-level directory is a per-branch log tree. Branch and hook names are sanitized via `sanitize_for_filename`: already-safe names pass through unchanged; names with invalid characters have them replaced with `-` and a short collision-avoidance hash appended.
 
 ## Coverage
 
@@ -288,6 +299,8 @@ cargo llvm-cov report --show-missing-lines | grep <file>   # find uncovered line
 
 For each uncovered function/method, either write a test or document why it's intentionally untested. Integration tests (via `assert_cmd_snapshot!`) do capture subprocess coverage.
 
+`cargo llvm-cov report --show-missing-lines` is the authoritative miss list — it matches codecov line-for-line. If codecov's compare API must be queried directly, `coverage.head` is a `LineType` enum: `0=hit`, `1=miss`, `2=partial`.
+
 **Renames and moves:** File renames (`git mv`) can trigger codecov/patch failures on pre-existing uncovered lines — codecov treats changed lines in renamed files as part of the patch. If the uncovered lines are unchanged and existed before the rename, this is a false positive. Verify by checking coverage on `main` for the same lines under the old path.
 
 ### "N functions have mismatched data" Warning
@@ -296,14 +309,32 @@ For each uncovered function/method, either write a test or document why it's int
 
 ## Benchmarks
 
-Benchmarks measure `wt list` performance across worktree counts and repository sizes.
+Benchmarks measure `wt list` performance across worktree counts and repository sizes. Criterion takes a positional `FILTER` (substring inclusion) — there's no `--skip`. Pick a filter that *includes* what you want.
 
 ```bash
-cargo bench --bench list -- --skip cold --skip real   # fast synthetic benchmarks
-cargo bench --bench list bench_list_by_worktree_count # specific benchmark
+cargo bench --bench list skeleton          # fast synthetic group only
+cargo bench --bench list scaling/warm      # one variant
+cargo bench --bench alias                  # alias-dispatch overhead
 ```
 
-Real repo benchmarks clone rust-lang/rust (~2-5 min first run, cached thereafter). Skip with `--skip real`. See `benches/CLAUDE.md` for methodology and adding new benchmarks.
+Real-repo benchmarks (`real_repo`, `real_repo_many_branches`) clone rust-lang/rust on first run (~2–5 min, cached at `target/bench-repos/rust/`). To skip them, name a synthetic group instead. See `benches/CLAUDE.md` for the full filter map, expected numbers, and adding new benchmarks.
+
+## Traces
+
+To trace a single `wt` invocation, use `wt-perf timeline` (text timeline by default; `--chrome` emits Chrome Trace Format JSON for Perfetto/chrome://tracing):
+
+```bash
+cargo run -p wt-perf -- timeline -- list --progressive
+cargo run -p wt-perf -- timeline --cold --repo /tmp/wt-perf-typical-8 -- \
+  -C /tmp/wt-perf-typical-8 list --progressive
+cargo run -p wt-perf -- timeline --chrome -- list --progressive > trace.json
+```
+
+The summary distinguishes `traced` (first → last `[wt-trace]` record) from `wall` (externally-measured spawn → wait); the gap between them is prelude/epilogue not visible to the trace. See `benches/CLAUDE.md` → "Generating traces" for the SQL-query path via `trace_processor`.
+
+### Don't wait for CI `benchmarks` before merging
+
+The `benchmarks` job is non-required — only `test (linux)`, `test (macos)`, and `test (windows)` block merge. Bench runs can take 80+ minutes (the `rust-lang/rust` clone plus a full `cargo bench`) and are often still pending when required checks have already passed. `gh pr view` reports `mergeStateStatus: UNSTABLE` in that state — that's mergeable, and it's generally fine to merge without waiting.
 
 ## JSON Output Format
 
@@ -448,9 +479,11 @@ Most data is stable for the duration of a command. `Repository` caches read-only
 
 **Not cached (changes during command execution):**
 - `is_dirty()` — changes as we stage/commit
-- `list_worktrees()` — changes as we create/remove worktrees
+- `head_sha()` — HEAD moves on commit/rebase/merge; a stale SHA would surface in `{{ commit }}` for hooks that fire after the move
 
-When adding new cached methods, see `RepoCache` in `src/git/repository/mod.rs` for patterns (repo-wide via `OnceCell`, per-worktree via `DashMap`).
+`list_worktrees()` *is* cached, even though `wt switch --create` / `wt remove` mutate the underlying list. The invariant is that mutating paths must not read the list through the same `Repository` after their own mutation: either read once up front and thread the slice through, or call `Repository::at(...)` again to get a fresh cache before any post-mutation probe.
+
+When adding new cached methods, see `RepoCache` in `src/git/repository/mod.rs` for patterns (repo-wide via `OnceCell`, per-worktree via `DashMap`) and the full caching contract.
 
 ## Releases
 

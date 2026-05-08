@@ -1,6 +1,6 @@
 ---
 name: writing-user-outputs
-description: CLI output formatting standards for worktrunk. Use when writing user-facing messages, error handling, progress output, hints, warnings, or working with the output system.
+description: CLI output formatting standards for worktrunk. Load before editing any code that calls warning_message, hint_message, error_message, info_message, eprintln, or println, or that produces strings the user will see (CLI help, progress UI, snapshot text). Documents ANSI color nesting rules, message patterns, and output system architecture.
 metadata:
   internal: true
 ---
@@ -103,6 +103,23 @@ Examples:
 - `wt list` → table/JSON to stdout (for grep, jq, scripts)
 - `wt config shell init` → shell code to stdout (for `eval`)
 - `wt switch` → status messages only (nothing to pipe)
+
+## When to page output
+
+Route long, human-oriented stdout through `crate::help_pager::show_help_in_pager`. The helper TTY-detects internally, so piping (`wt … | grep`) keeps working.
+
+Page when output is human-oriented (headings, gutters, structure) and plausibly exceeds one screen. Don't page pipe-first data (tables, JSON, shell code), short output, or output already paged by a delegated tool (`git diff`).
+
+Examples that page: `--help`, `wt config show`, `wt hook show`, `wt step {commit,squash} --dry-run`. Examples that don't: `wt list`, `wt step diff`, `wt step eval`, `--show-prompt` (pipe-first by design).
+
+Build the whole output into a `String` first (don't stream), then:
+
+```rust
+if let Err(e) = crate::help_pager::show_help_in_pager(&out, true) {
+    log::debug!("Pager failed, falling back to stdout: {}", e);
+    println!("{}", out);
+}
+```
 
 ## Security
 

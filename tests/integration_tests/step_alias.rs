@@ -273,6 +273,42 @@ deploy = [
     assert_cmd_snapshot!(cmd);
 }
 
+/// Alias body output is delivered on stdout so it can be piped into other
+/// commands (#2478). Worktrunk's own progress/announcement messages still go
+/// to stderr; only the child shell's stdout passes through.
+#[rstest]
+fn test_alias_body_writes_to_stdout(mut repo: TestRepo) {
+    repo.write_project_config(
+        r#"
+[aliases]
+emit = "echo hello"
+"#,
+    );
+    repo.commit("Add alias config");
+    let feature_path = repo.add_worktree("feature");
+
+    let output = repo
+        .wt_command()
+        .args(["-y", "emit"])
+        .current_dir(&feature_path)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "alias failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.lines().any(|line| line.trim() == "hello"),
+        "expected `hello` on stdout (so `wt <alias> | …` is usable in scripts), \
+         got stdout={stdout:?} stderr={stderr:?}"
+    );
+}
+
 /// Alias command failure propagates exit code (-y bypasses approval)
 #[rstest]
 fn test_step_alias_exit_code(mut repo: TestRepo) {
@@ -766,6 +802,172 @@ new-branch = "'{wt_toml}' switch --create alias-created"
     );
 }
 
+/// User-source aliases pass the EXEC directive file through to the body, so a
+/// nested `wt switch --execute X` writes the payload back to the parent
+/// shell's EXEC file the same as a top-level `wt switch --execute X` would.
+///
+/// Regression test for #2101: the conservative scrub used to refuse `--execute`
+/// inside any alias body, breaking workflows like `issue = "wt switch --create
+/// {{ args[0] }} --execute claude"` even when the alias lived in user config.
+#[rstest]
+fn test_user_alias_passes_exec_directive(repo: TestRepo) {
+    repo.commit("initial");
+    let wt = wt_bin();
+    let wt_str = wt.to_string_lossy();
+    assert!(
+        !wt_str.contains('\''),
+        "wt binary path should not contain single quotes: {wt_str}"
+    );
+    let wt_toml = wt_str.replace('\\', r"\\");
+
+    repo.write_test_config(&format!(
+        r#"
+[aliases]
+exec-passthrough = "'{wt_toml}' switch --create user-alias-target --execute 'echo from-user-alias'"
+"#
+    ));
+
+    let (cd_path, exec_path, _guard) = directive_files();
+
+    let mut cmd = repo.wt_command();
+    configure_directive_files(&mut cmd, &cd_path, &exec_path);
+    cmd.args(["step", "exec-passthrough"]);
+    let output = cmd.output().unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "wt step exec-passthrough failed: stdout={}\nstderr={stderr}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert!(
+        !stderr.contains("disabled inside"),
+        "user alias should not trip the EXEC scrub warning, got: {stderr}"
+    );
+
+    let exec_content = std::fs::read_to_string(&exec_path).unwrap_or_default();
+    assert!(
+        exec_content.contains("echo from-user-alias"),
+        "EXEC file should contain the alias's --execute payload, got: {exec_content:?}"
+    );
+}
+
+/// Project-source aliases keep the conservative EXEC scrub: a nested
+/// `wt switch --execute X` is refused with a warning pointing at the tracking
+/// issue. The body is shared config, so allowing it would let the project
+/// inject arbitrary shell into every contributor's interactive session.
+#[rstest]
+fn test_project_alias_scrubs_exec_directive(repo: TestRepo) {
+    repo.commit("initial");
+    let wt = wt_bin();
+    let wt_str = wt.to_string_lossy();
+    assert!(
+        !wt_str.contains('\''),
+        "wt binary path should not contain single quotes: {wt_str}"
+    );
+    let wt_toml = wt_str.replace('\\', r"\\");
+
+    repo.write_project_config(&format!(
+        r#"
+[aliases]
+exec-blocked = "'{wt_toml}' switch --create project-alias-target --execute 'echo should-not-pass'"
+"#
+    ));
+
+    let (cd_path, exec_path, _guard) = directive_files();
+
+    let mut cmd = repo.wt_command();
+    configure_directive_files(&mut cmd, &cd_path, &exec_path);
+    // -y skips the project-alias approval prompt.
+    cmd.args(["-y", "step", "exec-blocked"]);
+    let output = cmd.output().unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "wt -y step exec-blocked failed: stdout={}\nstderr={stderr}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert!(
+        stderr.contains("disabled inside project alias"),
+        "project alias should warn that --execute is disabled, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("issues/2101"),
+        "warning should link the tracking issue, got: {stderr}"
+    );
+
+    let exec_content = std::fs::read_to_string(&exec_path).unwrap_or_default();
+    assert!(
+        !exec_content.contains("should-not-pass"),
+        "EXEC file should NOT contain the scrubbed payload, got: {exec_content:?}"
+    );
+}
+
+/// Same alias name in both user and project configs: EXEC passes through for
+/// the user-source step but is scrubbed for the project-source step.
+///
+/// EXEC passthrough is a per-step decision driven by `HookSource` on each
+/// `SourcedStep`, not a per-pipeline scrub. When both sources define the
+/// alias, both run (user first, then project) — the user's own step still
+/// gets the relaxation, and the project-authored step keeps the conservative
+/// scrub even though it's part of the same merged body.
+#[rstest]
+fn test_user_and_project_alias_collision_scrubs_only_project_step(repo: TestRepo) {
+    repo.commit("initial");
+    let wt = wt_bin();
+    let wt_str = wt.to_string_lossy();
+    assert!(
+        !wt_str.contains('\''),
+        "wt binary path should not contain single quotes: {wt_str}"
+    );
+    let wt_toml = wt_str.replace('\\', r"\\");
+
+    repo.write_test_config(&format!(
+        r#"
+[aliases]
+shared = "'{wt_toml}' switch --create user-step-target --execute 'echo from-user-step'"
+"#
+    ));
+    // Project step also tries `--execute` so we can assert its payload is
+    // scrubbed even though the user step's payload passes through.
+    repo.write_project_config(&format!(
+        r#"
+[aliases]
+shared = "'{wt_toml}' switch --create project-step-target --execute 'echo from-project-step'"
+"#,
+    ));
+
+    let (cd_path, exec_path, _guard) = directive_files();
+
+    let mut cmd = repo.wt_command();
+    configure_directive_files(&mut cmd, &cd_path, &exec_path);
+    // -y skips the project-alias approval prompt.
+    cmd.args(["-y", "step", "shared"]);
+    let output = cmd.output().unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "wt -y step shared failed: stdout={}\nstderr={stderr}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert!(
+        stderr.contains("disabled inside project alias"),
+        "project-source step should still warn that --execute is disabled, got: {stderr}"
+    );
+
+    let exec_content = std::fs::read_to_string(&exec_path).unwrap_or_default();
+    assert!(
+        exec_content.contains("from-user-step"),
+        "EXEC file should contain the user step's payload (per-step relaxation), got: {exec_content:?}"
+    );
+    assert!(
+        !exec_content.contains("from-project-step"),
+        "EXEC file should NOT contain the project step's payload (per-step scrub), got: {exec_content:?}"
+    );
+}
+
 /// Alias subprocesses inherit the parent's stdin so interactive children
 /// (e.g. `wt switch`'s picker) keep the controlling terminal.
 ///
@@ -943,6 +1145,189 @@ fail = "exit 1"
     assert!(
         !output.status.success(),
         "wt step check should fail when a concurrent step exits non-zero"
+    );
+}
+
+/// Aliases must run their child in wt's process group when stdin is inherited,
+/// not isolate it in a new pgroup. Interactive children (`wt switch`'s picker,
+/// pagers, anything that calls `tcsetattr` on `/dev/tty`) only work when they
+/// share the foreground tty pgroup — otherwise the kernel sends SIGTTOU and
+/// stops the child mid-render. We check the invariant directly: the alias body
+/// records its shell pgid, and we assert it matches wt's pid (== wt's pgid
+/// because the test spawns wt as its own pgroup leader).
+#[rstest]
+#[cfg(unix)]
+fn test_alias_child_shares_parent_pgroup(repo: TestRepo) {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    repo.write_test_config(
+        r#"
+[aliases]
+record-pgid = "ps -o pgid= -p $$ | tr -d ' \n' > alias_pgid.txt"
+"#,
+    );
+    repo.commit("initial");
+
+    let mut cmd = repo.wt_command();
+    cmd.args(["step", "record-pgid"]);
+    cmd.current_dir(repo.root_path());
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
+    // wt becomes its own pgroup leader: wt.pid == wt.pgid. The alias child
+    // (a `sh -c '...'` shell) should inherit that pgid rather than being
+    // moved into a new group.
+    cmd.process_group(0);
+    let mut child = cmd.spawn().expect("failed to spawn wt step record-pgid");
+    let wt_pid = child.id() as i32;
+    let status = child.wait().expect("failed to wait for wt");
+    assert!(status.success(), "alias should succeed, got: {status:?}");
+
+    let marker = repo.root_path().join("alias_pgid.txt");
+    let recorded = std::fs::read_to_string(&marker)
+        .unwrap_or_else(|e| panic!("missing pgid marker {marker:?}: {e}"));
+    let alias_pgid: i32 = recorded
+        .trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("could not parse pgid {recorded:?}: {e}"));
+    assert_eq!(
+        alias_pgid, wt_pid,
+        "alias child shell must share wt's pgroup (wt pid={wt_pid}); \
+         got child pgid {alias_pgid}, indicating a new pgroup was created"
+    );
+}
+
+/// Externally-delivered SIGTERM to wt (e.g. `kill -TERM <wt-pid>`) must still
+/// reach the alias child in the shared-pgroup case. The kernel only delivers
+/// PID-targeted signals to the named process, not the foreground pgroup, so
+/// the listener in `Cmd::stream` must re-deliver to the child by PID.
+/// Without that, wt would latch the signal but the child would keep running
+/// indefinitely.
+#[rstest]
+#[cfg(unix)]
+fn test_alias_external_sigterm_reaches_child(repo: TestRepo) {
+    use crate::common::wait_for_file_content;
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    // The trap installs in wt's wrapper sh (no inner `sh -c`), so SIGTERM
+    // delivered to wt's child by PID hits the same shell that has the
+    // handler. The body uses `sleep 30 & wait $!` rather than a plain
+    // `sleep 30` because POSIX shells defer trap execution until the
+    // current foreground command returns; `wait` (a builtin) is the
+    // canonical interruptible idiom.
+    repo.write_test_config(
+        r#"
+[aliases]
+trapped = "trap 'echo got-term >> trap.log; exit 143' TERM; echo started >> start.log; sleep 30 & wait $!"
+"#,
+    );
+    repo.commit("initial");
+
+    let mut cmd = repo.wt_command();
+    cmd.args(["step", "trapped"]);
+    cmd.current_dir(repo.root_path());
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
+    // wt becomes its own pgroup leader so a PID-targeted `kill -TERM` against
+    // wt does NOT incidentally hit the test harness's pgroup, and only reaches
+    // wt itself (not the alias child via kernel broadcast).
+    cmd.process_group(0);
+    let mut child = cmd.spawn().expect("failed to spawn wt step trapped");
+
+    // Wait until the alias shell has installed its trap and entered `sleep`.
+    let start_marker = repo.root_path().join("start.log");
+    wait_for_file_content(&start_marker);
+
+    // Target wt's PID specifically (not its pgroup) — simulates an external
+    // `kill -TERM <wt-pid>`.
+    let wt_pid = Pid::from_raw(child.id() as i32);
+    kill(wt_pid, Signal::SIGTERM).expect("failed to send SIGTERM to wt");
+
+    let status = child.wait().expect("failed to wait for wt");
+
+    // The trap marker proves the alias shell received SIGTERM. Without the
+    // PID-targeted forwarding, this file would never appear and wt would
+    // block on the 30s sleep.
+    let trap_marker = repo.root_path().join("trap.log");
+    let recorded = std::fs::read_to_string(&trap_marker).unwrap_or_else(|e| {
+        panic!(
+            "missing trap marker {trap_marker:?}: {e} — \
+             alias child did not receive SIGTERM (forwarding regressed?)"
+        )
+    });
+    assert!(
+        recorded.contains("got-term"),
+        "trap marker missing expected content: {recorded:?}"
+    );
+
+    // wt itself exits with the signal-derived code (128 + 15 = 143).
+    use std::os::unix::process::ExitStatusExt;
+    assert!(
+        status.signal() == Some(15) || status.code() == Some(143),
+        "wt should exit from SIGTERM (signal 15) or with code 143, got: {status:?}"
+    );
+}
+
+/// SIGINT counterpart of `test_alias_external_sigterm_reaches_child`. A
+/// PID-targeted `kill -INT <wt-pid>` (not pgroup-broadcast) must traverse the
+/// SIGINT arm of `forward_signal_to_pid` — kernel pgroup delivery is bypassed
+/// when the signal is aimed at a single PID, so the child only sees SIGINT if
+/// wt re-delivers it.
+#[rstest]
+#[cfg(unix)]
+fn test_alias_external_sigint_reaches_child(repo: TestRepo) {
+    use crate::common::wait_for_file_content;
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    repo.write_test_config(
+        r#"
+[aliases]
+trapped = "trap 'echo got-int >> trap.log; exit 130' INT; echo started >> start.log; sleep 30 & wait $!"
+"#,
+    );
+    repo.commit("initial");
+
+    let mut cmd = repo.wt_command();
+    cmd.args(["step", "trapped"]);
+    cmd.current_dir(repo.root_path());
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
+    cmd.process_group(0);
+    let mut child = cmd.spawn().expect("failed to spawn wt step trapped");
+
+    let start_marker = repo.root_path().join("start.log");
+    wait_for_file_content(&start_marker);
+
+    // Target wt's PID specifically (not its pgroup). Kernel won't broadcast to
+    // the alias child; the only way the child sees SIGINT is via wt's PID-
+    // forwarding path.
+    let wt_pid = Pid::from_raw(child.id() as i32);
+    kill(wt_pid, Signal::SIGINT).expect("failed to send SIGINT to wt");
+
+    let status = child.wait().expect("failed to wait for wt");
+
+    let trap_marker = repo.root_path().join("trap.log");
+    let recorded = std::fs::read_to_string(&trap_marker).unwrap_or_else(|e| {
+        panic!(
+            "missing trap marker {trap_marker:?}: {e} — \
+             alias child did not receive SIGINT (forwarding regressed?)"
+        )
+    });
+    assert!(
+        recorded.contains("got-int"),
+        "trap marker missing expected content: {recorded:?}"
+    );
+
+    use std::os::unix::process::ExitStatusExt;
+    assert!(
+        status.signal() == Some(2) || status.code() == Some(130),
+        "wt should exit from SIGINT (signal 2) or with code 130, got: {status:?}"
     );
 }
 

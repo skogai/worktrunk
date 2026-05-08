@@ -166,9 +166,9 @@ Custom emoji markers show agent state in `wt list`. The [Claude Code](https://wo
 Set status manually for any workflow:
 
 ```bash
-wt config state marker set &quot;🚧&quot;                   # Current branch
-wt config state marker set &quot;✅&quot; --branch feature  # Specific branch
-git config worktrunk.state.feature.marker '{&quot;marker&quot;:&quot;💬&quot;,&quot;set_at&quot;:0}'  # Direct
+wt config state marker set "🚧"                   # Current branch
+wt config state marker set "✅" --branch feature  # Specific branch
+git config worktrunk.state.feature.marker '{"marker":"💬","set_at":0}'  # Direct
 ```
 
 See [Claude Code Integration](https://worktrunk.dev/claude-code/#installation) for plugin installation.
@@ -277,14 +277,20 @@ Spawn a worktree with an agent CLI running in the background. Examples below use
 
 **tmux** (new detached session):
 ```bash
-tmux new-session -d -s fix-auth-bug &quot;wt switch --create fix-auth-bug -x claude -- \
-  'The login session expires after 5 minutes. Find the session timeout config and extend it to 24 hours.'&quot;
+tmux new-session -d -s fix-auth-bug "wt switch --create fix-auth-bug -x claude -- \
+  'The login session expires after 5 minutes. Find the session timeout config and extend it to 24 hours.'"
 ```
 
 **Zellij** (new pane in current session):
 ```bash
 zellij run -- wt switch --create fix-auth-bug -x claude -- \
   'The login session expires after 5 minutes. Find the session timeout config and extend it to 24 hours.'
+```
+
+**cmux** (new workspace):
+```bash
+cmux new-workspace --command "wt switch --create fix-auth-bug -x claude -- \
+  'The login session expires after 5 minutes. Find the session timeout config and extend it to 24 hours.'"
 ```
 
 This lets one agent session hand off work to another that runs in the background. Hooks run inside the multiplexer session/pane.
@@ -331,6 +337,36 @@ To create a worktree and immediately attach:
 ```bash
 $ wt switch --create feature -x 'tmux attach -t {{ branch | sanitize }}'
 ```
+
+## cmux workspace per worktree
+
+Each worktree gets its own [cmux](https://cmux.com) workspace. Switching worktrees switches workspaces; removing a worktree closes its workspace.
+
+**Prerequisites:** [jq](https://jqlang.org) (`brew install jq`)
+
+```toml
+# ~/.config/worktrunk/config.toml
+[pre-start]
+cmux = "cmux new-workspace --name {{ repo | sanitize }}/{{ branch | sanitize }} --cwd {{ worktree_path }}"
+
+[pre-switch]
+cmux = """
+WS=$(cmux --json list-workspaces 2>/dev/null \\
+  | jq -r --arg t '{{ repo | sanitize }}/{{ branch | sanitize }}' \\
+      '.workspaces[] | select(.title == $t) | .ref' | head -1)
+[ -n "$WS" ] && cmux select-workspace --workspace "$WS" || true
+"""
+
+[pre-remove]
+cmux = """
+WS=$(cmux --json list-workspaces 2>/dev/null \\
+  | jq -r --arg t '{{ repo | sanitize }}/{{ branch | sanitize }}' \\
+      '.workspaces[] | select(.title == $t) | .ref' | head -1)
+[ -n "$WS" ] && cmux close-workspace --workspace "$WS" || true
+"""
+```
+
+**Why `pre-*` instead of `post-*`?** cmux restricts socket access to processes spawned inside a cmux terminal. `post-*` hooks run as detached background processes, breaking the process ancestry chain. `pre-*` hooks run in the foreground and inherit the terminal's process lineage.
 
 ## Xcode DerivedData cleanup
 
@@ -392,7 +428,7 @@ url = "http://{{ branch | sanitize }}.{{ repo }}.localhost:8080"
 Follow background hook output in real-time:
 
 ```bash
-tail -f &quot;$(wt config state logs get --hook=user:post-start:server)&quot;
+tail -f "$(wt config state logs get --hook=user:post-start:server)"
 ```
 
 The `--hook` format is `source:hook-type:name` — e.g., `project:post-start:build` for project-defined hooks. Use `wt config state logs get` to list all available logs.
@@ -400,7 +436,7 @@ The `--hook` format is `source:hook-type:name` — e.g., `project:post-start:bui
 Create an alias for frequent use:
 
 ```bash
-alias wtlog='f() { tail -f &quot;$(wt config state logs get --hook=&quot;$1&quot;)&quot;; }; f'
+alias wtlog='f() { tail -f "$(wt config state logs get --hook="$1")"; }; f'
 ```
 
 ## Bare repository layout

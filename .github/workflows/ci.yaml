@@ -1,7 +1,8 @@
 name: ci
 
 # Runner versions are pinned to avoid surprise breaking changes from -latest migrations.
-# The tend-renovate workflow checks weekly for updates and creates PRs.
+# The tend-weekly workflow checks for updates and opens bump PRs (see
+# .claude/skills/running-tend/SKILL.md → "Weekly Maintenance: CI Pin Bumps").
 # - windows-2022: Pinned because windows-2025 lacks D: drive (actions/runner-images#12677)
 # - ubuntu-24.04, macos-15: Pinned to current -latest equivalents
 
@@ -85,48 +86,7 @@ jobs:
     - name: 📂 Checkout code
       uses: actions/checkout@v6
 
-    - name: Install cargo-insta
-      uses: baptiste0928/cargo-install@v3
-      with:
-        crate: cargo-insta
-        version: "=1.46.3"
-
-    - name: Install cargo-nextest
-      uses: baptiste0928/cargo-install@v3
-      with:
-        crate: cargo-nextest
-        version: "=0.9.132"
-
-    - name: 💰 Cache
-      uses: Swatinem/rust-cache@v2
-
-    - name: Install shells (zsh, fish) - Ubuntu
-      if: runner.os == 'Linux'
-      uses: awalsh128/cache-apt-pkgs-action@latest
-      with:
-        packages: zsh fish
-        version: 1.0
-
-    - name: Install shells (fish) - macOS
-      if: runner.os == 'macOS'
-      run: |
-        brew install fish
-        # bash and zsh are pre-installed on macOS
-
-    - name: Install nushell
-      if: runner.os != 'Windows'
-      uses: hustcer/setup-nu@v3
-      with:
-        version: '*'
-
-    - name: Install shells - Windows
-      if: runner.os == 'Windows'
-      run: |
-        # Git Bash is pre-installed on GitHub Actions Windows runners
-        # Fish, zsh, and nushell are not commonly available on native Windows (require WSL/MSYS2)
-        # CI will test with bash only on Windows (tests skip unavailable shells)
-        echo "Using Git Bash for Windows tests"
-      shell: pwsh
+    - uses: ./.github/actions/test-setup
 
     - name: Install wt
       uses: baptiste0928/cargo-install@v3
@@ -153,7 +113,7 @@ jobs:
         path: target/nextest/default/junit.xml
 
     - name: 📊 Upload test results to Codecov
-      if: ${{ !cancelled() && github.repository_owner == 'max-sixty' }}
+      if: ${{ !cancelled() }}
       uses: codecov/codecov-action@v6.0.0
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
@@ -204,30 +164,6 @@ jobs:
     - name: Verify minimum rust version
       run: cargo msrv verify
 
-  check-unused-dependencies:
-    runs-on: ubuntu-24.04
-    needs: changes
-    if: needs.changes.outputs.cargo == 'true' || github.event_name == 'workflow_dispatch'
-    steps:
-    - name: 📂 Checkout code
-      uses: actions/checkout@v6
-
-    # cargo-udeps requires nightly; update date periodically
-    - run: rustup override set nightly-2026-03-01
-
-    - name: 💰 Cache
-      uses: Swatinem/rust-cache@v2
-
-    - uses: baptiste0928/cargo-install@v3
-      with:
-        crate: cargo-udeps
-        version: "=0.1.60"
-
-    - uses: clechasseur/rs-cargo@v5.0.3
-      with:
-        command: udeps
-        args: --all-targets
-
   check-docs:
     runs-on: ubuntu-24.04
     needs: changes
@@ -237,7 +173,7 @@ jobs:
       uses: actions/checkout@v6
 
     - name: Setup Zola
-      uses: taiki-e/install-action@v2.75.18
+      uses: taiki-e/install-action@v2.77.1
       with:
         tool: zola@0.22.1
 
@@ -245,36 +181,173 @@ jobs:
       run: zola build
       working-directory: docs
 
-  benchmarks:
+  # cargo-affected: runs only the tests whose recorded coverage overlaps the
+  # diff. Advisory at this stage — `test (linux/macos/windows)` still runs the
+  # full suite. The signal is the runtime delta on the exact-match path and
+  # whether selection misses any failures the full suite catches.
+  #
+  # TODO: once cargo-affected is trusted on this repo, gate the full test
+  # matrix to run only on pushes to main and on PRs with a `full-tests` label
+  # (or similar). PR pushes would default to affected-only. The full suite
+  # could fold into the existing `nightly` workflow, which already hosts
+  # slower integration-time checks. Periodic full runs remain essential —
+  # cargo-affected misses non-Rust inputs (`include_str!`, templates, SQL),
+  # build-time inputs not in its fingerprint (build.rs, rust-toolchain.toml,
+  # .cargo/config.toml), and proc-macro source edits.
+  #
+  # Cache strategy:
+  # - `collect-affected` (push to main) saves `target/affected/coverage.db`
+  #   to actions/cache keyed on the main commit sha. We cache only the DB,
+  #   not the parent dir — cargo-affected drops its profraw staging dir
+  #   at the end of every successful collect, but caching the path
+  #   explicitly keeps the contract obvious and ~10 GB of profile bundles
+  #   from leaking into the cache if that cleanup ever regresses.
+  # - `collect-affected` also restores the most recent prior main DB before
+  #   collecting, so the new DB accumulates rows for up to FINGERPRINT_KEEP
+  #   (=10) recent main-tip env_fingerprints (LRU-evicted in `Db::gc`).
+  #   PRs whose manifests match any of those fingerprints get exact-match
+  #   selection instead of the all-or-nothing single-fingerprint cache.
+  #   Don't "simplify" by removing the restore — it's load-bearing.
+  # - `affected-tests` (PRs) restores the cache. Primary key is the
+  #   PR/main merge-base — when collect ran on that exact commit, we get a
+  #   tight diff (`PR changes only`) and the smallest possible selection.
+  # - Restore-keys fall back to the most recent main DB. Its `collect_sha`
+  #   is typically a sibling of the PR's HEAD, not a strict ancestor.
+  #   cargo-affected uses any sha still in the repo as a diff anchor, so
+  #   the fallback drives normal selection — over-includes tests touched
+  #   by main commits between the merge-base and collect_sha (correct
+  #   superset), but never widens to "run everything" unless the cache is
+  #   missing entirely.
+  # - Cache keys include `runner.os` (fingerprint embeds `rustc -vV`) and a
+  #   manual `db-v{N}` marker. Bump the marker if cargo-affected ships an
+  #   on-disk schema change; the cache is otherwise version-agnostic.
+  collect-affected:
+    name: collect affected coverage
+    if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-24.04
-    needs: changes
-    if: needs.changes.outputs.cargo == 'true' || github.event_name == 'workflow_dispatch'
     steps:
     - name: 📂 Checkout code
       uses: actions/checkout@v6
-
-    - name: 💰 Cache
-      uses: Swatinem/rust-cache@v2
-
-    - name: Install shells (zsh, fish)
-      uses: awalsh128/cache-apt-pkgs-action@latest
       with:
-        packages: zsh fish
-        version: 1.0
+        # `cargo affected run` later diffs PR HEAD against the sha that was
+        # HEAD when collect ran. That sha must be reachable.
+        fetch-depth: 0
 
-    - name: Install nushell
-      uses: hustcer/setup-nu@v3
+    - uses: ./.github/actions/test-setup
+
+    - name: Install cargo-affected
+      uses: baptiste0928/cargo-install@v3
       with:
-        version: '*'
+        crate: cargo-affected
+        git: https://github.com/max-sixty/cargo-affected
+        # No rev/branch/tag → action resolves to latest default-branch sha.
 
-    - name: 💰 Rust repo cache
-      uses: actions/cache@v5
+    - name: Install llvm-tools
+      run: rustup component add llvm-tools
+
+    - name: 💾 Restore prior coverage DB
+      uses: actions/cache/restore@v5
       with:
-        path: target/bench-repos
-        key: bench-repos-rust-${{ runner.os }}
+        path: target/affected/coverage.db
+        # Primary key matches the current sha (no-op on first push of this
+        # commit; on re-runs of the same sha, lets us skip rebuilding from
+        # scratch).
+        key: cargo-affected-db-v1-${{ runner.os }}-${{ github.sha }}
+        # Fall back to any prior main DB. cargo-affected preserves rows for
+        # up to FINGERPRINT_KEEP (=10) distinct fingerprints in one DB,
+        # evicting LRU on each collect. By feeding a prior DB into the new
+        # collect, we accumulate fingerprint snapshots across main commits —
+        # PRs whose manifests match any of the last ~10 main fingerprints
+        # get exact-match selection, instead of the all-or-nothing
+        # single-fingerprint cache.
+        restore-keys: |
+          cargo-affected-db-v1-${{ runner.os }}-
 
-    - name: 📊 Run benchmarks
-      run: cargo bench
+    - name: 📊 Collect coverage data
+      env:
+        NEXTEST_NO_INPUT_HANDLER: 1
+      run: cargo affected collect -- --features shell-integration-tests
+
+    - name: 💾 Save coverage DB
+      uses: actions/cache/save@v5
+      with:
+        # Only the SQLite DB. `target/affected/profraw-<PID>/` holds raw
+        # profile bundles (~5 GB on this repo) that aren't needed past the
+        # current collect — caching them blows past the 10 GB repo cache
+        # cap and forces eviction of every prior cache.
+        path: target/affected/coverage.db
+        key: cargo-affected-db-v1-${{ runner.os }}-${{ github.sha }}
+
+  affected-tests:
+    name: affected tests (linux, advisory)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    # Advisory while we calibrate selection accuracy against the full suite.
+    # The full matrix (`test (linux/macos/windows)`) is still required for
+    # merge.
+    continue-on-error: true
+    steps:
+    - name: 📂 Checkout code
+      uses: actions/checkout@v6
+      with:
+        # Need the cached `collect_sha` reachable from HEAD for the diff;
+        # see collect-affected above.
+        fetch-depth: 0
+
+    - name: Compute merge-base for cache key
+      id: mb
+      env:
+        PR_HEAD: ${{ github.event.pull_request.head.sha }}
+      run: |
+        git fetch --no-tags --depth=200 origin main
+        sha=$(git merge-base origin/main "$PR_HEAD")
+        echo "sha=$sha" >> "$GITHUB_OUTPUT"
+        echo "merge-base with origin/main: $sha"
+
+    - uses: ./.github/actions/test-setup
+
+    # Restore AFTER test-setup so we land on top of rust-cache's tar
+    # extraction. rust-cache's restore step calls `cleanTargetDir` on a
+    # partial cache hit (`full match: false`), which deletes file children
+    # of `target/affected/` — including a `coverage.db` we'd just dropped
+    # there. Order: rust-cache populates `target/` first; we then drop the
+    # DB on top, where nothing else touches it.
+    - name: 💾 Restore coverage DB
+      uses: actions/cache/restore@v5
+      with:
+        path: target/affected/coverage.db
+        # Exact match: collect ran on the PR's merge-base → tight diff.
+        key: cargo-affected-db-v1-${{ runner.os }}-${{ steps.mb.outputs.sha }}
+        # Fallback: most recent main DB. cargo-affected runs all tests when
+        # the cached `collect_sha` is missing from the repo (rebased and
+        # pruned, beyond a shallow clone boundary). Sibling shas — including
+        # PR-vs-main-tip — drive normal selection.
+        restore-keys: |
+          cargo-affected-db-v1-${{ runner.os }}-
+
+    - name: Install cargo-affected
+      uses: baptiste0928/cargo-install@v3
+      with:
+        crate: cargo-affected
+        git: https://github.com/max-sixty/cargo-affected
+        # No rev/branch/tag → action resolves to latest default-branch sha.
+
+    - name: 🎯 Run affected tests
+      env:
+        NEXTEST_NO_INPUT_HANDLER: 1
+      run: cargo affected run --report-json target/affected/report.json -- --features shell-integration-tests
+
+    # Report writes BEFORE nextest runs, so it survives test failures —
+    # uploading on `!cancelled()` makes it the most useful diagnostic
+    # when tests fail (cache state, fingerprint divergence, selection
+    # reasons). Schema documented at:
+    # https://github.com/max-sixty/cargo-affected/blob/main/docs/report-json.md
+    - name: 📊 Upload cargo-affected report
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: cargo-affected-report
+        path: target/affected/report.json
 
   code-coverage:
     runs-on: ubuntu-24.04
@@ -293,7 +366,7 @@ jobs:
         save-if: ${{ github.ref == 'refs/heads/main' }}
 
     - name: Install shells (zsh, fish)
-      uses: awalsh128/cache-apt-pkgs-action@latest
+      uses: awalsh128/cache-apt-pkgs-action@v1.6.0
       with:
         packages: zsh fish
         version: 1.0
@@ -301,7 +374,7 @@ jobs:
     - name: Install nushell
       uses: hustcer/setup-nu@v3
       with:
-        version: '*'
+        version: '0.112.2'
 
     # Ensure nothing remains from caching
     - run: cargo llvm-cov clean --workspace
@@ -318,10 +391,10 @@ jobs:
         path: cobertura.xml
 
     - name: Upload to codecov.io
-      # Codecov action raises errors on forks; allow running on PRs to main repo
-      if: github.repository_owner == 'max-sixty'
       uses: codecov/codecov-action@v6.0.0
       with:
         files: cobertura.xml
-        fail_ci_if_error: true
+        # Soft-fail on fork PRs: secrets aren't available there, so we rely on
+        # tokenless upload, which can hiccup. Keep hard-fail on the main repo.
+        fail_ci_if_error: ${{ github.repository_owner == 'max-sixty' }}
         token: ${{ secrets.CODECOV_TOKEN }}

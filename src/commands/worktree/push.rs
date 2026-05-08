@@ -8,13 +8,57 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use color_print::cformat;
-use worktrunk::git::{GitError, Repository};
+use worktrunk::git::{ErrorExt, GitError, Repository};
 use worktrunk::styling::{
     eprintln, format_with_gutter, info_message, progress_message, success_message, warning_message,
 };
 
 use super::types::MergeOperations;
 use crate::commands::repository_ext::{RepositoryCliExt, TargetWorktreeStash};
+
+/// Distinguishes a standalone push from a fast-forward push driven by `wt merge`.
+///
+/// Carried into [`handle_push`] so progress/success messages use the right verb
+/// without sniffing a passed-in string.
+#[derive(Debug, Clone, Copy)]
+pub enum PushKind {
+    /// `wt push` — no merge operations precede the push.
+    Standalone,
+    /// `wt merge` resolved to a fast-forward.
+    MergeFastForward,
+}
+
+impl PushKind {
+    fn verb_past(self) -> &'static str {
+        match self {
+            PushKind::Standalone => "Pushed to",
+            PushKind::MergeFastForward => "Merged to",
+        }
+    }
+
+    fn verb_progressive(self) -> &'static str {
+        match self {
+            PushKind::Standalone => "Pushing",
+            PushKind::MergeFastForward => "Merging",
+        }
+    }
+}
+
+/// Outcome of a push or no-ff merge, returned for JSON output.
+pub struct PushResult {
+    pub target: String,
+    pub commit_count: usize,
+    pub outcome: PushOutcome,
+}
+
+pub enum PushOutcome {
+    /// Target was fast-forwarded to HEAD.
+    FastForwarded,
+    /// Target already contained HEAD; nothing to push.
+    UpToDate,
+    /// A new merge commit was created on the target branch.
+    MergeCommit { merge_sha: String },
+}
 
 // ---------------------------------------------------------------------------
 // Shared scaffolding
@@ -98,11 +142,12 @@ impl MergeContext {
 
     /// Print progress message, commit graph, and diff statistics.
     ///
-    /// `verb_ing` is the gerund shown in the progress line (e.g. "Merging", "Pushing").
-    /// `extra_note` is appended after the SHA (e.g. " (--no-ff)").
+    /// `verb_progressive` is the present participle shown in the progress line
+    /// (e.g. "Merging", "Pushing"). `extra_note` is appended after the SHA
+    /// (e.g. " (--no-ff)").
     fn show_progress(
         &self,
-        verb_ing: &str,
+        verb_progressive: &str,
         extra_note: &str,
         operations: Option<MergeOperations>,
     ) -> anyhow::Result<()> {
@@ -115,15 +160,15 @@ impl MergeContext {
         } else {
             "commits"
         };
-        let head_sha = self.repo.run_command(&["rev-parse", "--short", "HEAD"])?;
-        let head_sha = head_sha.trim();
+        let full_sha = self.repo.run_command(&["rev-parse", "HEAD"])?;
+        let head_sha = self.repo.short_sha(full_sha.trim())?;
 
         let operations_note = format_operations_note(operations);
 
         eprintln!(
             "{}",
             progress_message(cformat!(
-                "{verb_ing} {} {commit_text} to <bold>{}</> @ <dim>{head_sha}</>{extra_note}{operations_note}",
+                "{verb_progressive} {} {commit_text} to <bold>{}</> @ <dim>{head_sha}</>{extra_note}{operations_note}",
                 self.commit_count,
                 self.target_branch,
             ))
@@ -248,17 +293,12 @@ fn format_up_to_date_context(operations: Option<MergeOperations>) -> String {
 /// overlaps with the push range.
 pub fn handle_push(
     target: Option<&str>,
-    verb: &str,
+    kind: PushKind,
     operations: Option<MergeOperations>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<PushResult> {
     let mut ctx = MergeContext::prepare(target, operations)?;
 
-    let verb_ing = if verb.starts_with("Merged") {
-        "Merging"
-    } else {
-        "Pushing"
-    };
-    ctx.show_progress(verb_ing, "", operations)?;
+    ctx.show_progress(kind.verb_progressive(), "", operations)?;
 
     // Perform the push via --receive-pack (atomically updates ref + working tree)
     let git_common_dir = ctx.repo.git_common_dir();
@@ -275,18 +315,24 @@ pub fn handle_push(
         ])
         .map_err(|e| GitError::PushFailed {
             target_branch: ctx.target_branch.clone(),
-            error: e.to_string(),
+            error: e.display_message(),
         })?;
 
     ctx.restore_stash();
 
-    if ctx.commit_count > 0 {
-        ctx.show_success(verb, "", "");
+    let outcome = if ctx.commit_count > 0 {
+        ctx.show_success(kind.verb_past(), "", "");
+        PushOutcome::FastForwarded
     } else {
         ctx.show_up_to_date_if_needed(operations);
-    }
+        PushOutcome::UpToDate
+    };
 
-    Ok(())
+    Ok(PushResult {
+        target: ctx.target_branch,
+        commit_count: ctx.commit_count,
+        outcome,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -311,13 +357,17 @@ pub fn handle_no_ff_merge(
     target: Option<&str>,
     operations: Option<MergeOperations>,
     feature_branch: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<PushResult> {
     let mut ctx = MergeContext::prepare(target, operations)?;
 
     ctx.show_progress("Merging", " (--no-ff)", operations)?;
 
     if ctx.show_up_to_date_if_needed(operations) {
-        return Ok(());
+        return Ok(PushResult {
+            target: ctx.target_branch,
+            commit_count: 0,
+            outcome: PushOutcome::UpToDate,
+        });
     }
 
     // Create the merge commit using git plumbing.
@@ -361,7 +411,7 @@ pub fn handle_no_ff_merge(
         .run_command(&["update-ref", &target_ref, &merge_sha, &ctx.target_tip])
         .map_err(|e| GitError::PushFailed {
             target_branch: ctx.target_branch.clone(),
-            error: format!("Failed to update ref: {e:#}"),
+            error: format!("Failed to update ref: {}", e.display_message()),
         })?;
 
     // Sync the target worktree's working tree if it exists.
@@ -391,11 +441,16 @@ pub fn handle_no_ff_merge(
 
     ctx.restore_stash();
 
-    let merge_sha_short = &merge_sha[..merge_sha.len().min(7)];
+    // Display uses `Repository::short_sha`; the JSON payload carries the full SHA.
+    let merge_sha_short = ctx.repo.short_sha(&merge_sha)?;
     let sha_suffix = cformat!(" @ <dim>{merge_sha_short}</>");
     ctx.show_success("Merged to", &sha_suffix, ", --no-ff");
 
-    Ok(())
+    Ok(PushResult {
+        target: ctx.target_branch,
+        commit_count: ctx.commit_count,
+        outcome: PushOutcome::MergeCommit { merge_sha },
+    })
 }
 
 #[cfg(test)]

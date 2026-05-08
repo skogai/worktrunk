@@ -11,11 +11,9 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 use skim::prelude::*;
-use worktrunk::git::Repository;
 use worktrunk::styling::{StyledLine, strip_osc8_hyperlinks};
 
 use super::items::{HeaderSkimItem, PreviewCache, WorktreeSkimItem};
-use super::preview::PreviewMode;
 use super::preview_orchestrator::PreviewOrchestrator;
 use crate::commands::list::collect::PickerProgressHandler;
 use crate::commands::list::model::ListItem;
@@ -39,11 +37,14 @@ pub(super) struct PickerHandler {
     pub(super) orchestrator: Arc<PreviewOrchestrator>,
     pub(super) preview_dims: (usize, usize),
     pub(super) llm_command: Option<String>,
-    pub(super) repo: Repository,
     /// Filled into the Summary preview cache for every item when summaries
     /// are disabled — gives the Summary tab something useful instead of a
     /// perpetual "Generating…" placeholder.
     pub(super) summary_hint: Option<String>,
+    /// Pre-formatted warning lines stashed by `collect::collect` while skim
+    /// owns the terminal. The picker drains and emits these to stderr after
+    /// `Skim::run_with` returns. Lines are kept in arrival order.
+    pub(super) stashed_warnings: Arc<Mutex<Vec<String>>>,
 }
 
 impl PickerProgressHandler for PickerHandler {
@@ -102,7 +103,12 @@ impl PickerProgressHandler for PickerHandler {
             let _ = self.tx.send(Arc::clone(skim_item));
         }
 
-        self.spawn_precompute(&list_items);
+        self.orchestrator.spawn_all_precompute(
+            &list_items,
+            self.preview_dims,
+            self.llm_command.as_deref(),
+            self.summary_hint.as_deref(),
+        );
     }
 
     fn on_update(&self, idx: usize, rendered: String) {
@@ -113,62 +119,17 @@ impl PickerProgressHandler for PickerHandler {
         }
     }
 
-    fn on_reveal(&self, rendered: Vec<Option<String>>) {
+    fn on_reveal(&self, rendered: Vec<String>) {
         let Some(slots) = self.rendered_slots.get() else {
             return;
         };
         for (slot, line) in slots.iter().zip(rendered) {
-            if let Some(line) = line {
-                *slot.lock().unwrap() = strip_osc8_hyperlinks(&line);
-            }
+            *slot.lock().unwrap() = strip_osc8_hyperlinks(&line);
         }
     }
-}
 
-impl PickerHandler {
-    /// Kick off preview + summary pre-compute in the dedicated rayon pool.
-    ///
-    /// Spawn order mirrors the old synchronous path: the first item's modes
-    /// win the first slots (the user lands there and may tab-cycle), then
-    /// mode-major across the rest. Summaries queue last because each LLM
-    /// call can take seconds.
-    fn spawn_precompute(&self, list_items: &[Arc<ListItem>]) {
-        let modes = [
-            PreviewMode::WorkingTree,
-            PreviewMode::Log,
-            PreviewMode::BranchDiff,
-            PreviewMode::UpstreamDiff,
-        ];
-
-        if let Some(first) = list_items.first() {
-            for mode in modes {
-                self.orchestrator
-                    .spawn_preview(Arc::clone(first), mode, self.preview_dims);
-            }
-        }
-        for mode in modes {
-            for item in list_items.iter().skip(1) {
-                self.orchestrator
-                    .spawn_preview(Arc::clone(item), mode, self.preview_dims);
-            }
-        }
-
-        if let Some(llm) = self.llm_command.as_ref() {
-            if let Some(first) = list_items.first() {
-                self.orchestrator
-                    .spawn_summary(Arc::clone(first), llm.clone(), self.repo.clone());
-            }
-            for item in list_items.iter().skip(1) {
-                self.orchestrator
-                    .spawn_summary(Arc::clone(item), llm.clone(), self.repo.clone());
-            }
-        } else if let Some(hint) = self.summary_hint.as_ref() {
-            for item in list_items {
-                let branch = item.branch_name().to_string();
-                self.preview_cache
-                    .insert((branch, PreviewMode::Summary), hint.clone());
-            }
-        }
+    fn stash_warning(&self, line: String) {
+        self.stashed_warnings.lock().unwrap().push(line);
     }
 }
 
@@ -186,8 +147,7 @@ mod tests {
         let test = TestRepo::with_initial_commit();
         let (tx, rx) = crossbeam_channel::unbounded::<Arc<dyn SkimItem>>();
         let shared_items = Arc::new(Mutex::new(Vec::new()));
-        let repo = test.repo.clone();
-        let orchestrator = Arc::new(PreviewOrchestrator::new(repo.clone()));
+        let orchestrator = Arc::new(PreviewOrchestrator::new(test.repo.clone()));
         let preview_cache: PreviewCache = Arc::clone(&orchestrator.cache);
         let handler = PickerHandler {
             tx,
@@ -197,8 +157,8 @@ mod tests {
             orchestrator,
             preview_dims: (80, 24),
             llm_command: None,
-            repo,
             summary_hint: Some("disabled".to_string()),
+            stashed_warnings: Arc::new(Mutex::new(Vec::new())),
         };
         (handler, test, rx)
     }
@@ -238,14 +198,11 @@ mod tests {
         assert_eq!(*slots[0].lock().unwrap(), "skel-one", "row 0 untouched");
         assert_eq!(*slots[1].lock().unwrap(), "updated-two");
 
-        // on_reveal: Some entries rewrite the slot, None entries leave it.
-        handler.on_reveal(vec![Some("rev-one".into()), None]);
+        // on_reveal rewrites every slot — slot writes are idempotent
+        // through `Mutex<String>`, so unconditional updates are safe.
+        handler.on_reveal(vec!["rev-one".into(), "rev-two".into()]);
         assert_eq!(*slots[0].lock().unwrap(), "rev-one");
-        assert_eq!(
-            *slots[1].lock().unwrap(),
-            "updated-two",
-            "row 1 had data — reveal must not clobber it"
-        );
+        assert_eq!(*slots[1].lock().unwrap(), "rev-two");
     }
 
     /// Header + items get published in order. `output()` of the
@@ -278,5 +235,17 @@ mod tests {
         assert_eq!(shared.len(), 3);
         assert_eq!(shared[1].output().as_ref(), "feat-a");
         assert_eq!(shared[2].output().as_ref(), "feat-b");
+    }
+
+    /// `stash_warning` accumulates lines in arrival order so the picker can
+    /// drain them in one shot after skim releases the terminal.
+    #[test]
+    fn stash_warning_preserves_order() {
+        let (handler, _test, _rx) = make_handler();
+        handler.stash_warning("first".into());
+        handler.stash_warning("second".into());
+        handler.stash_warning("third".into());
+        let stash = handler.stashed_warnings.lock().unwrap();
+        assert_eq!(stash.as_slice(), &["first", "second", "third"]);
     }
 }

@@ -11,15 +11,14 @@ use worktrunk::styling::{eprint, format_bash_with_gutter, stderr};
 
 use crate::commands::command_executor::CommandContext;
 use crate::commands::command_executor::FailureStrategy;
-use crate::commands::hooks::{
-    announce_and_spawn_background_hooks, execute_hook, prepare_background_hooks,
-};
+use crate::commands::hooks::{HookAnnouncer, execute_hook, prepare_background_pipelines};
 use crate::commands::process::{
     HookLog, InternalOp, build_remove_command, build_remove_command_staged, spawn_detached,
 };
 use crate::commands::worktree::hooks::PostRemoveContext;
 use crate::commands::worktree::{RemoveResult, SwitchBranchInfo, SwitchResult};
 use worktrunk::config::UserConfig;
+use worktrunk::git::ErrorExt;
 use worktrunk::git::GitError;
 use worktrunk::git::IntegrationReason;
 use worktrunk::git::Repository;
@@ -38,7 +37,7 @@ use worktrunk::styling::{
 
 use super::shell_integration::{
     compute_shell_warning_reason, explicit_path_hint, git_subcommand_warning,
-    shell_integration_hint, should_show_explicit_path_hint,
+    print_shell_integration_hint, should_show_explicit_path_hint,
 };
 
 // ============================================================================
@@ -451,7 +450,7 @@ fn handle_branch_deletion_result(
                 "{}",
                 error_message(cformat!("Failed to delete branch <bold>{branch_name}</>"))
             );
-            eprintln!("{}", format_with_gutter(&e.to_string(), None));
+            eprintln!("{}", format_with_gutter(&e.display_message(), None));
             Err(e)
         }
     }
@@ -590,7 +589,7 @@ fn print_switch_message_if_changed(
         if should_show_explicit_path_hint() {
             eprintln!("{}", hint_message(explicit_path_hint(&dest_branch)));
         } else {
-            eprintln!("{}", hint_message(shell_integration_hint()));
+            print_shell_integration_hint(&repo);
         }
     }
     Ok(())
@@ -727,7 +726,9 @@ pub fn execute_user_command(command: &str, display_path: Option<&Path>) -> anyho
 
 /// Handle output for a remove operation
 ///
-/// Approval is handled at the gate (command entry point), not here.
+/// Approval is handled at the gate (command entry point), not here. The
+/// `announcer`'s `show_branch` setting (set by the caller) controls whether
+/// hook announce lines include the branch name for batch-context disambiguation.
 /// When `quiet` is true (prune context), suppresses informational messages
 /// like "No worktree found for branch X" that are noise in batch operations.
 pub fn handle_remove_output(
@@ -735,7 +736,7 @@ pub fn handle_remove_output(
     foreground: bool,
     verify: bool,
     quiet: bool,
-    show_branch_in_hooks: bool,
+    announcer: &mut HookAnnouncer<'_>,
 ) -> anyhow::Result<()> {
     match result {
         RemoveResult::RemovedWorktree {
@@ -749,21 +750,23 @@ pub fn handle_remove_output(
             force_worktree,
             expected_path,
             removed_commit,
-        } => handle_removed_worktree_output(RemovedWorktreeOutputContext {
-            main_path,
-            worktree_path,
-            changed_directory: *changed_directory,
-            branch_name: branch_name.as_deref(),
-            deletion_mode: *deletion_mode,
-            target_branch: target_branch.as_deref(),
-            pre_computed_integration: *integration_reason,
-            force_worktree: *force_worktree,
-            expected_path: expected_path.as_deref(),
-            removed_commit: removed_commit.as_deref(),
-            foreground,
-            verify,
-            show_branch_in_hooks,
-        }),
+        } => handle_removed_worktree_output(
+            RemovedWorktreeOutputContext {
+                main_path,
+                worktree_path,
+                changed_directory: *changed_directory,
+                branch_name: branch_name.as_deref(),
+                deletion_mode: *deletion_mode,
+                target_branch: target_branch.as_deref(),
+                pre_computed_integration: *integration_reason,
+                force_worktree: *force_worktree,
+                expected_path: expected_path.as_deref(),
+                removed_commit: removed_commit.as_deref(),
+                foreground,
+                verify,
+            },
+            announcer,
+        ),
         RemoveResult::BranchOnly {
             branch_name,
             deletion_mode,
@@ -874,19 +877,22 @@ fn handle_branch_only_output(
     Ok(())
 }
 
-/// Spawn post-remove and post-switch hooks as a single batch after worktree removal.
+/// Register post-remove and post-switch hooks after worktree removal onto the
+/// caller's announcer.
 ///
-/// Combines both hook types into one output line for consistency with how
-/// post-switch and post-start are combined during worktree creation.
-///
-/// Post-remove template variables reflect the removed worktree (branch, path, commit).
-/// Post-switch hooks only run when `changed_directory` is true (user cd'd to main).
+/// Pipelines come from two contexts: post-remove uses the removed worktree's
+/// identity (branch, path, commit), while post-switch (only when
+/// `changed_directory` is true) uses the destination worktree's branch. Both
+/// types share whatever announce line the caller's announcer eventually
+/// flushes — multi-phase callers (e.g. `wt merge`) batch with later phases,
+/// standalone callers (e.g. `wt remove`) flush immediately after.
 ///
 /// Only runs if `ctx.verify` is true (hooks approved).
 fn spawn_hooks_after_remove(
     repo: &Repository,
     ctx: &RemovedWorktreeOutputContext<'_>,
     removed_branch: &str,
+    announcer: &mut HookAnnouncer<'_>,
 ) -> anyhow::Result<()> {
     if !ctx.verify {
         return Ok(());
@@ -915,17 +921,12 @@ fn spawn_hooks_after_remove(
     let remove_ctx = CommandContext::new(repo, &config, Some(removed_branch), ctx.main_path, false);
 
     // Collect post-remove and post-switch hooks for a single combined announcement.
-    let mut pipelines = Vec::new();
-    pipelines.extend(
-        prepare_background_hooks(
-            &remove_ctx,
-            worktrunk::HookType::PostRemove,
-            &extra_vars,
-            display_path,
-        )?
-        .into_iter()
-        .map(|g| (remove_ctx, g)),
-    );
+    let mut pipelines = prepare_background_pipelines(
+        &remove_ctx,
+        worktrunk::HookType::PostRemove,
+        &extra_vars,
+        display_path,
+    )?;
 
     // Post-switch: only when the user actually changed directory.
     // Uses its own context with the destination branch for template variables.
@@ -938,20 +939,15 @@ fn spawn_hooks_after_remove(
     if let Some(ref dest_branch) = dest_branch {
         let switch_ctx =
             CommandContext::new(repo, &config, dest_branch.as_deref(), ctx.main_path, false);
-        pipelines.extend(
-            prepare_background_hooks(
-                &switch_ctx,
-                worktrunk::HookType::PostSwitch,
-                &[],
-                display_path,
-            )?
-            .into_iter()
-            .map(|g| (switch_ctx, g)),
-        );
+        pipelines.extend(prepare_background_pipelines(
+            &switch_ctx,
+            worktrunk::HookType::PostSwitch,
+            &[],
+            display_path,
+        )?);
     }
 
-    announce_and_spawn_background_hooks(pipelines, ctx.show_branch_in_hooks)?;
-
+    announcer.extend(pipelines);
     Ok(())
 }
 
@@ -1179,8 +1175,6 @@ struct RemovedWorktreeOutputContext<'a> {
     removed_commit: Option<&'a str>,
     foreground: bool,
     verify: bool,
-    /// Show branch name in hook announcements for disambiguation in batch contexts.
-    show_branch_in_hooks: bool,
 }
 
 fn execute_pre_remove_hooks_if_needed(
@@ -1224,7 +1218,6 @@ fn execute_pre_remove_hooks_if_needed(
         worktrunk::HookType::PreRemove,
         &extra_vars,
         FailureStrategy::FailFast,
-        &[],
         display_path,
     )
 }
@@ -1247,6 +1240,7 @@ fn prepare_remove_directory_change(
 fn handle_detached_removed_worktree_output(
     repo: &Repository,
     ctx: &RemovedWorktreeOutputContext<'_>,
+    announcer: &mut HookAnnouncer<'_>,
 ) -> anyhow::Result<()> {
     if ctx.foreground {
         eprintln!(
@@ -1256,8 +1250,10 @@ fn handle_detached_removed_worktree_output(
                 format_path_for_display(ctx.worktree_path)
             ))
         );
+        let snapshot = repo.capture_refs()?;
         let output = remove_worktree_with_cleanup(
             repo,
+            &snapshot,
             ctx.worktree_path,
             RemoveOptions {
                 branch: None,
@@ -1270,7 +1266,7 @@ fn handle_detached_removed_worktree_output(
             branch: path_dir_name(ctx.worktree_path).to_string(),
             path: ctx.worktree_path.to_path_buf(),
             remaining_entries: list_remaining_entries(ctx.worktree_path),
-            error: err.to_string(),
+            error: err.display_message(),
         })?;
         let (files, bytes) = output
             .staged_path
@@ -1307,7 +1303,7 @@ fn handle_detached_removed_worktree_output(
     }
 
     // Post-remove hooks for detached HEAD use "HEAD" as the branch identifier
-    spawn_hooks_after_remove(repo, ctx, "HEAD")?;
+    spawn_hooks_after_remove(repo, ctx, "HEAD", announcer)?;
     stderr().flush()?;
     Ok(())
 }
@@ -1316,6 +1312,7 @@ fn handle_named_removed_worktree_foreground(
     repo: &Repository,
     ctx: &RemovedWorktreeOutputContext<'_>,
     branch_name: &str,
+    announcer: &mut HookAnnouncer<'_>,
 ) -> anyhow::Result<()> {
     eprintln!(
         "{}",
@@ -1329,8 +1326,10 @@ fn handle_named_removed_worktree_foreground(
         );
     }
 
+    let snapshot = repo.capture_refs()?;
     let output = remove_worktree_with_cleanup(
         repo,
+        &snapshot,
         ctx.worktree_path,
         RemoveOptions {
             branch: Some(branch_name.to_string()),
@@ -1343,7 +1342,7 @@ fn handle_named_removed_worktree_foreground(
         branch: branch_name.into(),
         path: ctx.worktree_path.to_path_buf(),
         remaining_entries: list_remaining_entries(ctx.worktree_path),
-        error: err.to_string(),
+        error: err.display_message(),
     })?;
     let stats = output
         .staged_path
@@ -1363,7 +1362,7 @@ fn handle_named_removed_worktree_foreground(
     display_info.print_hints(branch_name, ctx.deletion_mode, ctx.pre_computed_integration)?;
     print_switch_message_if_changed(ctx.changed_directory, ctx.main_path)?;
 
-    spawn_hooks_after_remove(repo, ctx, branch_name)?;
+    spawn_hooks_after_remove(repo, ctx, branch_name, announcer)?;
     stderr().flush()?;
     Ok(())
 }
@@ -1372,6 +1371,7 @@ fn handle_named_removed_worktree_background(
     repo: &Repository,
     ctx: &RemovedWorktreeOutputContext<'_>,
     branch_name: &str,
+    announcer: &mut HookAnnouncer<'_>,
 ) -> anyhow::Result<()> {
     if let Some(expected) = ctx.expected_path {
         eprintln!(
@@ -1401,13 +1401,16 @@ fn handle_named_removed_worktree_background(
         ctx.changed_directory,
     )?;
 
-    spawn_hooks_after_remove(repo, ctx, branch_name)?;
+    spawn_hooks_after_remove(repo, ctx, branch_name, announcer)?;
     stderr().flush()?;
     Ok(())
 }
 
 /// Handle output for RemovedWorktree removal
-fn handle_removed_worktree_output(ctx: RemovedWorktreeOutputContext<'_>) -> anyhow::Result<()> {
+fn handle_removed_worktree_output(
+    ctx: RemovedWorktreeOutputContext<'_>,
+    announcer: &mut HookAnnouncer<'_>,
+) -> anyhow::Result<()> {
     // Use main_path for discovery - the worktree being removed might be cwd,
     // and git operations after removal need a valid working directory.
     let repo = worktrunk::git::Repository::at(ctx.main_path)?;
@@ -1417,13 +1420,13 @@ fn handle_removed_worktree_output(ctx: RemovedWorktreeOutputContext<'_>) -> anyh
 
     // Handle detached HEAD case (no branch known)
     let Some(branch_name) = ctx.branch_name else {
-        return handle_detached_removed_worktree_output(&repo, &ctx);
+        return handle_detached_removed_worktree_output(&repo, &ctx, announcer);
     };
 
     if ctx.foreground {
-        handle_named_removed_worktree_foreground(&repo, &ctx, branch_name)
+        handle_named_removed_worktree_foreground(&repo, &ctx, branch_name, announcer)
     } else {
-        handle_named_removed_worktree_background(&repo, &ctx, branch_name)
+        handle_named_removed_worktree_background(&repo, &ctx, branch_name, announcer)
     }
 }
 
@@ -1434,7 +1437,7 @@ fn handle_removed_worktree_output(ctx: RemovedWorktreeOutputContext<'_>) -> anyh
 /// (`run_pipeline.rs`) has its own spawning logic since it redirects to log
 /// files and runs detached.
 ///
-/// Capabilities: stdout→stderr redirect for deterministic ordering,
+/// Capabilities: optional stdout→stderr redirect for deterministic ordering,
 /// SIGINT/SIGTERM forwarding to child process group, ANSI reset before child
 /// runs, `Cmd` tracing/logging, and directive file control.
 ///
@@ -1442,17 +1445,31 @@ fn handle_removed_worktree_output(ctx: RemovedWorktreeOutputContext<'_>) -> anyh
 ///
 /// `directives` controls whether the child can write shell-integration
 /// directives back to the parent shell. The CD file is always safe to pass
-/// through (raw path, no injection surface); the EXEC file is never passed
-/// through — only wt-internal Rust code writes arbitrary shell directives.
+/// through (raw path, no injection surface); the EXEC file is normally scrubbed
+/// because alias/hook bodies must not inject arbitrary shell into the parent
+/// session — see [`DirectivePassthrough::inherit_from_env_with_exec`] for the
+/// one exception.
 ///
-/// - `DirectivePassthrough::none()` — scrubs all directive env vars from the
-///   child. Used by `for-each` (runs in other worktrees) and background hooks
-///   (outlive the parent shell).
-/// - `DirectivePassthrough::inherit_from_env()` — re-adds whichever directive
-///   env vars are currently set in this process. Used by aliases and
-///   foreground hooks, which may emit `cd` directives. In new-protocol mode
-///   only the CD file passes through; in legacy compat mode the single
-///   legacy file passes through to preserve pre-split behavior.
+/// - `DirectivePassthrough::default()` — scrubs all directive env vars from
+///   the child. Used by background hooks (outlive the parent shell).
+/// - `DirectivePassthrough::inherit_from_env()` — re-adds CD (and the legacy
+///   compat var) but scrubs EXEC. Used by project aliases and foreground hooks,
+///   which may emit `cd` directives but must not be able to inject shell.
+/// - `DirectivePassthrough::inherit_from_env_with_exec()` — also re-adds EXEC.
+///   Used only for user-source aliases, where the alias body is already user-
+///   authored just like a top-level `wt switch --execute` invocation.
+///
+/// ## Stdout routing
+///
+/// `redirect_stdout_to_stderr` controls whether the child's stdout is merged
+/// onto wt's stderr (`true`) or passed through unchanged (`false`).
+///
+/// - Hooks and `for-each` pass `true`: their output is decoration around
+///   wt's own stderr messages, and merging keeps "Running …" / progress lines
+///   ordered with the child's own writes.
+/// - Aliases pass `false`: `wt <alias>` is a user-defined command and its
+///   stdout must remain pipeable, so `wt my-alias | jq` and similar
+///   compositions work (#2478).
 ///
 /// ## ANSI reset
 ///
@@ -1466,6 +1483,7 @@ pub fn execute_shell_command(
     stdin_content: Option<&str>,
     command_log_label: Option<&str>,
     directives: DirectivePassthrough,
+    redirect_stdout_to_stderr: bool,
 ) -> anyhow::Result<()> {
     // Flush stdout before executing command to ensure all our messages appear
     // before the child process output
@@ -1477,11 +1495,13 @@ pub fn execute_shell_command(
     eprint!("{}", anstyle::Reset);
     stderr().flush().ok(); // Ignore flush errors - reset is best-effort, command execution should proceed
 
-    // Execute with stdout→stderr redirect for deterministic ordering
     let mut cmd = Cmd::shell(command)
         .current_dir(working_dir)
-        .stdout(Stdio::from(std::io::stderr()))
         .forward_signals();
+
+    if redirect_stdout_to_stderr {
+        cmd = cmd.stdout(Stdio::from(std::io::stderr()));
+    }
 
     if let Some(label) = command_log_label {
         cmd = cmd.external(label);
@@ -1491,13 +1511,18 @@ pub fn execute_shell_command(
         cmd = cmd.stdin_bytes(content);
     } else {
         // Inherit the parent's stdin so interactive children (e.g. TUI
-        // pickers) keep their controlling terminal. Without this, `Cmd`
-        // defaults stdin to null and `stdin().is_terminal()` checks fail.
-        cmd = cmd.stdin(Stdio::inherit());
+        // pickers) keep their controlling terminal. `inherit_stdin()` also
+        // keeps the child in the parent's process group so `tcsetattr` on
+        // `/dev/tty` succeeds — see the method's doc comment for the
+        // SIGTTOU rationale.
+        cmd = cmd.inherit_stdin();
     }
 
     if let Some(path) = directives.cd_file {
         cmd = cmd.directive_cd_file(path);
+    }
+    if let Some(path) = directives.exec_file {
+        cmd = cmd.directive_exec_file(path);
     }
     if let Some(path) = directives.legacy_file {
         cmd = cmd.directive_legacy_file(path);
@@ -1513,38 +1538,51 @@ pub fn execute_shell_command(
 
 /// Selector for which directive file env vars to pass through to a child shell.
 ///
-/// Constructed by callers via [`DirectivePassthrough::none`] or
-/// [`DirectivePassthrough::inherit_from_env`]. The EXEC file is intentionally
-/// never included — alias/hook shell bodies must not inject arbitrary shell
-/// into the parent session.
+/// `Default` (no fields set) scrubs all directive env vars from the child;
+/// [`DirectivePassthrough::inherit_from_env`] reads the current process
+/// environment and re-adds CD only; [`DirectivePassthrough::inherit_from_env_with_exec`]
+/// re-adds CD and EXEC. The EXEC file is only included by the `_with_exec`
+/// variant — every other path scrubs it so alias/hook shell bodies cannot
+/// inject arbitrary shell into the parent session.
 #[derive(Debug, Default, Clone)]
 pub struct DirectivePassthrough {
     pub cd_file: Option<std::path::PathBuf>,
+    pub exec_file: Option<std::path::PathBuf>,
     pub legacy_file: Option<std::path::PathBuf>,
 }
 
 impl DirectivePassthrough {
-    /// Scrub all directive file env vars from the child process.
-    pub fn none() -> Self {
-        Self::default()
-    }
-
     /// Pass CD and legacy directive files through to the child, reading the
-    /// current process environment. Used by trusted contexts (aliases,
-    /// foreground hooks) that may legitimately emit a `cd` directive. The
-    /// EXEC file is deliberately omitted.
+    /// current process environment. Used by project aliases and foreground
+    /// hooks that may legitimately emit a `cd` directive. The EXEC file is
+    /// deliberately omitted — a project-config body could otherwise inject
+    /// arbitrary shell into the parent session.
     pub fn inherit_from_env() -> Self {
         use worktrunk::shell_exec::{DIRECTIVE_CD_FILE_ENV_VAR, DIRECTIVE_FILE_ENV_VAR};
-        let read = |var: &str| {
-            std::env::var_os(var)
-                .map(std::path::PathBuf::from)
-                .filter(|p| !p.as_os_str().is_empty())
-        };
         Self {
-            cd_file: read(DIRECTIVE_CD_FILE_ENV_VAR),
-            legacy_file: read(DIRECTIVE_FILE_ENV_VAR),
+            cd_file: read_directive_env(DIRECTIVE_CD_FILE_ENV_VAR),
+            exec_file: None,
+            legacy_file: read_directive_env(DIRECTIVE_FILE_ENV_VAR),
         }
     }
+
+    /// Like [`Self::inherit_from_env`] but also passes the EXEC directive
+    /// file through. Used only for user-source aliases: the body lives in the
+    /// user's own config, so a nested `wt --execute` is no different from the
+    /// user typing the same command at the top level. See issue #2101.
+    pub fn inherit_from_env_with_exec() -> Self {
+        use worktrunk::shell_exec::DIRECTIVE_EXEC_FILE_ENV_VAR;
+        Self {
+            exec_file: read_directive_env(DIRECTIVE_EXEC_FILE_ENV_VAR),
+            ..Self::inherit_from_env()
+        }
+    }
+}
+
+fn read_directive_env(var: &str) -> Option<std::path::PathBuf> {
+    std::env::var_os(var)
+        .map(std::path::PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
 }
 
 #[cfg(test)]
@@ -1694,12 +1732,6 @@ mod tests {
 
         let result = resolve_subdir_in_target(&target, Some(&source), &source);
         assert_eq!(result, target);
-    }
-
-    #[test]
-    fn test_shell_integration_hint() {
-        let hint = shell_integration_hint();
-        assert_snapshot!(hint, @"To enable automatic cd, run [4mwt config shell install[24m");
     }
 
     #[test]

@@ -91,6 +91,7 @@ mod items;
 mod log_formatter;
 mod pager;
 mod preview;
+pub(crate) mod preview_cache;
 mod preview_orchestrator;
 mod progressive_handler;
 mod summary;
@@ -107,18 +108,19 @@ use anyhow::Context;
 use skim::prelude::*;
 use skim::reader::CommandCollector;
 use worktrunk::git::{Repository, current_or_recover};
+use worktrunk::styling::eprintln;
 
 use super::command_executor::FailureStrategy;
-use super::handle_switch::{
-    approve_switch_hooks, run_pre_switch_hooks, spawn_switch_background_hooks, switch_extra_vars,
-};
-use super::hooks::{execute_hook, spawn_background_hooks};
+use super::hooks::{HookAnnouncer, execute_hook};
 use super::list::collect;
+use super::list::progressive::RenderTarget;
 use super::repository_ext::{RemoveTarget, RepositoryCliExt};
+use super::template_vars::TemplateVars;
 use super::worktree::hooks::PostRemoveContext;
 use super::worktree::{
-    RemoveResult, SwitchBranchInfo, SwitchResult, execute_switch,
-    offer_bare_repo_worktree_path_fix, path_mismatch, plan_switch,
+    RemoveResult, SwitchBranchInfo, SwitchResult, approve_switch_hooks, execute_switch,
+    offer_bare_repo_worktree_path_fix, path_mismatch, plan_switch, run_pre_switch_hooks,
+    spawn_switch_background_hooks,
 };
 use crate::commands::command_executor::CommandContext;
 use crate::output::handle_switch_output;
@@ -129,6 +131,16 @@ use worktrunk::git::{
 use items::{PreviewCache, WorktreeSkimItem};
 use preview::{PreviewLayout, PreviewMode, PreviewState};
 use preview_orchestrator::PreviewOrchestrator;
+
+/// Drain stashed warnings to stderr. Called after skim has released the
+/// terminal (or in the dry-run path after the bg thread joins) — eprintln
+/// during the picker would corrupt skim's frame, so collect routes warnings
+/// through `PickerProgressHandler::stash_warning` and we emit them here.
+fn drain_stashed_warnings(stash: &Mutex<Vec<String>>) {
+    for line in stash.lock().unwrap().drain(..) {
+        eprintln!("{line}");
+    }
+}
 
 /// Action selected by the user in the picker.
 enum PickerAction {
@@ -192,24 +204,23 @@ impl PickerCollector {
                     .ok()
                     .flatten()
                     .unwrap_or_default();
-                let target_path_str = worktrunk::path::to_posix_path(&main_path.to_string_lossy());
-                let extra_vars: Vec<(&str, &str)> = vec![
-                    ("target", &target_ref),
-                    ("target_worktree_path", &target_path_str),
-                ];
+                let template_vars = TemplateVars::new()
+                    .with_target(&target_ref)
+                    .with_target_worktree_path(main_path);
                 let pre_ctx =
                     CommandContext::new(&repo, config, Some(hook_branch), worktree_path, false);
                 execute_hook(
                     &pre_ctx,
                     worktrunk::HookType::PreRemove,
-                    &extra_vars,
+                    &template_vars.as_extra_vars(),
                     FailureStrategy::FailFast,
-                    &[],
                     None, // no display path in TUI context
                 )?;
 
+                let snapshot = repo.capture_refs()?;
                 let output = remove_worktree_with_cleanup(
                     &repo,
+                    &snapshot,
                     worktree_path,
                     RemoveOptions {
                         branch: branch_name.clone(),
@@ -232,12 +243,14 @@ impl PickerCollector {
                     &repo,
                 );
                 let extra_vars = remove_vars.extra_vars(hook_branch);
-                spawn_background_hooks(
+                let mut announcer = HookAnnouncer::new(&repo, config, false);
+                announcer.register(
                     &post_ctx,
                     worktrunk::HookType::PostRemove,
                     &extra_vars,
                     None, // no display path in TUI context
                 )?;
+                announcer.flush()?;
             }
             RemoveResult::BranchOnly {
                 branch_name,
@@ -247,8 +260,15 @@ impl PickerCollector {
                 if !deletion_mode.should_keep() {
                     let default_branch = repo.default_branch();
                     let target = default_branch.as_deref().unwrap_or("HEAD");
-                    let _ =
-                        delete_branch_if_safe(repo, branch_name, target, deletion_mode.is_force());
+                    if let Ok(snapshot) = repo.capture_refs() {
+                        let _ = delete_branch_if_safe(
+                            repo,
+                            &snapshot,
+                            branch_name,
+                            target,
+                            deletion_mode.is_force(),
+                        );
+                    }
                 }
             }
         }
@@ -294,6 +314,7 @@ impl CommandCollector for PickerCollector {
                     false,
                     config,
                     caller_path,
+                    None,
                     None,
                 );
 
@@ -375,7 +396,7 @@ pub fn handle_picker(
     if std::env::var_os("WORKTRUNK_PICKER_DRY_RUN").is_none() && !std::io::stdin().is_terminal() {
         anyhow::bail!("Interactive picker requires an interactive terminal");
     }
-    worktrunk::shell_exec::trace_instant("Picker started");
+    worktrunk::trace::instant("Picker started");
 
     let (repo, is_recovered) = current_or_recover()?;
 
@@ -384,15 +405,15 @@ pub fn handle_picker(
     let change_dir = change_dir_flag.unwrap_or_else(|| config.switch.cd());
     let show_branches = cli_branches || config.list.branches();
     let show_remotes = cli_remotes || config.list.remotes();
-    worktrunk::shell_exec::trace_instant("Picker config resolved");
+    worktrunk::trace::instant("Picker config resolved");
 
     // Initialize preview mode state file (auto-cleanup on drop)
     let state = PreviewState::new();
-    worktrunk::shell_exec::trace_instant("Picker layout detected");
+    worktrunk::trace::instant("Picker layout detected");
 
-    // Prime the current worktree's root / git-dir / branch / HEAD-SHA caches
-    // with one batched `git rev-parse`. Subsumes the two standalone forks that
-    // the speculative preview block below would otherwise make via `branch()`
+    // Prime the current worktree's root / git-dir / branch caches with one
+    // batched `git rev-parse`. Subsumes the two standalone forks that the
+    // speculative preview block below would otherwise make via `branch()`
     // and `root()`, and is also short-circuited when `collect::collect` calls
     // `repo.url_template()` → `load_project_config()` → `project_config_path()`
     // (which runs `prewarm_info` again — now a cache hit).
@@ -472,7 +493,7 @@ pub fn handle_picker(
         }
         estimate
     };
-    worktrunk::shell_exec::trace_instant("Picker estimate computed");
+    worktrunk::trace::instant("Picker estimate computed");
     let preview_window_spec = state
         .initial_layout
         .to_preview_window_spec(num_items_estimate);
@@ -538,6 +559,23 @@ pub fn handle_picker(
         .no_info(true) // Hide info line (matched/total counter)
         .preview(Some("".to_string())) // Enable preview (empty string means use SkimItem::preview())
         .preview_window(preview_window_spec)
+        // Force the inline-mode clearing path on exit.
+        //
+        // tuikit only enters the alternate screen when the picker is full
+        // height; at `height: "90%"` we're inline, so `smcup` is never
+        // sent. But its `pause()` still emits `rmcup` whenever the option
+        // `disable_alternate_screen` is false — and unmatched `rmcup`
+        // varies by terminal: a no-op on most macOS terminals, but on some
+        // Linux setups it leaves the picker frame on screen because no
+        // explicit erase ran.
+        //
+        // skim plumbs `disable_alternate_screen = no_clear_start` (see
+        // `skim/src/lib.rs` `Skim::run_with`), so setting `no_clear_start`
+        // here forces pause() down the `cursor_goto + erase_down` branch,
+        // which actually erases the rows skim drew on. The other side
+        // effect, `clear_on_start = false`, is harmless for us — skim
+        // immediately overdraws the rows it allocates.
+        .no_clear_start(true)
         // Color scheme using fzf's --color=light values: dark text (237) on light gray bg (251)
         //
         // Terminal color compatibility is tricky:
@@ -597,9 +635,14 @@ pub fn handle_picker(
         // Legend/controls moved to preview window tabs (render_preview_tabs)
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build skim options: {}", e))?;
-    worktrunk::shell_exec::trace_instant("Picker skim options built");
+    worktrunk::trace::instant("Picker skim options built");
 
     let (tx, rx): (SkimItemSender, SkimItemReceiver) = unbounded();
+
+    // Shared between the bg-thread handler (which pushes warnings while
+    // skim owns the terminal) and the main thread (which drains them after
+    // `Skim::run_with` returns and stderr is safe again).
+    let stashed_warnings: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
     let handler: Arc<dyn collect::PickerProgressHandler> =
         Arc::new(progressive_handler::PickerHandler {
@@ -610,8 +653,8 @@ pub fn handle_picker(
             orchestrator: Arc::clone(&orchestrator),
             preview_dims,
             llm_command,
-            repo: repo.clone(),
             summary_hint,
+            stashed_warnings: Arc::clone(&stashed_warnings),
         });
 
     // Spawn collect on a background thread. The handler holds the only
@@ -634,12 +677,13 @@ pub fn handle_picker(
                     list_width: Some(skim_list_width),
                     progressive_handler: Some(bg_handler),
                 },
-                false, // show_progress (picker renders its own UI)
-                false, // render_table
+                // Picker renders its own UI through `progressive_handler`;
+                // collect must not write to stdout.
+                RenderTarget::Json,
             );
         })
         .context("Failed to spawn picker-collect thread")?;
-    worktrunk::shell_exec::trace_instant("Picker collect spawned");
+    worktrunk::trace::instant("Picker collect spawned");
 
     // Drop main-thread copies so the bg thread's `tx` clone is the last
     // sender (its drop is what stops skim's heartbeat).
@@ -652,6 +696,7 @@ pub fn handle_picker(
         drop(rx);
         let _ = bg_handle.join();
         orchestrator.wait_for_idle();
+        drain_stashed_warnings(&stashed_warnings);
         println!("{}", orchestrator.dump_cache_json());
         return Ok(());
     }
@@ -665,6 +710,12 @@ pub fn handle_picker(
     // are read-only.
     let output = Skim::run_with(&options, Some(rx));
     drop(bg_handle);
+
+    // Skim has released the terminal — emit any warnings that collect's bg
+    // thread stashed during the run. Late warnings (e.g. drain timeouts)
+    // may still be in flight; we capture whatever has landed by now and let
+    // the rest fall on the floor with the bg thread.
+    drain_stashed_warnings(&stashed_warnings);
 
     // Handle selection (signal file cleaned up by PreviewState::Drop)
     if let Some(out) = output
@@ -715,9 +766,10 @@ pub fn handle_picker(
         } else {
             Repository::current().context("Failed to switch worktree")?
         };
-        // Load config, offering bare repo worktree-path fix if needed.
-        // Reload from disk so mutations are picked up by plan_switch.
-        let mut config = worktrunk::config::UserConfig::load().context("Failed to load config")?;
+        // Clone user out so `offer_bare_repo_worktree_path_fix` can mutate
+        // locally. Project config is loaded on demand by downstream
+        // `run_pre_switch_hooks` / `plan_switch`.
+        let mut config = repo.user_config().clone();
         offer_bare_repo_worktree_path_fix(&repo, &mut config)?;
 
         // Run pre-switch hooks before branch resolution or worktree creation.
@@ -756,10 +808,12 @@ pub fn handle_picker(
         let hooks_display_path =
             handle_switch_output(&result, &branch_info, change_dir, Some(&source_root), &cwd)?;
 
-        // Spawn background hooks after success message
+        // Spawn background hooks after success message. Picker doesn't capture
+        // pre-switch source identity, so existing-switch `base` vars stay
+        // unset; result-derived `base` (creates) and `target` flow as usual.
         if hooks_approved {
-            let mut pr_number_buf = String::new();
-            let extra_vars = switch_extra_vars(&result, &mut pr_number_buf);
+            let template_vars = TemplateVars::for_post_switch(&result, &branch_info, "", "");
+            let extra_vars = template_vars.as_extra_vars();
             spawn_switch_background_hooks(
                 &repo,
                 &config,
@@ -809,10 +863,29 @@ fn resolve_identifier(
 #[cfg(test)]
 pub mod tests {
     use super::preview::{PreviewLayout, PreviewMode, PreviewStateData};
-    use super::{PickerAction, PickerCollector, resolve_identifier};
+    use super::{PickerAction, PickerCollector, drain_stashed_warnings, resolve_identifier};
     use crate::commands::worktree::RemoveResult;
     use std::fs;
+    use std::sync::Mutex;
     use worktrunk::git::BranchDeletionMode;
+
+    /// Empties the stash and emits each line. Verifies post-skim drain
+    /// semantics without standing up a real picker.
+    #[test]
+    fn drain_stashed_warnings_empties_the_stash() {
+        let stash = Mutex::new(vec!["one".to_string(), "two".to_string()]);
+        drain_stashed_warnings(&stash);
+        assert!(stash.lock().unwrap().is_empty());
+    }
+
+    /// A fresh stash with no warnings is a no-op — exercising the empty path
+    /// keeps the loop body covered when the picker exits cleanly.
+    #[test]
+    fn drain_stashed_warnings_handles_empty_stash() {
+        let stash: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        drain_stashed_warnings(&stash);
+        assert!(stash.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn test_preview_state_data_roundtrip() {

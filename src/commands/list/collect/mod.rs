@@ -65,7 +65,7 @@
 //! ├─ is_builtin_fsmonitor_enabled()             (5ms, sequential - gate)
 //! ├─ rayon::scope(
 //! │    ├─ switch_previous()                     (5ms)
-//! │    ├─ integration_target()                  (10ms)
+//! │    ├─ integration_targets()                 (10ms)
 //! │    ├─ start_fsmonitor_daemon × N worktrees  (6ms each, all parallel)
 //! │  )                                          // ~10ms total (max of all spawns)
 //! ├─ populate ListItem.commit from cache        (cache-hit lookups, sub-ms)
@@ -234,7 +234,7 @@ use crossbeam_channel as chan;
 use dunce::canonicalize;
 use once_cell::sync::OnceCell;
 use rayon::prelude::*;
-use worktrunk::git::{LocalBranch, Repository, WorktreeInfo};
+use worktrunk::git::{ErrorExt, LocalBranch, Repository, WorktreeInfo};
 use worktrunk::styling::{
     INFO_SYMBOL, eprintln, format_with_gutter, hint_message, warning_message,
 };
@@ -242,6 +242,7 @@ use worktrunk::styling::{
 use crate::commands::is_worktree_at_expected_path;
 
 use super::model::{CommitDetails, DisplayFields, ItemKind, ListItem, StatusSymbols, WorktreeData};
+use super::progressive::RenderTarget;
 use super::progressive_table::ProgressiveTable;
 
 // Re-exports for sibling modules (columns.rs, render.rs, layout.rs)
@@ -253,7 +254,7 @@ pub(crate) use execution::ExpectedResults;
 use execution::{work_items_for_branch, work_items_for_worktree};
 use results::drain_results;
 use types::DrainOutcome;
-use types::{TaskError, TaskResult};
+use types::{MissingResult, TaskError, TaskResult};
 
 struct TableRenderPlan {
     progressive_table: Option<ProgressiveTable>,
@@ -265,11 +266,7 @@ struct TableRenderPlan {
 impl TableRenderPlan {
     fn render(mut self) -> anyhow::Result<()> {
         if let Some(mut table) = self.progressive_table.take() {
-            if table.is_tty() {
-                table.finalize(self.rows, self.summary)?;
-            } else {
-                print_buffered_table(&self.header, &self.rows, &self.summary);
-            }
+            table.finalize(self.rows, self.summary)?;
         } else {
             print_buffered_table(&self.header, &self.rows, &self.summary);
         }
@@ -313,9 +310,21 @@ pub struct CollectOptions {
     /// persisted value degrades silently (empty cells) here rather than
     /// emitting a cascade of "ambiguous argument" errors from every task.
     pub default_branch: Option<String>,
-    /// Integration target (`default_branch`, or its upstream when ahead).
-    /// `None` when the default branch is unset or stale.
-    pub integration_target: Option<String>,
+    /// Integration targets resolved for this list invocation. The diverged
+    /// case carries both local and upstream so per-branch tasks can OR
+    /// over them, matching `Repository::integration_reason`. `None` when
+    /// the default branch is unset or stale.
+    pub integration_targets: Option<worktrunk::git::IntegrationTargets>,
+
+    /// Captured ref state for this list invocation.
+    ///
+    /// Built once during the pre-skeleton phase by
+    /// [`Repository::capture_refs_with_ahead_behind`] and shared (cheaply,
+    /// behind `Arc`) into every task. Tasks resolve target ref names to
+    /// commit SHAs through this snapshot, then call the `_by_sha` variants
+    /// of cached methods — bypassing the ambient ref→SHA cache entirely.
+    /// `None` when capture failed (degraded mode).
+    pub snapshot: Option<std::sync::Arc<worktrunk::git::RefSnapshot>>,
 }
 
 fn worktree_branch_set(worktrees: &[WorktreeInfo]) -> HashSet<&str> {
@@ -351,10 +360,18 @@ pub trait PickerProgressHandler: Send + Sync {
     /// up on the next heartbeat.
     fn on_update(&self, idx: usize, rendered: String);
 
-    /// Fired at the 200ms reveal deadline. Entry per row: `Some(line)` for
-    /// rows still at skeleton state (placeholder needs promoting to `·`),
-    /// `None` for rows that already received real data via `on_update`.
-    fn on_reveal(&self, rendered: Vec<Option<String>>);
+    /// Fired at the 200ms reveal deadline. One pre-rendered line per row,
+    /// with the placeholder promoted from blank to `·`: rows that have
+    /// received real data use `format_list_item_line`, rows still at
+    /// skeleton state use the skeleton renderer. The handler writes every
+    /// slot — slot writes are idempotent.
+    fn on_reveal(&self, rendered: Vec<String>);
+
+    /// Stash a pre-formatted warning line. Skim owns the terminal while
+    /// collect runs on the picker's bg thread, so eprintln from collect
+    /// would corrupt the rendered frame. The picker drains stashed lines
+    /// after `Skim::run_with` returns, when stderr is safe again.
+    fn stash_warning(&self, line: String);
 }
 
 /// Controls how show flags (branches/remotes/full) are determined in [`collect`].
@@ -388,64 +405,30 @@ pub enum ShowConfig {
     },
 }
 
-/// Per-row render cache shared by the `wt list` progressive table and the
-/// picker's `PickerProgressHandler`. Both sinks write through the same dedup
-/// path so one rendering pass serves both.
-///
-/// `set_result` records a new render and returns `Some(line)` only when it
-/// differs from the cached value.
-///
-/// `set_reveal` runs after `layout.placeholder` is promoted from blank to
-/// `·`. Every row is re-rendered (skeleton for rows with no data yet to
-/// avoid surfacing seeded defaults like "55y"; `format_list_item_line` for
-/// rows that received at least one result, so still-pending cells pick up
-/// the promoted `·`). Dedup against the cache keeps emitted updates minimal.
-struct RowCache {
-    last: Vec<String>,
-    has_data: Vec<bool>,
-}
-
-impl RowCache {
-    fn new(n: usize) -> Self {
-        Self {
-            last: vec![String::new(); n],
-            has_data: vec![false; n],
-        }
-    }
-
-    fn set_result(&mut self, idx: usize, rendered: String) -> Option<String> {
-        self.has_data[idx] = true;
-        if self.last[idx] == rendered {
-            None
-        } else {
-            self.last[idx] = rendered.clone();
-            Some(rendered)
-        }
-    }
-
-    fn set_reveal(
-        &mut self,
-        items: &[super::model::ListItem],
-        layout: &super::layout::LayoutConfig,
-    ) -> Vec<Option<String>> {
-        items
-            .iter()
-            .enumerate()
-            .map(|(idx, item)| {
-                let new = if self.has_data[idx] {
-                    layout.format_list_item_line(item)
-                } else {
-                    layout.render_skeleton_row(item).render()
-                };
-                if self.last[idx] == new {
-                    None
-                } else {
-                    self.last[idx] = new.clone();
-                    Some(new)
-                }
-            })
-            .collect()
-    }
+/// On the reveal tick, every row is re-rendered. Rows that have already
+/// received at least one task result use `format_list_item_line` so still-
+/// pending cells pick up the promoted `·`; rows with no data yet stay on
+/// the skeleton renderer to avoid flashing seeded defaults like "55y". The
+/// `has_data` bitmap is the only state needed to make that choice. Callers
+/// pass the post-reveal placeholder (always [`super::render::PLACEHOLDER`]
+/// in production — the reveal tick is what promotes blank to dot).
+fn render_reveal(
+    has_data: &[bool],
+    items: &[super::model::ListItem],
+    layout: &super::layout::LayoutConfig,
+    placeholder: &str,
+) -> Vec<String> {
+    items
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| {
+            if has_data[idx] {
+                layout.format_list_item_line(item, placeholder)
+            } else {
+                layout.render_skeleton_row(item, placeholder).render()
+            }
+        })
+        .collect()
 }
 
 /// Build the progressive-table footer shown while the drain is stalled.
@@ -475,19 +458,85 @@ fn format_stall_footer(
     )
 }
 
-/// Collect worktree data with optional progressive rendering.
+/// Emit the drain-timeout warning + hint when the default 120s
+/// `DRAIN_TIMEOUT` was hit. No-op for `Complete` outcomes or when an
+/// explicit `collect_deadline` was supplied — those are intentional
+/// truncations the caller controls.
 ///
-/// When `show_progress` is true, renders a skeleton immediately and updates as data arrives.
-/// When false, behavior depends on `render_table`:
-/// - If `render_table` is true: renders final table (buffered mode)
-/// - If `render_table` is false: returns data without rendering (JSON mode)
+/// Split out so tests can drive it with a synthetic `DrainOutcome::TimedOut`
+/// without spinning up a real 120s drain.
+fn handle_drain_timeout(
+    drain_outcome: DrainOutcome,
+    collect_deadline: Option<std::time::Instant>,
+    emit: &dyn Fn(String),
+) {
+    if collect_deadline.is_none()
+        && let DrainOutcome::TimedOut {
+            received_count,
+            items_with_missing,
+        } = drain_outcome
+    {
+        let diag = format_drain_timeout_diag(received_count, &items_with_missing);
+        emit(warning_message(&diag).to_string());
+        emit(
+            hint_message(cformat!(
+                "A git command likely hung; for details, re-run with <underline>-v</>; for a diagnostic file, re-run with <underline>-vv</>"
+            ))
+            .to_string(),
+        );
+    }
+}
+
+/// Build the drain-timeout diagnostic shown when the default 120s
+/// `DRAIN_TIMEOUT` is hit. Returns the pre-formatted warning text — the
+/// caller wraps it in `warning_message` and routes through the picker stash
+/// or stderr. Pure so tests can exercise it without spinning up a 120s drain.
+fn format_drain_timeout_diag(
+    received_count: usize,
+    items_with_missing: &[MissingResult],
+) -> String {
+    let mut diag = format!(
+        "Listing worktrees timed out after {}s ({received_count} results received)",
+        results::DRAIN_TIMEOUT.as_secs()
+    );
+
+    if !items_with_missing.is_empty() {
+        diag.push_str("; blocked tasks:");
+        let missing_lines: Vec<String> = items_with_missing
+            .iter()
+            .take(5)
+            .map(|result| {
+                let missing_names: Vec<&str> =
+                    result.missing_kinds.iter().map(|k| k.into()).collect();
+                cformat!("<bold>{}</>: {}", result.name, missing_names.join(", "))
+            })
+            .collect();
+        diag.push_str(&format!(
+            "\n{}",
+            format_with_gutter(&missing_lines.join("\n"), None)
+        ));
+    }
+    diag
+}
+
+/// Collect worktree data with rendering driven by `render_target`.
+///
+/// - [`RenderTarget::Table { progressive: true }`]: renders a skeleton
+///   immediately and updates rows in place as data arrives, then morphs the
+///   skeleton into the final table.
+/// - [`RenderTarget::Table { progressive: false }`]: collects silently, then
+///   prints the final table once.
+/// - [`RenderTarget::Json`]: collects silently and returns data without
+///   writing to stdout. Used by `--format=json` and the picker (which has its
+///   own progressive UI driven via `ShowConfig::Resolved::progressive_handler`).
 pub fn collect(
     repo: &Repository,
     show_config: ShowConfig,
-    show_progress: bool,
-    render_table: bool,
+    render_target: RenderTarget,
 ) -> anyhow::Result<Option<super::model::ListData>> {
-    worktrunk::shell_exec::trace_instant("List collect started");
+    let show_progress = matches!(render_target, RenderTarget::Table { progressive: true });
+    let render_table = matches!(render_target, RenderTarget::Table { .. });
+    worktrunk::trace::instant("List collect started");
 
     // Determine what to fetch speculatively in the parallel phase.
     //
@@ -643,6 +692,19 @@ pub fn collect(
         }
     };
 
+    // The picker (`wt switch`) drives a skim TUI that owns the terminal while
+    // collect runs on a background thread. Any stderr write from collect
+    // would overlay the picker's rendered frame and corrupt skim's clear
+    // math, so warnings go through the handler's stash instead — picker
+    // drains and emits them after `Skim::run_with` returns.
+    let emit_warning = |line: String| {
+        if let Some(h) = progressive_handler.as_ref() {
+            h.stash_warning(line);
+        } else {
+            eprintln!("{line}");
+        }
+    };
+
     // Opportunistic stale-default-branch check: `default_branch` above is
     // the persisted value, now trusted without validation on the hot path.
     // Cross-check against the enumerated branch set and surface a warning
@@ -680,17 +742,17 @@ pub fn collect(
     };
 
     if warn_stale_default && let Some(branch) = default_branch.as_deref() {
-        eprintln!(
-            "{}",
+        emit_warning(
             warning_message(cformat!(
                 "Configured default branch <bold>{branch}</> does not exist locally"
             ))
+            .to_string(),
         );
-        eprintln!(
-            "{}",
+        emit_warning(
             hint_message(cformat!(
                 "To reset, run <underline>wt config state default-branch clear</>"
             ))
+            .to_string(),
         );
     }
 
@@ -766,9 +828,11 @@ pub fn collect(
         .filter(|sha| *sha != worktrunk::git::NULL_OID)
         .collect();
     let commit_details_map = repo.commit_details_many(&all_shas).unwrap_or_else(|err| {
-        eprintln!(
-            "{}",
-            warning_message(cformat!("Failed to batch-fetch commit details: {err}"))
+        // Surface git's actual stderr (when available via the typed leaf)
+        // rather than our `CommandError` summary.
+        let detail = err.display_message();
+        emit_warning(
+            warning_message(cformat!("Failed to batch-fetch commit details: {detail}")).to_string(),
         );
         std::collections::HashMap::new()
     });
@@ -826,6 +890,7 @@ pub fn collect(
             // URL expanded post-skeleton to minimize time-to-skeleton
             ListItem {
                 head: wt.head.clone(),
+                short_sha: String::new(),
                 branch: wt.branch.clone(),
                 commit: None,
                 counts: None,
@@ -900,7 +965,7 @@ pub fn collect(
     // Single-line invariant: use safe width to prevent line wrapping
     let max_width = crate::display::terminal_width();
 
-    // Create collection options from skip set. `integration_target` is
+    // Create collection options from skip set. `integration_targets` is
     // patched in after the parallel phase below extracts it — at this
     // point we haven't yet resolved it, but task spawning doesn't happen
     // until line 1090+ so late population is safe.
@@ -909,7 +974,8 @@ pub fn collect(
         url_template: url_template.clone(),
         llm_command,
         default_branch: default_branch.clone(),
-        integration_target: None,
+        integration_targets: None,
+        snapshot: None,
     };
 
     // Track expected results per item - populated as spawns are queued
@@ -936,15 +1002,21 @@ pub fn collect(
             format!("Showing {} worktree{}", num_worktrees, plural)
         };
 
-    // Create progressive table if showing progress.
-    //
-    // Skeleton renders with `PLACEHOLDER_BLANK` (space) so commands that finish
-    // under ~200ms never flash the `·` loading indicator. After
-    // `PLACEHOLDER_REVEAL_DELAY` the placeholder is promoted to `·` via the
-    // drain tick below.
-    let mut progressive_table = if show_progress {
-        layout.placeholder.set(super::render::PLACEHOLDER_BLANK);
+    // Track which placeholder rendering currently uses. Progressive renderers
+    // (table or picker) start blank so commands that finish under
+    // `PLACEHOLDER_REVEAL_DELAY` never flash the `·` loading indicator; the
+    // reveal event below promotes it to [`super::render::PLACEHOLDER`].
+    // Non-progressive callers (e.g. JSON, buffered table) render once at the
+    // end and use the dot directly.
+    let progressive_active = show_progress || progressive_handler.is_some();
+    let mut placeholder: &'static str = if progressive_active {
+        super::render::PLACEHOLDER_BLANK
+    } else {
+        super::render::PLACEHOLDER
+    };
 
+    // Create progressive table if showing progress.
+    let mut progressive_table = if show_progress {
         let dim = Style::new().dimmed();
 
         // Build skeleton rows for both worktrees and branches
@@ -952,7 +1024,7 @@ pub fn collect(
         // hasn't been loaded yet. Using format_list_item_line would show default values like "55y".
         let skeletons: Vec<String> = all_items
             .iter()
-            .map(|item| layout.render_skeleton_row(item).render())
+            .map(|item| layout.render_skeleton_row(item, placeholder).render())
             .collect();
 
         let initial_footer = format!("{INFO_SYMBOL} {dim}{footer_base} (loading...){dim:#}");
@@ -964,20 +1036,11 @@ pub fn collect(
             max_width,
         );
         table.render_skeleton()?;
-        worktrunk::shell_exec::trace_instant("Skeleton rendered");
+        worktrunk::trace::instant("Skeleton rendered");
         Some(table)
     } else {
         None
     };
-
-    // Picker mirrors `wt list`'s blank→`·` reveal. The placeholder starts
-    // blank so fast completions don't flash loading dots; the Reveal event
-    // below promotes it to `·` at 200ms. `show_progress=false` (the picker
-    // path today) skips the block above, so set it here unconditionally
-    // when a handler is present.
-    if progressive_handler.is_some() {
-        layout.placeholder.set(super::render::PLACEHOLDER_BLANK);
-    }
 
     // Deliver the skeleton to the picker handler. Rendered strings use the
     // blank placeholder so skim's initial render mirrors the `wt list`
@@ -985,12 +1048,12 @@ pub fn collect(
     if let Some(handler) = progressive_handler.as_ref() {
         let skeletons: Vec<String> = all_items
             .iter()
-            .map(|item| layout.render_skeleton_row(item).render())
+            .map(|item| layout.render_skeleton_row(item, placeholder).render())
             .collect();
         handler.on_skeleton(all_items.clone(), skeletons, layout.render_header_line());
         // Mirror the `wt list` progressive-table marker so `wt-perf phases`
         // sees the same boundary across both commands.
-        worktrunk::shell_exec::trace_instant("Skeleton rendered");
+        worktrunk::trace::instant("Skeleton rendered");
     }
 
     /// Delay before the `·` loading indicator replaces blank placeholders.
@@ -1037,7 +1100,7 @@ pub fn collect(
     // See: https://gitlab.com/gitlab-org/git/-/merge_requests/148 (scalar's fsmonitor workaround)
     // See: https://github.com/jj-vcs/jj/issues/6440 (jj hit same fsmonitor issue)
     let previous_branch_cell: OnceCell<Option<String>> = OnceCell::new();
-    let integration_target_cell: OnceCell<Option<String>> = OnceCell::new();
+    let snapshot_cell: OnceCell<Option<worktrunk::git::RefSnapshot>> = OnceCell::new();
 
     rayon::scope(|s| {
         // Previous branch lookup (for gutter symbol)
@@ -1045,9 +1108,17 @@ pub fn collect(
             let _ = previous_branch_cell.set(repo.switch_previous());
         });
 
-        // Integration target (upstream if ahead of local, else local)
+        // Capture ref state. One `for-each-ref refs/heads/ refs/remotes/`
+        // plus (when default_branch is known) one `for-each-ref
+        // %(ahead-behind:BASE)` batch. The snapshot replaces the prior
+        // `commit_shas` priming + `batch_ahead_behind` pair: tasks consume
+        // it by SHA, dodging ref→SHA cache staleness.
         s.spawn(|_| {
-            let _ = integration_target_cell.set(repo.integration_target());
+            let snap = match default_branch.as_deref() {
+                Some(db) => repo.capture_refs_with_ahead_behind(db).ok(),
+                None => repo.capture_refs().ok(),
+            };
+            let _ = snapshot_cell.set(snap);
         });
 
         // Fsmonitor daemon starts (one spawn per worktree)
@@ -1060,16 +1131,27 @@ pub fn collect(
 
     // Extract results from cells
     let previous_branch = previous_branch_cell.into_inner().flatten();
-    let integration_target = integration_target_cell.into_inner().flatten();
+    let snapshot = snapshot_cell
+        .into_inner()
+        .flatten()
+        .map(std::sync::Arc::new);
 
-    // Patch integration_target into options now that it's resolved. When
-    // default_branch is None (unset or stale), also null it out — tasks
-    // otherwise see a target derived from the stale value and emit
-    // "ambiguous argument" noise.
-    options.integration_target = options
+    // Resolve integration targets from the snapshot. Same OR semantics
+    // as `Repository::integration_reason` (`primary` + optional
+    // `secondary` only in the diverged case).
+    let integration_targets = snapshot
+        .as_deref()
+        .and_then(|s| repo.integration_targets(s));
+
+    // Patch integration_targets and snapshot into options. When
+    // default_branch is None (unset or stale), null integration_targets
+    // out — tasks otherwise see a target derived from the stale value
+    // and emit "ambiguous argument" noise.
+    options.integration_targets = options
         .default_branch
         .as_ref()
-        .and(integration_target.clone());
+        .and(integration_targets.clone());
+    options.snapshot = snapshot;
 
     // Update is_previous on items
     if let Some(prev) = previous_branch.as_deref() {
@@ -1082,38 +1164,33 @@ pub fn collect(
         }
     }
 
-    // Populate commit details (timestamp + subject) on every item directly
-    // from the pre-skeleton batch map. No per-SHA recovery — if the batch
-    // failed, the warning printed above is the user-visible signal and
-    // Age/Message cells render their placeholder. Prunable worktrees are
-    // skipped because their directory is missing from disk; leaving these
-    // rows at the placeholder matches the old task-queue UX.
+    // Populate commit data on every item directly from the pre-skeleton batch
+    // map. No per-SHA recovery — if the batch failed, the warning printed above
+    // is the user-visible signal and Age/Message cells render their placeholder.
+    //
+    // `short_sha` is populated for every row (including prunable), since it's a
+    // pure SHA derivation that doesn't need the worktree directory. The
+    // timestamp/message bundle is skipped for prunable rows to match the old
+    // task-queue UX where probes against a missing worktree dir failed.
     for item in &mut all_items {
+        let Some((short_sha, timestamp, commit_message)) = commit_details_map.get(&item.head)
+        else {
+            continue;
+        };
+        item.short_sha = short_sha.clone();
         if item.worktree_data().is_some_and(|d| d.is_prunable()) {
             continue;
         }
-        if let Some((timestamp, commit_message)) = commit_details_map.get(&item.head) {
-            item.commit = Some(CommitDetails {
-                timestamp: *timestamp,
-                commit_message: commit_message.clone(),
-            });
-        }
+        item.commit = Some(CommitDetails {
+            timestamp: *timestamp,
+            commit_message: commit_message.clone(),
+        });
     }
 
-    // Batch-fetch ahead/behind counts for all local branches in a single
-    // `git for-each-ref` call. Primes the Repository cache so each
-    // `AheadBehindTask` hits the cache instead of spawning its own
-    // `git rev-list --count`. One git call replaces N.
-    //
-    // Note: `resolved_refs`, `commit_shas`, and upstream tracking info are
-    // already primed by `local_branches()` (called during pre-skeleton
-    // phase), so `Branch::upstream()` is an in-memory lookup from here on.
-    //
-    // On git < 2.36 (no `%(ahead-behind:)` support) or if default_branch is
-    // unknown, skip the batch — individual tasks fall back to direct calls.
-    if let Some(ref db) = default_branch {
-        repo.batch_ahead_behind(db);
-    }
+    // No need to prime the ambient `cache.ahead_behind` here: the
+    // snapshot captured above carries the same batched data, and all
+    // tasks consume it by SHA. (Step 5 deletes `cache.ahead_behind`
+    // entirely.)
 
     // Note: URL template expansion is deferred to task spawning (in collect_worktree_progressive
     // and collect_branch_progressive). This parallelizes the work and minimizes time-to-skeleton.
@@ -1188,9 +1265,9 @@ pub fn collect(
     // worker-thread split lets the drain loop start consuming results on
     // the main thread immediately.
     let tx_worker = tx.clone();
-    worktrunk::shell_exec::trace_instant("Spawning worker thread");
+    worktrunk::trace::instant("Spawning worker thread");
     std::thread::spawn(move || {
-        worktrunk::shell_exec::trace_instant("Parallel execution started");
+        worktrunk::trace::instant("Parallel execution started");
         all_work_items.into_par_iter().for_each(|item| {
             worktrunk::shell_exec::set_command_timeout(command_timeout);
             let result = item.execute();
@@ -1227,7 +1304,7 @@ pub fn collect(
             first_result_traced: false,
         })
     });
-    let mut row_cache = RowCache::new(n_items);
+    let mut has_data = vec![false; n_items];
 
     let drain_deadline =
         collect_deadline.unwrap_or_else(|| std::time::Instant::now() + results::DRAIN_TIMEOUT);
@@ -1236,27 +1313,43 @@ pub fn collect(
     let reveal_at = (progressive_state.is_some() || progressive_handler.is_some())
         .then_some(placeholder_reveal_at);
 
+    let primary_target = options
+        .integration_targets
+        .as_ref()
+        .map(|t| t.primary.as_str());
+
     let drain_outcome = drain_results(
         rx,
         &mut all_items,
         &mut errors,
         &expected_results,
         drain_deadline,
-        integration_target.as_deref(),
+        primary_target,
         |event| {
             let dim = Style::new().dimmed();
             let total_results = expected_results.count();
 
             match event {
                 results::DrainEvent::Result { item_idx, item } => {
-                    let rendered = layout.format_list_item_line(item);
-                    let changed = row_cache.set_result(item_idx, rendered);
+                    has_data[item_idx] = true;
+
+                    // JSON and buffered-table modes render once at the end,
+                    // not per-result.
+                    if progressive_state.is_none() && progressive_handler.is_none() {
+                        return;
+                    }
+
+                    // `update_row` and the picker handler both write through
+                    // an idempotent slot (terminal line / `Mutex<String>`),
+                    // so forwarding every result without dedup is safe; the
+                    // table dedups internally against its previous render.
+                    let rendered = layout.format_list_item_line(item, placeholder);
 
                     if let Some(state_cell) = progressive_state.as_ref() {
                         let mut s = state_cell.borrow_mut();
                         if !s.first_result_traced {
                             s.first_result_traced = true;
-                            worktrunk::shell_exec::trace_instant("First result received");
+                            worktrunk::trace::instant("First result received");
                         }
 
                         s.completed_results += 1;
@@ -1275,32 +1368,25 @@ pub fn collect(
                             "{INFO_SYMBOL} {dim}{footer_base} ({completed}/{total_results} loaded){dim:#}"
                         );
                         s.table.update_footer(footer_msg);
-
-                        if let Some(line) = &changed {
-                            s.table.update_row(item_idx, line.clone());
-                        }
+                        s.table.update_row(item_idx, rendered.clone());
 
                         if let Err(e) = s.table.flush() {
                             log::debug!("Progressive table flush failed: {}", e);
                         }
                     }
 
-                    if let Some(handler) = progressive_handler.as_ref()
-                        && let Some(line) = changed
-                    {
-                        handler.on_update(item_idx, line);
+                    if let Some(handler) = progressive_handler.as_ref() {
+                        handler.on_update(item_idx, rendered);
                     }
                 }
                 results::DrainEvent::Reveal { items } => {
-                    layout.placeholder.set(super::render::PLACEHOLDER);
-                    let updates = row_cache.set_reveal(items, &layout);
+                    placeholder = super::render::PLACEHOLDER;
+                    let updates = render_reveal(&has_data, items, &layout, placeholder);
 
                     if let Some(state_cell) = progressive_state.as_ref() {
                         let mut s = state_cell.borrow_mut();
-                        for (idx, update) in updates.iter().enumerate() {
-                            if let Some(line) = update {
-                                s.table.update_row(idx, line.clone());
-                            }
+                        for (idx, line) in updates.iter().enumerate() {
+                            s.table.update_row(idx, line.clone());
                         }
                         if let Err(e) = s.table.flush() {
                             log::debug!("Progressive table reveal flush failed: {}", e);
@@ -1342,7 +1428,7 @@ pub fn collect(
         },
         reveal_at,
     );
-    worktrunk::shell_exec::trace_instant("All results drained");
+    worktrunk::trace::instant("All results drained");
 
     // Extract progressive state back out. `progressive_table` is re-bound so
     // post-drain code (finalize / error rendering) works unchanged.
@@ -1353,52 +1439,17 @@ pub fn collect(
         }
         None => (None, false),
     };
-    // Reveal the placeholder synchronously for any path where the drain
-    // finished before the reveal could fire — keeps subsequent renders
-    // (including `finalize`) consistent with the post-reveal placeholder.
-    layout.placeholder.set(super::render::PLACEHOLDER);
+    // Force the dot for any post-drain render. The reveal event only fires
+    // once the 200ms deadline has passed; if every result arrives before
+    // then, the closure left `placeholder` on `PLACEHOLDER_BLANK`, and the
+    // final table / finalize / timeout paths must not inherit that.
+    placeholder = super::render::PLACEHOLDER;
 
-    // Handle timeout if it occurred.
-    // Budget-based deadlines (collect_deadline) are intentional truncation — don't warn.
-    // Only warn for the default DRAIN_TIMEOUT (120s), which indicates a hung command.
-    if collect_deadline.is_none()
-        && let DrainOutcome::TimedOut {
-            received_count,
-            items_with_missing,
-        } = drain_outcome
-    {
-        // Warning: what happened + gutter showing which tasks blocked
-        let mut diag = format!(
-            "wt list timed out after {}s ({received_count} results received)",
-            results::DRAIN_TIMEOUT.as_secs()
-        );
-
-        if !items_with_missing.is_empty() {
-            diag.push_str("; blocked tasks:");
-            let missing_lines: Vec<String> = items_with_missing
-                .iter()
-                .take(5)
-                .map(|result| {
-                    let missing_names: Vec<&str> =
-                        result.missing_kinds.iter().map(|k| k.into()).collect();
-                    cformat!("<bold>{}</>: {}", result.name, missing_names.join(", "))
-                })
-                .collect();
-            diag.push_str(&format!(
-                "\n{}",
-                format_with_gutter(&missing_lines.join("\n"), None)
-            ));
-        }
-
-        eprintln!("{}", warning_message(&diag));
-
-        eprintln!(
-            "{}",
-            hint_message(cformat!(
-                "A git command likely hung; run <underline>wt list -v</> for details or <underline>wt list -vv</> to create a diagnostic file"
-            ))
-        );
-    }
+    // Handle timeout if it occurred. Budget-based deadlines
+    // (collect_deadline) are intentional truncation — don't warn. Only
+    // warn for the default DRAIN_TIMEOUT (120s), which indicates a hung
+    // command.
+    handle_drain_timeout(drain_outcome, collect_deadline, &emit_warning);
 
     // The drain calls `refresh_status_symbols` after every *successful*
     // result, but items with zero successful results (all tasks errored
@@ -1407,7 +1458,7 @@ pub fn collect(
     // pre-seeded main_state for unborn/prunable items) still materialize.
     // The call is idempotent — already-resolved gates are skipped.
     for item in all_items.iter_mut() {
-        item.refresh_status_symbols(integration_target.as_deref());
+        item.refresh_status_symbols(primary_target);
     }
 
     // Count errors for summary
@@ -1419,7 +1470,7 @@ pub fn collect(
         header: layout.format_header_line(),
         rows: all_items
             .iter()
-            .map(|item| layout.format_list_item_line(item))
+            .map(|item| layout.format_list_item_line(item, placeholder))
             .collect(),
         summary: super::format_summary_message(
             &all_items,
@@ -1470,10 +1521,10 @@ pub fn collect(
         }
 
         let warning = warning_parts.join("\n");
-        eprintln!("{}", warning_message(&warning));
+        emit_warning(warning_message(&warning).to_string());
 
         // Show issue reporting hint (free function - doesn't collect diagnostic data)
-        eprintln!("{}", hint_message(crate::diagnostic::issue_hint()));
+        emit_warning(hint_message(crate::diagnostic::issue_hint()).to_string());
     }
 
     // Populate display fields for all items (used by JSON output and statusline)
@@ -1484,12 +1535,14 @@ pub fn collect(
     // all_items now contains both worktrees and branches (if requested)
     let items = all_items;
 
-    // Table rendering complete (when render_table=true):
-    // - Progressive + TTY: rows morphed in place, footer became summary
-    // - Progressive + Non-TTY: rendered final table (no intermediate output)
-    // - Buffered: rendered final table
-    // JSON mode (render_table=false): no rendering, data returned for serialization
-    worktrunk::shell_exec::trace_instant("List collect complete");
+    // Table rendering complete:
+    // - `RenderTarget::Table { progressive: true }`: rows morphed in place,
+    //   footer became summary
+    // - `RenderTarget::Table { progressive: false }`: rendered final table
+    // - `RenderTarget::Json`: no stdout rendering; data returned for the
+    //   caller to serialize (`wt list --format=json`) or feed into its own
+    //   UI (picker via `progressive_handler`)
+    worktrunk::trace::instant("List collect complete");
 
     Ok(Some(super::model::ListData { items }))
 }
@@ -1501,7 +1554,7 @@ pub fn collect(
 /// Sort items by timestamp descending using the pre-fetched commit-details map.
 fn sort_by_timestamp_desc_with_cache<T, F>(
     items: Vec<T>,
-    commit_details: &std::collections::HashMap<String, (i64, String)>,
+    commit_details: &std::collections::HashMap<String, (String, i64, String)>,
     get_sha: F,
 ) -> Vec<T>
 where
@@ -1511,7 +1564,9 @@ where
     let mut with_ts: Vec<_> = items
         .into_iter()
         .map(|item| {
-            let ts = commit_details.get(get_sha(&item)).map_or(0, |(ts, _)| *ts);
+            let ts = commit_details
+                .get(get_sha(&item))
+                .map_or(0, |(_, ts, _)| *ts);
             (item, ts)
         })
         .collect();
@@ -1525,7 +1580,7 @@ fn sort_worktrees_with_cache(
     worktrees: &[WorktreeInfo],
     main_worktree: &WorktreeInfo,
     current_path: Option<&std::path::PathBuf>,
-    commit_details: &std::collections::HashMap<String, (i64, String)>,
+    commit_details: &std::collections::HashMap<String, (String, i64, String)>,
 ) -> Vec<WorktreeInfo> {
     // Embed timestamp and priority in tuple to avoid parallel Vec and index lookups
     let mut with_sort_key: Vec<_> = worktrees
@@ -1538,7 +1593,7 @@ fn sort_worktrees_with_cache(
             } else {
                 2 // Rest by timestamp
             };
-            let ts = commit_details.get(&wt.head).map_or(0, |(ts, _)| *ts);
+            let ts = commit_details.get(&wt.head).map_or(0, |(_, ts, _)| *ts);
             (wt, priority, ts)
         })
         .collect();
@@ -1566,6 +1621,7 @@ pub fn build_worktree_item(
 ) -> ListItem {
     ListItem {
         head: wt.head.clone(),
+        short_sha: String::new(),
         branch: wt.branch.clone(),
         commit: None,
         counts: None,
@@ -1609,23 +1665,28 @@ pub fn populate_item(
     item: &mut ListItem,
     mut options: CollectOptions,
 ) -> anyhow::Result<()> {
-    // Populate commit details (timestamp + subject) directly. The main
-    // `collect()` path batches this across all items pre-skeleton; the
-    // single-item statusline path has no such batch, so fetch the one SHA
-    // here. Skip null OIDs (unborn branches) and prunable worktrees —
-    // matches the behavior in `collect()`. Silent on batch failure: the
-    // statusline is a compact prompt element with no room for warnings, and
-    // `commit.message` / `commit.timestamp` fall through to their defaults.
+    // Populate commit data directly. The main `collect()` path batches this
+    // across all items pre-skeleton; the single-item statusline path has no
+    // such batch, so fetch the one SHA here. Skip null OIDs (unborn branches).
+    // Silent on batch failure: the statusline is a compact prompt element with
+    // no room for warnings, and `commit.message` / `commit.timestamp` fall
+    // through to their defaults.
+    //
+    // `short_sha` populates for every row (including prunable). The
+    // timestamp/message bundle is skipped for prunable rows to match the old
+    // task-queue UX where probes against a missing worktree dir failed.
     let is_prunable = item.worktree_data().is_some_and(|d| d.is_prunable());
     if item.head != worktrunk::git::NULL_OID
-        && !is_prunable
         && let Ok(map) = repo.commit_details_many(&[&item.head])
-        && let Some((timestamp, commit_message)) = map.get(&item.head)
+        && let Some((short_sha, timestamp, commit_message)) = map.get(&item.head)
     {
-        item.commit = Some(CommitDetails {
-            timestamp: *timestamp,
-            commit_message: commit_message.clone(),
-        });
+        item.short_sha = short_sha.clone();
+        if !is_prunable {
+            item.commit = Some(CommitDetails {
+                timestamp: *timestamp,
+                commit_message: commit_message.clone(),
+            });
+        }
     }
 
     // Extract worktree data (skip if not a worktree item)
@@ -1633,20 +1694,26 @@ pub fn populate_item(
         return Ok(());
     };
 
-    // Get integration target for status symbol computation (cached in repo)
-    // None if default branch cannot be determined - status symbols will be skipped
-    let target = repo.integration_target();
-
-    // Populate default_branch / integration_target if the caller didn't.
-    // Tasks read these through `TaskContext`; `None` here tells them to
-    // skip (see collect()'s stale-default-branch path). Single-item callers
-    // like statusline pass `CollectOptions::default()` and expect the
-    // repo-derived values.
+    // Populate default_branch / snapshot / integration_targets if the
+    // caller didn't. Tasks read these through `TaskContext`; `None`
+    // values tell them to skip (see collect()'s stale-default-branch
+    // path). Single-item callers like statusline pass
+    // `CollectOptions::default()` and expect the repo-derived values.
     if options.default_branch.is_none() {
         options.default_branch = repo.default_branch();
     }
-    if options.integration_target.is_none() {
-        options.integration_target = target.clone();
+    if options.snapshot.is_none() {
+        options.snapshot = match options.default_branch.as_deref() {
+            Some(db) => repo.capture_refs_with_ahead_behind(db).ok(),
+            None => repo.capture_refs().ok(),
+        }
+        .map(std::sync::Arc::new);
+    }
+    if options.integration_targets.is_none() {
+        options.integration_targets = options
+            .snapshot
+            .as_deref()
+            .and_then(|s| repo.integration_targets(s));
     }
 
     // Create channel for task results
@@ -1704,7 +1771,10 @@ pub fn populate_item(
         &mut errors,
         &expected_results,
         std::time::Instant::now() + results::DRAIN_TIMEOUT,
-        target.as_deref(),
+        options
+            .integration_targets
+            .as_ref()
+            .map(|t| t.primary.as_str()),
         |_event| {},
         None,
     );
@@ -1733,7 +1803,12 @@ pub fn populate_item(
 
     // Ensure status symbols are refreshed even if all tasks errored
     // (the drain only calls refresh on the success path).
-    item.refresh_status_symbols(target.as_deref());
+    item.refresh_status_symbols(
+        options
+            .integration_targets
+            .as_ref()
+            .map(|t| t.primary.as_str()),
+    );
 
     // Populate display fields (including status_line for statusline command)
     item.finalize_display();
@@ -1787,13 +1862,111 @@ mod tests {
         );
     }
 
-    /// `set_result` marks the row as having data and dedups by comparing
-    /// against the cached render; `set_reveal` picks skeleton-vs-format
-    /// per row based on `has_data` and also dedups. These two behaviors
-    /// are load-bearing for the picker's partial-row reveal correctness
-    /// (see the RowCache doc comment).
+    /// Drain timeout diagnostic without per-item breakdown — the early-exit
+    /// path when no items are blocked.
     #[test]
-    fn test_row_cache_dedup_and_reveal() {
+    fn test_format_drain_timeout_diag_no_items() {
+        let rendered = format_drain_timeout_diag(7, &[]);
+        insta::assert_snapshot!(
+            strip_ansi(&rendered),
+            @"Listing worktrees timed out after 120s (7 results received)"
+        );
+    }
+
+    /// `handle_drain_timeout` emits both warning + hint when the default
+    /// timeout fires (`collect_deadline: None` + `TimedOut`). Captures
+    /// emissions through the closure to avoid touching real stderr.
+    #[test]
+    fn test_handle_drain_timeout_emits_on_default_timeout() {
+        use std::sync::Mutex;
+        let captured: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let emit = |line: String| captured.lock().unwrap().push(line);
+        let outcome = DrainOutcome::TimedOut {
+            received_count: 4,
+            items_with_missing: vec![],
+        };
+        handle_drain_timeout(outcome, None, &emit);
+        let lines = captured.lock().unwrap();
+        assert_eq!(lines.len(), 2, "expected warning + hint, got: {lines:?}");
+        assert!(
+            strip_ansi(&lines[0]).contains("Listing worktrees timed out after"),
+            "warning line: {}",
+            lines[0]
+        );
+        assert!(
+            strip_ansi(&lines[1]).contains("re-run with -v"),
+            "hint line: {}",
+            lines[1]
+        );
+    }
+
+    /// An explicit `collect_deadline` is intentional truncation — the helper
+    /// must stay silent so user-budgeted deadlines don't surface as bugs.
+    #[test]
+    fn test_handle_drain_timeout_silent_when_deadline_set() {
+        use std::sync::Mutex;
+        let captured: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let emit = |line: String| captured.lock().unwrap().push(line);
+        let outcome = DrainOutcome::TimedOut {
+            received_count: 0,
+            items_with_missing: vec![],
+        };
+        let deadline = std::time::Instant::now();
+        handle_drain_timeout(outcome, Some(deadline), &emit);
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "expected no emissions for budgeted deadline"
+        );
+    }
+
+    /// `Complete` outcomes are the happy path — the helper must stay silent.
+    #[test]
+    fn test_handle_drain_timeout_silent_on_complete() {
+        use std::sync::Mutex;
+        let captured: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let emit = |line: String| captured.lock().unwrap().push(line);
+        handle_drain_timeout(DrainOutcome::Complete, None, &emit);
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "expected no emissions for Complete outcome"
+        );
+    }
+
+    /// With blocked items, the diagnostic appends a gutter listing each
+    /// item's missing task kinds. `take(5)` caps the list; cover that here.
+    #[test]
+    fn test_format_drain_timeout_diag_with_blocked_items() {
+        let items = vec![
+            MissingResult {
+                item_idx: 0,
+                name: "feature-a".to_string(),
+                missing_kinds: vec![TaskKind::CiStatus, TaskKind::BranchDiff],
+            },
+            MissingResult {
+                item_idx: 1,
+                name: "feature-b".to_string(),
+                missing_kinds: vec![TaskKind::AheadBehind],
+            },
+        ];
+        let rendered = format_drain_timeout_diag(3, &items);
+        insta::assert_snapshot!(
+            strip_ansi(&rendered),
+            @r"
+        Listing worktrees timed out after 120s (3 results received); blocked tasks:
+          feature-a: ci-status, branch-diff
+          feature-b: ahead-behind
+        "
+        );
+    }
+
+    /// `render_reveal` picks `format_list_item_line` for rows with data and
+    /// `render_skeleton_row` for rows without — the choice is load-bearing
+    /// for the picker's partial-row reveal correctness, since the
+    /// post-reveal placeholder swap has to reach pending cells without
+    /// surfacing seeded defaults like "55y" on rows that haven't received
+    /// any task results.
+    #[test]
+    fn test_render_reveal_picks_renderer_per_row() {
         use super::super::layout::calculate_layout_with_width;
         use super::super::model::ListItem;
         use std::collections::HashSet;
@@ -1805,39 +1978,19 @@ mod tests {
         ];
         let skip_tasks: HashSet<TaskKind> = HashSet::new();
         let layout = calculate_layout_with_width(&items, &skip_tasks, 80, Path::new("/tmp"), None);
+        let placeholder = super::super::render::PLACEHOLDER;
 
-        let mut cache = RowCache::new(2);
-
-        // First set_result: cache was empty, so the new line is emitted.
-        let first = cache.set_result(0, "row-zero-line-v1".into());
-        assert_eq!(first.as_deref(), Some("row-zero-line-v1"));
-
-        // Same render again → dedup: None.
-        let dup = cache.set_result(0, "row-zero-line-v1".into());
-        assert_eq!(dup, None);
-
-        // Different render → Some again.
-        let changed = cache.set_result(0, "row-zero-line-v2".into());
-        assert_eq!(changed.as_deref(), Some("row-zero-line-v2"));
-
-        // set_reveal after the placeholder flip. Row 0 has data: use
-        // format_list_item_line; the result is different from the cached
-        // synthetic string above so it's emitted as Some. Row 1 has no
-        // data: use render_skeleton_row; cache was empty so it's emitted.
-        layout.placeholder.set(super::super::render::PLACEHOLDER);
-        let updates = cache.set_reveal(&items, &layout);
+        // Row 0 has data → format_list_item_line; row 1 doesn't → skeleton.
+        let has_data = vec![true, false];
+        let updates = render_reveal(&has_data, &items, &layout, placeholder);
         assert_eq!(updates.len(), 2);
-        assert!(
-            updates[0].is_some(),
-            "row 0 had data but cached string was synthetic; reveal must emit new render"
+        assert_eq!(
+            updates[0],
+            layout.format_list_item_line(&items[0], placeholder)
         );
-        assert!(
-            updates[1].is_some(),
-            "row 1 had no data; reveal must emit skeleton render"
+        assert_eq!(
+            updates[1],
+            layout.render_skeleton_row(&items[1], placeholder).render()
         );
-
-        // Second reveal with no intervening changes: both rows dedup to None.
-        let updates2 = cache.set_reveal(&items, &layout);
-        assert_eq!(updates2, vec![None, None]);
     }
 }
