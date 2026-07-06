@@ -4,9 +4,5 @@
   "author": {
     "name": "Worktrunk"
   },
-  "hooks": "./hooks/hooks.json",
-  "skills": [
-    "./skills/worktrunk",
-    "./skills/wt-switch-create"
-  ]
+  "skills": ["./skills/worktrunk", "./skills/wt-switch-create"]
 }
