@@ -51,7 +51,7 @@
 //!
 //! ```text
 //! git log --no-walk --no-show-signature \
-//!   --format=%H%x00%h%x00%ct%x00%s \
+//!   --format=%H%x00%h%x00%ct%x00%T%x00%s \
 //!   SHA₁ SHA₂ … SHA_N
 //! ```
 //!
@@ -62,10 +62,10 @@
 //! - `--no-show-signature` — skip GPG verification. If `gpg.program` is set
 //!   and any of these commits are signed, the default forks `gpg` per
 //!   commit; disabled here.
-//! - `--format=%H%x00%h%x00%ct%x00%s` — four fields per commit,
+//! - `--format=%H%x00%h%x00%ct%x00%T%x00%s` — five fields per commit,
 //!   NUL-separated because subjects can contain anything except NUL:
 //!   - `%H` full SHA, `%h` abbreviated SHA, `%ct` committer date (Unix
-//!     epoch), `%s` subject (first line of message).
+//!     epoch), `%T` tree SHA, `%s` subject (first line of message).
 //!
 //! SHAs come from #4 (worktree HEADs) ∪ #5 (branch tips), deduplicated.
 //! Argv length scales with N — Linux `ARG_MAX` (~128 KB) bounds the
@@ -77,13 +77,16 @@
 //! - `%ct` again, post-skeleton — Age column ("3 hours ago").
 //! - `%s` post-skeleton — Message column.
 //! - `%h` post-skeleton — abbreviated-SHA cell.
+//! - `%T` post-skeleton — primes the `commit_tree` cache so the per-row
+//!   `CommittedTreesMatch` / `WouldMergeAdd` tree lookups never fork
+//!   `git rev-parse <sha>^{tree}` (see [`Repository::commit_details_many`]).
 //!
-//! Subjects and abbreviated SHAs ride along for free: git resolves each
-//! commit object to read its timestamp anyway, so the extra bytes add no
-//! measurable latency to the round trip. Without this batch you'd be
-//! forking `git log -1` per SHA later — same data, N forks instead of one.
-//! The full `(timestamp, subject)` map is handed to the post-skeleton loop
-//! that populates `ListItem.commit` directly.
+//! Tree SHAs, subjects, and abbreviated SHAs ride along for free: git resolves
+//! each commit object to read its timestamp anyway, so the extra bytes add no
+//! measurable latency to the round trip. Without this batch you'd be forking
+//! `git log -1` (and `rev-parse ^{tree}`) per SHA later — same data, N forks
+//! instead of one. The full `(timestamp, subject)` map is handed to the
+//! post-skeleton loop that populates `ListItem.commit` directly.
 //!
 //! When the batch fails (e.g., a listed SHA was deleted mid-run), the
 //! failure is surfaced once and Age/Message cells render placeholders for
@@ -127,7 +130,21 @@
 //! │  )                                          // ~10ms total (max of all spawns)
 //! ├─ populate ListItem.commit from cache        (cache-hit lookups, sub-ms)
 //! Worker thread spawns
+//! └─ paint Age/Message columns                  (workers already running)
 //! ```
+//!
+//! **Why the Age/Message paint:** those two columns carry no task — their
+//! data is the `ListItem.commit` populated above — so without an explicit
+//! repaint they'd sit on the skeleton placeholder until the row's first *task*
+//! result happened to redraw it, lagging behind the slower task-driven columns
+//! (and a cache-warm Summary preview). The paint runs *after* the worker pool
+//! is spawned — so the slow git subprocesses (the long pole) aren't delayed by
+//! it — but *before* the drain renders any result, so Age/Message still reach
+//! the screen ahead of every task-driven column. Reading `all_items` here is
+//! race-free: the worker thread only sends results through the channel, and the
+//! drain (the sole `all_items` mutator) hasn't started. `render_skeleton_row`
+//! fills Age/Message from `item.commit` while every task column keeps its
+//! placeholder.
 //!
 //! **Why fsmonitor check is sequential:** It gates whether daemon starts are needed.
 //! The check is fast (~5ms) and must complete before we know which spawns to add.
@@ -209,6 +226,7 @@
 //! | `has-added-changes/` | `git::repository::sha_cache` | `{branch_sha}-{target_sha}.json` | Never — content-addressed |
 //! | `diff-stats/` | `git::repository::sha_cache` | `{base_sha}-{head_sha}.json` | Never — content-addressed |
 //! | `ahead-behind/` | `git::repository::sha_cache` | `{base_sha}-{head_sha}.json` | Never — content-addressed |
+//! | `merge-base/` | `git::repository::sha_cache` | `{sha1}-{sha2}.json` (sorted) | Never — content-addressed |
 //! | `ci-status/` | `commands::list::ci_status::cache` | `{branch}.json` | TTL 30–60s + HEAD SHA check |
 //! | `summary/{branch}/` | `summary` | `{diff_hash}.json` | Miss if no file exists for the current hash; siblings pruned on write |
 //!
@@ -216,7 +234,7 @@
 //!
 //! - **SHA-pair**: pure function of two commit SHAs. Never stale, no TTL, no invalidation.
 //!   Used by all `sha_cache` kinds (merge-tree conflicts, merge-add probes, ancestry
-//!   checks, file-change probes, diff stats, ahead/behind counts).
+//!   checks, file-change probes, diff stats, ahead/behind counts, merge-base).
 //! - **Branch + TTL + HEAD**: external mutable state (CI API, remote refs). TTL bounds
 //!   staleness; the HEAD check invalidates early when the branch moves.
 //! - **Branch + content-addressed hash in filename**: content hash (SHA-256
@@ -235,7 +253,7 @@
 //! | `IsAncestor` | `sha_cache` (is-ancestor) |
 //! | `HasFileChanges` | `sha_cache` (has-added-changes) |
 //! | `BranchDiff` | `sha_cache` (diff-stats, skipped when sparse checkout is active) |
-//! | `AheadBehind`, `Upstream` | `sha_cache` (ahead-behind); on a cold cache both columns are pre-filled from `for-each-ref %(ahead-behind:SHA)` walks — one against the default branch (`main↕`, in `RefSnapshot::capture_ahead_behind`) and one per unique upstream SHA (`Remote⇅`, in `Repository::prime_upstream_ahead_behind_cache`) |
+//! | `AheadBehind`, `Upstream` | `sha_cache` (ahead-behind for counts, merge-base for the orphan check); on a cold cache both columns are pre-filled from `for-each-ref %(ahead-behind:SHA)` walks — one against the default branch (`main↕`, in `RefSnapshot::capture_ahead_behind`) and one per unique upstream SHA (`Remote⇅`, in `Repository::prime_upstream_ahead_behind_cache`) |
 //! | `CiStatus` | `ci_status::cache` |
 //! | `SummaryGenerate` | `summary` |
 //!
@@ -243,7 +261,11 @@
 //!
 //! ### Already optimized (not cache candidates)
 //!
-//! - `CommittedTreesMatch` — single `git rev-parse` resolving both tree SHAs (~1ms)
+//! - `CommittedTreesMatch` — resolves both commit→tree SHAs through the
+//!   in-memory `commit_tree` cache, which the pre-skeleton commit-details
+//!   `git log` batch primes via `%T` (see [`Repository::commit_details_many`]).
+//!   So on the `wt list` path it forks nothing per row — the tree SHAs are
+//!   already in memory.
 //!
 //! ### Cached via tree SHA
 //!
@@ -399,14 +421,22 @@ fn print_buffered_table(header: &str, rows: &[String], summary: &str) {
 ///
 /// This is operation parameters for a single `wt list` invocation, not a cache.
 /// For cached repo data, see Repository's global cache.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct CollectOptions {
-    /// Tasks to skip (not compute). Empty set means compute everything.
+    /// The background tasks to run, derived from the columns that will render
+    /// (`columns::required_tasks_for_render`). `collect` plans this once from the
+    /// `[list] columns` selection and the gates; nothing hand-writes a task set.
     ///
-    /// This controls both:
-    /// - Work item generation (in `work_items_for_worktree`/`work_items_for_branch`)
-    /// - Column visibility (layout filters columns via `ColumnSpec::requires_task`)
-    pub skip_tasks: std::collections::HashSet<TaskKind>,
+    /// This drives both work-item generation (the spawn loops in
+    /// `work_items_for_worktree` / `work_items_for_branch`) and column visibility
+    /// (the layout filter calls `ColumnKind::renders_given_run`). A task runs iff
+    /// some rendered column needs it, so an unrendered column's tasks never run.
+    ///
+    /// There is no blanket default: `collect` plans this from the `[list] columns`
+    /// selection, and single-item callers (statusline) declare their columns via
+    /// [`CollectOptions::for_columns`]. A caller states which columns it renders;
+    /// the tasks follow.
+    pub tasks: std::collections::HashSet<TaskKind>,
 
     /// URL template from project config (e.g., "http://localhost:{{ branch | hash_port }}").
     /// Expanded per-item in task spawning (post-skeleton) to minimize time-to-skeleton.
@@ -446,6 +476,37 @@ pub struct CollectOptions {
     pub include_untracked_in_working_diff: bool,
 }
 
+impl CollectOptions {
+    /// Build options whose task plan is derived from the columns that will
+    /// render under `gates` — the canonical "declare the columns, get the tasks"
+    /// entry, so nothing hand-writes a task set. The context fields (url
+    /// template, llm command, snapshot, …) start empty; callers set what they
+    /// need (e.g. `CollectOptions { url_template, ..for_columns(cols, &gates) }`).
+    ///
+    /// `collect` builds its options directly — it has the context fields already
+    /// resolved — so this is for the single-item callers (statusline). They
+    /// render the default column set, not a `[list] columns` selection, so the
+    /// plan uses [`ColumnSource::Default`](super::columns::ColumnSource).
+    pub fn for_columns(
+        rendered: impl IntoIterator<Item = super::columns::ColumnKind>,
+        gates: &super::columns::ColumnGates,
+    ) -> Self {
+        Self {
+            tasks: super::columns::required_tasks_for_render(
+                rendered,
+                super::columns::ColumnSource::Default,
+                gates,
+            ),
+            url_template: None,
+            llm_command: None,
+            default_branch: None,
+            integration_targets: None,
+            snapshot: None,
+            include_untracked_in_working_diff: false,
+        }
+    }
+}
+
 fn worktree_branch_set(worktrees: &[WorktreeInfo]) -> HashSet<&str> {
     worktrees
         .iter()
@@ -460,31 +521,40 @@ fn worktree_branch_set(worktrees: &[WorktreeInfo]) -> HashSet<&str> {
 /// The handler receives pre-rendered strings so it doesn't need to share the
 /// layout across threads (`LayoutConfig` is `!Sync` via an interior
 /// `Cell<&'static str>`).
-#[cfg_attr(not(unix), allow(dead_code))]
 pub trait PickerProgressHandler: Send + Sync {
     /// Fired once after items are initialized and layout is computed, but
     /// before any task results arrive. `rendered` is one entry per item,
     /// with fast fields (branch, path, head) populated and blank
     /// placeholders for slow cells. `header` is the column-header line;
-    /// the handler calls `render()` / `plain_text()` as needed.
+    /// the handler calls `render()` / `plain_text()` as needed. `grid` is
+    /// the layout's column geometry, for rows rendered outside collect
+    /// (the picker's `--prs` rows align their cells to it).
     fn on_skeleton(
         &self,
         items: Vec<super::model::ListItem>,
         rendered: Vec<String>,
         header: worktrunk::styling::StyledLine,
+        grid: super::layout::ColumnGrid,
     );
 
     /// Fired after a single task result updates row `idx`. `rendered` is the
-    /// new line — write it through the item's shared state so skim picks it
-    /// up on the next heartbeat.
-    fn on_update(&self, idx: usize, rendered: String);
+    /// new line — write it through the item's shared state and wake the picker
+    /// to repaint (skim 4.x renders on demand, not on a timer). `item` is the
+    /// row's current model carrying the just-updated fields; the picker reads
+    /// `pr_status` from it to feed the live `pr` preview tab, which cannot see
+    /// the frozen skeleton snapshot.
+    fn on_update(&self, idx: usize, rendered: String, item: &super::model::ListItem);
 
-    /// Fired at the 200ms reveal deadline. One pre-rendered line per row,
-    /// with the placeholder promoted from blank to `·`: rows that have
-    /// received real data use `format_list_item_line`, rows still at
-    /// skeleton state use the skeleton renderer. The handler writes every
-    /// slot — slot writes are idempotent.
-    fn on_reveal(&self, rendered: Vec<String>);
+    /// Rewrite every row's rendered line from `rendered` and repaint. The
+    /// handler writes one slot per row — slot writes are idempotent — then
+    /// pokes skim. Two callers, both handing over a full set of freshly
+    /// rendered rows:
+    /// - the post-skeleton commit paint (Age/Message filled from the
+    ///   pre-skeleton batch, every task column still on its placeholder),
+    /// - the 200ms reveal (placeholder promoted from blank to `·`: rows that
+    ///   have data use `format_list_item_line`, rows still at skeleton state
+    ///   use the skeleton renderer).
+    fn repaint_rows(&self, rendered: Vec<String>);
 
     /// Stash a pre-formatted warning line. Skim owns the terminal while
     /// collect runs on the picker's bg thread, so eprintln from collect
@@ -503,16 +573,26 @@ pub trait PickerProgressHandler: Send + Sync {
     /// benchmark early-exit, nor on the zero-worktree `Ok(None)` return
     /// (which exits before `on_skeleton`). Default: no-op.
     fn on_collect_complete(&self) {}
+
+    /// Hand the picker a clone of the collect layout, right after `on_skeleton`.
+    /// `LayoutConfig` is `!Sync`, so the handler stows it behind a lock for the
+    /// collector to read at `alt-x` time, where it renders a `/ branch` row on
+    /// the same grid as the worktree rows (the in-place morph). Default: no-op —
+    /// only the picker needs it. Column geometry is stable after skeleton (the
+    /// `--prs` rows already rely on that via `grid`), so one clone here suffices.
+    fn provide_layout(&self, _layout: &super::layout::LayoutConfig) {}
 }
 
 /// Controls how show flags (branches/remotes/full) are determined in [`collect`].
-#[cfg_attr(not(unix), allow(dead_code))]
 pub enum ShowConfig {
     /// Flags already resolved by the caller (used by the picker).
+    ///
+    /// The picker is always `wt list --full` (`show_full` is implicit): it
+    /// fetches every field for its preview tabs, so it has no skip set to pass —
+    /// `collect` derives the task set from the columns like every other caller.
     Resolved {
         show_branches: bool,
         show_remotes: bool,
-        skip_tasks: HashSet<TaskKind>,
         command_timeout: Option<std::time::Duration>,
         /// Wall-clock deadline for the collect phase. `None` uses the default
         /// [`DRAIN_TIMEOUT`](results::DRAIN_TIMEOUT) and shows a warning on timeout.
@@ -771,7 +851,7 @@ pub fn collect(
     let (
         show_branches,
         show_remotes,
-        skip_tasks,
+        show_full,
         command_timeout,
         collect_deadline,
         list_width,
@@ -781,7 +861,6 @@ pub fn collect(
         ShowConfig::Resolved {
             show_branches,
             show_remotes,
-            skip_tasks,
             command_timeout,
             collect_deadline,
             list_width,
@@ -789,14 +868,16 @@ pub fn collect(
         } => (
             show_branches,
             show_remotes,
-            skip_tasks,
+            // Picker is the only `Resolved` caller and is `wt list --full`: it
+            // fetches every field for its preview tabs regardless of which
+            // columns render. Like default `wt list` (but unlike `--full`) it
+            // opts out of the untracked-inclusive working diff — the last tuple
+            // field — so the two `show_full`-shaped values aren't the same bucket.
+            true,
             command_timeout,
             collect_deadline,
             list_width,
             progressive_handler,
-            // Picker is the only `Resolved` caller and runs the same fast
-            // bucket as default `wt list` (skips BranchDiff/CiStatus), so
-            // it also opts out of the untracked-inclusive working diff.
             false,
         ),
         ShowConfig::DeferredToParallel {
@@ -808,17 +889,6 @@ pub fn collect(
             let show_branches = cli_branches || config.list.branches();
             let show_remotes = cli_remotes || config.list.remotes();
             let show_full = cli_full || config.list.full();
-            let skip_tasks: HashSet<TaskKind> = if show_full {
-                HashSet::new()
-            } else {
-                [
-                    TaskKind::BranchDiff,
-                    TaskKind::CiStatus,
-                    TaskKind::SummaryGenerate,
-                ]
-                .into_iter()
-                .collect()
-            };
             // Resolve timeouts from merged config (--full disables both)
             let (command_timeout, collect_deadline) = if show_full {
                 (None, None)
@@ -830,7 +900,7 @@ pub fn collect(
             (
                 show_branches,
                 show_remotes,
-                skip_tasks,
+                show_full,
                 command_timeout,
                 collect_deadline,
                 None,
@@ -877,17 +947,15 @@ pub fn collect(
                 .any(|b| Some(b.name.as_str()) == default_branch.as_deref())
         });
 
-    // Filter local branches to those without worktrees (CPU-only, no git commands)
-    let branches_without_worktrees: Vec<(String, String)> = if show_branches {
-        fetched_local
-            .unwrap_or(&[])
-            .iter()
-            .filter(|b| !worktree_branches.contains(b.name.as_str()))
-            .map(|b| (b.name.clone(), b.commit_sha.clone()))
-            .collect()
-    } else {
-        Vec::new()
-    };
+    // Filter local branches to those without worktrees (CPU-only, no git
+    // commands). With `show_branches` off there are no branch-only rows.
+    let branches_without_worktrees: Vec<(String, String)> = fetched_local
+        .unwrap_or(&[])
+        .iter()
+        .filter(|_| show_branches)
+        .filter(|b| !worktree_branches.contains(b.name.as_str()))
+        .map(|b| (b.name.clone(), b.commit_sha.clone()))
+        .collect();
 
     if warn_stale_default && let Some(branch) = default_branch.as_deref() {
         emit_warning(
@@ -1058,6 +1126,7 @@ pub fn collect(
                 user_marker: None,
                 status_symbols: StatusSymbols::default(),
                 statusline: None,
+                custom_values: Vec::new(),
                 kind: ItemKind::Worktree(Box::new(worktree_data)),
             }
         })
@@ -1078,23 +1147,130 @@ pub fn collect(
             .map(|(name, sha)| ListItem::new_remote_branch(sha.clone(), name.clone())),
     );
 
-    // If no URL template configured, add UrlStatus to skip_tasks
-    let mut effective_skip_tasks = skip_tasks.clone();
-    if url_template.is_none() {
-        effective_skip_tasks.insert(TaskKind::UrlStatus);
-    }
-
-    // Skip SummaryGenerate unless summary is enabled and an LLM command is configured
+    // Gate inputs for the task-planning decision below. `llm_command` also flows
+    // into each `TaskContext` (the per-item SummaryGenerate guard) further down.
     let config = repo.config();
     let llm_command = config.commit_generation.command.clone();
-    if !config.list.summary() || llm_command.is_none() {
-        effective_skip_tasks.insert(TaskKind::SummaryGenerate);
+
+    // Custom [list.custom-columns] values expand before layout: their inputs
+    // (branch, worktree identity, vars and branch_config from the bulk config
+    // snapshot) are already in memory, so cells paint with the skeleton and
+    // column widths are measured from content like Branch/Path. Pure CPU — no
+    // subprocess.
+    //
+    // A broken column definition aborts `wt list` with the error. The picker
+    // shares this path but runs collect on a background thread while skim
+    // owns the terminal, so it can't surface an abort — it stashes a warning
+    // (drained after the picker closes) and renders without custom columns.
+    let custom_columns =
+        match super::custom_columns::resolve_custom_columns(&config.list.custom_columns, repo) {
+            Ok(columns) => columns,
+            Err(e) if progressive_handler.is_some() => {
+                emit_warning(warning_message(format!("Custom columns disabled: {e}")).to_string());
+                Vec::new()
+            }
+            Err(e) => return Err(e),
+        };
+    if !custom_columns.is_empty() {
+        let all_vars = repo.all_vars_from_snapshot()?;
+        let all_branch_config = repo.all_branch_config_from_snapshot()?;
+        super::custom_columns::expand_custom_columns(
+            &custom_columns,
+            &mut all_items,
+            &all_vars,
+            &all_branch_config,
+            repo,
+        );
+    }
+
+    // `[list] columns` selects/reorders the columns to render. Names address
+    // built-ins or custom columns (by header → resolved index), so the custom
+    // names are passed in resolution order. Like custom columns, a bad name
+    // aborts `wt list` but only degrades the picker (which can't surface an
+    // abort mid-render), so the same `progressive_handler` fork applies. An
+    // empty selection means "use the default column set".
+    let custom_names: Vec<&str> = custom_columns.iter().map(|c| c.name.as_str()).collect();
+    let selected_columns =
+        match super::columns::parse_selected_columns(&config.list.columns, &custom_names) {
+            Ok(columns) => columns,
+            Err(e) if progressive_handler.is_some() => {
+                emit_warning(warning_message(format!("Column selection ignored: {e}")).to_string());
+                Vec::new()
+            }
+            Err(e) => return Err(e),
+        };
+
+    // Decide, in one place, which background tasks to run: the union of the
+    // tasks every column the rendered table needs. This is the canonical "what
+    // do we need" stage — the spawn loop fires exactly this set, and the layout
+    // filter renders exactly the columns it feeds. Three shapes:
+    //
+    // - `wt list` table → the `[list] columns` selection (source `Listed`), or
+    //   `all_columns` (source `Default`) when nothing narrows it. The `Listed`
+    //   source lets an explicit selection override the preset gates (`--full`,
+    //   `[list] summary`): listing `ci` runs its task without `--full`. The
+    //   data-source gates (`[commit.generation]`, a url template) still drop a
+    //   column whose data can't be produced, however it was requested.
+    // - picker → `all_columns` for its preview tabs, unioned with the selection's
+    //   forced-on columns so its table matches `wt list`'s. The union matters for
+    //   a listed `summary` that `Default` alone wouldn't plan (LLM command set,
+    //   `[list] summary` off): without it the picker would hide a column `wt list`
+    //   shows. CI is already covered — the picker is always `show_full`.
+    // - `--format json` → `all_columns` (source `Default`), ignoring the
+    //   selection: its every-field contract (`src/cli/mod.rs`) needs the full set.
+    //
+    // So a branch/path `ls` alias over many dirty worktrees runs no `git status`
+    // / diffs / ahead-behind walks (#3133), while a default column gated off by
+    // `--full` stays off until the user passes `--full` or lists it.
+    let gates = super::columns::ColumnGates {
+        show_full,
+        summary_enabled: config.list.summary(),
+        has_llm_command: llm_command.is_some(),
+        has_url_template: url_template.is_some(),
+    };
+    let listed_plan = || {
+        super::columns::required_tasks_for_render(
+            selected_columns.iter().copied(),
+            super::columns::ColumnSource::Listed,
+            &gates,
+        )
+    };
+    let full_plan = || {
+        super::columns::required_tasks_for_render(
+            super::columns::all_columns(),
+            super::columns::ColumnSource::Default,
+            &gates,
+        )
+    };
+    let prune_to_selection =
+        render_table && progressive_handler.is_none() && !selected_columns.is_empty();
+    let tasks = if prune_to_selection {
+        listed_plan()
+    } else if progressive_handler.is_some() {
+        let mut tasks = full_plan();
+        tasks.extend(listed_plan());
+        tasks
+    } else {
+        full_plan()
+    };
+
+    // The picker primes its CI cells from the local cache so the column paints
+    // instantly, then the live `CiStatus` task (which the picker keeps — see
+    // `handle_picker`) overwrites each cell as results stream in. Uncached rows
+    // stay pending until the fetch reports, exactly like the other progressive
+    // columns. `wt list` drives its progressive render through `progressive_state`,
+    // not a handler, so the prime is picker-only.
+    if progressive_handler.is_some() {
+        super::ci_status::populate_from_cache(repo, &mut all_items);
     }
 
     // CI column width hint: the largest PR/MR number any previous fetch saw
     // (one small file read — cheap enough for the pre-skeleton budget, and
-    // the skeleton can't size the column without it).
-    let max_pr_number = (!effective_skip_tasks.contains(&TaskKind::CiStatus))
+    // the skeleton can't size the column without it). Whatever fetch wrote a
+    // cache entry also ratcheted this maximum, so the hint already covers any
+    // number the prime above reads back.
+    let max_pr_number = tasks
+        .contains(&TaskKind::CiStatus)
         .then(|| super::ci_status::MaxPrNumber::read(repo))
         .flatten();
 
@@ -1103,25 +1279,29 @@ pub fn collect(
     // terminal — the rest belongs to the preview pane.
     let layout = super::layout::calculate_layout_with_width(
         &all_items,
-        &effective_skip_tasks,
+        &tasks,
         list_width
             .or_else(crate::display::terminal_width)
             .unwrap_or(usize::MAX),
         &main_worktree.path,
         url_template.as_deref(),
         max_pr_number,
+        super::layout::ColumnSelection {
+            custom: &custom_columns,
+            selected: (!selected_columns.is_empty()).then_some(selected_columns.as_slice()),
+        },
     );
 
     // Single-line invariant: with no detectable width, an unlimited width
     // keeps rows untruncated rather than wrapping at a guessed width
     let max_width = crate::display::terminal_width().unwrap_or(usize::MAX);
 
-    // Create collection options from skip set. `integration_targets` is
-    // patched in after the parallel phase below extracts it — at this
+    // Create collection options from the planned task set. `integration_targets`
+    // is patched in after the parallel phase below extracts it — at this
     // point we haven't yet resolved it, but task spawning doesn't happen
     // until line 1090+ so late population is safe.
     let mut options = CollectOptions {
-        skip_tasks: effective_skip_tasks,
+        tasks,
         url_template: url_template.clone(),
         llm_command,
         default_branch: default_branch.clone(),
@@ -1202,7 +1382,15 @@ pub fn collect(
             .iter()
             .map(|item| layout.render_skeleton_row(item, placeholder).render())
             .collect();
-        handler.on_skeleton(all_items.clone(), skeletons, layout.render_header_line());
+        handler.on_skeleton(
+            all_items.clone(),
+            skeletons,
+            layout.render_header_line(),
+            layout.column_grid(),
+        );
+        // Hand the picker the layout so `alt-x` can render a `/ branch` row on
+        // this same grid without re-collecting. No-op for non-picker handlers.
+        handler.provide_layout(&layout);
         // Mirror the `wt list` progressive-table marker so `wt-perf phases`
         // sees the same boundary across both commands.
         worktrunk::trace::instant("Skeleton rendered");
@@ -1235,6 +1423,15 @@ pub fn collect(
     //
     // These operations run in parallel using rayon::scope with single-level parallelism.
     // See module docs for the timing diagram.
+
+    // Seed root/git-dir for every worktree from the list we already fetched, so
+    // the per-worktree tasks below don't each fork `git rev-parse
+    // --show-toplevel` / `--git-dir`. Deferred to post-skeleton: only the
+    // worker-pool tasks consume these (the pre-skeleton current-worktree probe
+    // uses the prewarmed discovery-worktree root), so seeding here keeps the
+    // local fs reads off the skeleton critical path — and skips them entirely
+    // on the `WORKTRUNK_SKELETON_ONLY` exit above, which runs no tasks.
+    repo.prime_worktree_path_caches(worktrees);
 
     // Collect worktree paths for fsmonitor starts (macOS only, fast, no git commands).
     // Git's builtin fsmonitor has race conditions under parallel load - pre-starting
@@ -1368,6 +1565,14 @@ pub fn collect(
     let integration_targets = snapshot
         .as_deref()
         .and_then(|s| repo.integration_targets(s));
+
+    // Seed the repo-wide comparison-base cache from this snapshot so the
+    // diff/summary preview panes reuse this ref scan instead of capturing their
+    // own. They run on `repo` (`wt list --full`'s summary column) or a clone of
+    // it (the picker's panes), both sharing this `Arc<RepoCache>`.
+    if let Some(s) = snapshot.as_deref() {
+        repo.prime_comparison_base(s);
+    }
 
     // Patch integration_targets and snapshot into options. When
     // default_branch is None (unset or stale), null integration_targets
@@ -1509,6 +1714,37 @@ pub fn collect(
     // Drop the original sender so drain_results knows when all spawned threads are done
     drop(tx);
 
+    // Workers are running now — paint the commit-derived columns (Age,
+    // Message) while the git subprocesses spin up. They carry no task, so
+    // without this they'd sit on the skeleton placeholder until the row's
+    // first task result happened to redraw it, lagging behind the slower
+    // task-driven columns (and the cache-warm Summary preview, the symptom
+    // this addresses). Spawning the workers first means the slow git work (the
+    // long pole) isn't delayed by this paint, and reading `all_items` here is
+    // race-free: the worker thread only sends results through the channel —
+    // the drain below is the sole `all_items` mutator and hasn't started. The
+    // paint still lands before the drain renders any result, so Age/Message
+    // reach the screen ahead of every task-driven column. `render_skeleton_row`
+    // fills them from `item.commit` while each task column keeps its blank
+    // placeholder.
+    if progressive_table.is_some() || progressive_handler.is_some() {
+        let commit_rows: Vec<String> = all_items
+            .iter()
+            .map(|item| layout.render_skeleton_row(item, placeholder).render())
+            .collect();
+        if let Some(table) = progressive_table.as_mut() {
+            for (idx, row) in commit_rows.iter().enumerate() {
+                table.update_row(idx, row.clone());
+            }
+            if let Err(e) = table.flush() {
+                tracing::debug!(error = %e, "Progressive table commit-column paint flush failed: {}", e);
+            }
+        }
+        if let Some(handler) = progressive_handler.as_ref() {
+            handler.repaint_rows(commit_rows);
+        }
+    }
+
     // Drain task results with conditional progressive rendering.
     //
     // Progressive mutable state (table, row cache, counters) is owned by a
@@ -1602,12 +1838,12 @@ pub fn collect(
                         s.table.update_row(item_idx, rendered.clone());
 
                         if let Err(e) = s.table.flush() {
-                            log::debug!("Progressive table flush failed: {}", e);
+                            tracing::debug!(error = %e, "Progressive table flush failed: {}", e);
                         }
                     }
 
                     if let Some(handler) = progressive_handler.as_ref() {
-                        handler.on_update(item_idx, rendered);
+                        handler.on_update(item_idx, rendered, item);
                     }
                 }
                 results::DrainEvent::Reveal { items } => {
@@ -1620,12 +1856,12 @@ pub fn collect(
                             s.table.update_row(idx, line.clone());
                         }
                         if let Err(e) = s.table.flush() {
-                            log::debug!("Progressive table reveal flush failed: {}", e);
+                            tracing::debug!(error = %e, "Progressive table reveal flush failed: {}", e);
                         }
                     }
 
                     if let Some(handler) = progressive_handler.as_ref() {
-                        handler.on_reveal(updates);
+                        handler.repaint_rows(updates);
                     }
                 }
                 results::DrainEvent::Stall {
@@ -1650,10 +1886,11 @@ pub fn collect(
                         if s.table.update_footer(footer_msg)
                             && let Err(e) = s.table.flush()
                         {
-                            log::debug!("Progressive table flush failed: {}", e);
+                            tracing::debug!(error = %e, "Progressive table flush failed: {}", e);
                         }
                     }
-                    // Picker has no stall UI; heartbeat keeps it responsive.
+                    // Picker has no stall UI; per-update repaints keep it
+                    // responsive without a stall message.
                 }
             }
         },
@@ -1785,7 +2022,10 @@ pub fn collect(
         handler.on_collect_complete();
     }
 
-    Ok(Some(super::model::ListData { items }))
+    Ok(Some(super::model::ListData {
+        items,
+        custom_columns,
+    }))
 }
 
 // ============================================================================
@@ -1882,6 +2122,7 @@ pub fn build_worktree_item(
         user_marker: None,
         status_symbols: StatusSymbols::default(),
         statusline: None,
+        custom_values: Vec::new(),
         kind: ItemKind::Worktree(Box::new(WorktreeData::from_worktree(
             wt,
             is_main,
@@ -1938,8 +2179,9 @@ pub fn populate_item(
     // Populate default_branch / snapshot / integration_targets if the
     // caller didn't. Tasks read these through `TaskContext`; `None`
     // values tell them to skip (see collect()'s stale-default-branch
-    // path). Single-item callers like statusline pass
-    // `CollectOptions::default()` and expect the repo-derived values.
+    // path). Single-item callers like statusline build options via
+    // `CollectOptions::for_columns` (these fields start `None`) and expect
+    // the repo-derived values.
     if options.default_branch.is_none() {
         options.default_branch = repo.default_branch();
     }
@@ -2007,7 +2249,7 @@ pub fn populate_item(
     });
 
     // Drain task results (blocking until complete). `drain_results`
-    // writes each result onto the item and calls `compute_status_symbols`
+    // writes each result onto the item and calls `refresh_status_symbols`
     // after every write, so the callback here is just a no-op — there is
     // no progressive table to refresh on the statusline path.
     let drain_outcome = drain_results(
@@ -2026,7 +2268,8 @@ pub fn populate_item(
 
     // Handle timeout (silent for statusline - just log it)
     if let DrainOutcome::TimedOut { received_count, .. } = drain_outcome {
-        log::warn!(
+        tracing::warn!(
+            count = received_count,
             "populate_item timed out after {}s ({received_count} results received)",
             results::DRAIN_TIMEOUT.as_secs()
         );
@@ -2034,10 +2277,17 @@ pub fn populate_item(
 
     // Log errors silently (statusline shouldn't spam warnings)
     if !errors.is_empty() {
-        log::warn!("populate_item had {} task errors", errors.len());
+        tracing::warn!(
+            count = errors.len(),
+            "populate_item had {} task errors",
+            errors.len()
+        );
         for error in &errors {
             let kind_str: &'static str = error.kind.into();
-            log::debug!(
+            tracing::debug!(
+                item = error.item_idx,
+                kind = %kind_str,
+                error = %error.message,
                 "  - item {}: {} ({})",
                 error.item_idx,
                 kind_str,
@@ -2229,16 +2479,25 @@ mod tests {
     fn test_render_reveal_picks_renderer_per_row() {
         use super::super::layout::calculate_layout_with_width;
         use super::super::model::ListItem;
-        use std::collections::HashSet;
         use std::path::Path;
 
         let items = vec![
             ListItem::new_branch("aaa".into(), "row-zero".into()),
             ListItem::new_branch("bbb".into(), "row-one".into()),
         ];
-        let skip_tasks: HashSet<TaskKind> = HashSet::new();
-        let layout =
-            calculate_layout_with_width(&items, &skip_tasks, 80, Path::new("/tmp"), None, None);
+        let tasks = super::super::columns::all_tasks();
+        let layout = calculate_layout_with_width(
+            &items,
+            &tasks,
+            80,
+            Path::new("/tmp"),
+            None,
+            None,
+            super::super::layout::ColumnSelection {
+                custom: &[],
+                selected: None,
+            },
+        );
         let placeholder = super::super::render::PLACEHOLDER;
 
         // Row 0 has data → format_list_item_line; row 1 doesn't → skeleton.

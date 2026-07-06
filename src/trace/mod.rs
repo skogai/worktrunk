@@ -20,8 +20,8 @@
 //! # fire even though wt-perf pipes wt's stdout to /dev/null)
 //! cargo run -p wt-perf -- timeline --chrome -- list --progressive > trace.json
 //!
-//! # From a log already captured to disk
-//! cargo run -p wt-perf -- trace < captured.log > trace.json
+//! # From a trace.jsonl already captured to disk
+//! cargo run -p wt-perf -- trace .git/wt/logs/trace.jsonl > trace.json
 //!
 //! # Analyze with SQL (requires: curl -LO https://get.perfetto.dev/trace_processor)
 //! trace_processor trace.json -Q 'SELECT name, COUNT(*), SUM(dur)/1e6 as ms FROM slice GROUP BY name'
@@ -40,8 +40,10 @@
 pub mod chrome;
 pub mod emit;
 pub mod parse;
+pub mod profile;
 
 // Re-export main types for convenience
 pub use chrome::to_chrome_trace;
-pub use emit::{Span, WT_TRACE_TARGET, instant};
+pub use emit::{CommandTrace, Span, WT_TRACE_TARGET, instant, now_us, thread_id};
 pub use parse::{TraceEntry, TraceEntryKind, TraceResult, parse_lines};
+pub use profile::{CacheReport, Profile};

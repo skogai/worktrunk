@@ -102,8 +102,7 @@ Before opening a `fix/ci-*` PR, classify the failure:
   PR. The maintainer will rerun CI. Comment on the run or exit silently; a
   permanent config change for a one-off timeout is churn the maintainer will
   close.
-- **Flaky test** (known-flaky or first-seen PTY/shell test) — exit without a
-  PR (same behavior as prior test-flake ci-fix runs).
+- **Flaky test** (known-flaky or first-seen PTY/shell test) — try to fix it.
 - **Real regression** — proceed with a fix PR.
 
 **Non-required ≠ transient.** A non-required job (e.g. `collect affected coverage`, `affected tests (linux, advisory)`) can fail from a real regression. The required/non-required distinction is about merge-blocking, not about how the failure is classified. If a deterministic build error (`error[E...]`, "binary not found", "ambiguous candidates", missing target) repeats across consecutive runs of the same shape, it's a real regression even when the job is advisory. Reserve "transient" for non-deterministic causes: `BrokenPipe`, `connection reset`, runner disk full, GitHub API timeouts, host-availability blips.
@@ -157,6 +156,14 @@ the issue gives us most of what we'd otherwise ask for piecemeal, so lead
 with this for unexplained failures rather than chaining version/config/repro
 questions across multiple round-trips.
 
+When the report is about a slow `wt` command, read its **Performance profile**
+section first. It renders the same breakdown as `wt config state logs profile`
+(subprocess time by command type, slowest calls, repeated `(command, context)`
+pairs) directly from the bundled `trace.log`, so you can spot redundant git
+calls and slow commands without parsing the raw trace by hand. The deeper
+per-render cache analysis is a separate tool — see **Weekly Maintenance:
+Statusline Cache-Check**.
+
 Reach for narrower asks only when the diagnostic is overkill:
 
 - `wt --version` — when the only question is whether a fix has landed.
@@ -181,22 +188,29 @@ closed in error, they can let us know and we'll reopen it.
 
 ### Suggesting Aliases for Niche Feature Requests
 
-Deflect narrow feature requests to aliases rather than native flags — this
-keeps the CLI surface small while giving users the behavior immediately.
-Suggest an alias when:
+worktrunk deliberately limits flag and config growth, so a `wt` alias is the
+standing answer to a narrow feature request rather than a new native flag.
+Suggest one when the request serves a single reporter's workflow or a small
+subset of users (idempotent create-or-switch, auto-push after merge) and
+composes from existing `wt` commands.
 
-- The request benefits a small subset of users or a single reporter's workflow
-  (e.g., idempotent create-or-switch, auto-push after merge)
-- The behavior can be composed from existing `wt` commands or shell primitives
-- A shell one-liner or `wt step` alias covers the use case
+Answer with a `wt` `[aliases]` entry. Defined in user config, it resolves
+`wt <name>` to the alias whenever no built-in matches, so the same alias works
+across every repo. It's the project's preferred extension point.
 
 **How to respond:**
-1. Draft the alias (shell function or `wt step` alias, whichever fits better)
-2. Test it in a scratch worktree — verify it works for the happy path and edge
-   cases (e.g., branch already exists, dirty worktree, missing remote)
-3. Post the tested alias in the issue with usage examples
-4. Link to the [aliases docs](https://worktrunk.dev/step/#aliases) and
-   [tips & patterns](https://worktrunk.dev/tips-patterns/) for further recipes
+1. Search open and closed issues for the same request and link the prior
+   thread; these asks recur, and the link lets the deflection read as a
+   considered position rather than a brush-off.
+2. Draft the alias.
+3. Test it in a scratch worktree against the happy path and edge cases (branch
+   already exists, dirty worktree). When a surprising behavior turns up, note
+   it in the reply instead of building the alias around it. For example, a
+   create-or-switch wrapper inherits `wt switch <name>`'s habit of
+   materializing a *remote* branch of the same name.
+4. Post the tested alias with usage examples.
+5. Link to the [aliases docs](https://worktrunk.dev/extending/#aliases) and
+   [tips & patterns](https://worktrunk.dev/tips-patterns/).
 
 ### Don't fix tests by adding skip guards
 
@@ -264,7 +278,7 @@ Pinned third-party versions in CI are invisible to Dependabot — it follows `Ca
 For each weekly run, check upstream and bump:
 
 - **`baptiste0928/cargo-install@v3` blocks** in `.github/workflows/ci.yaml`, `.github/workflows/nightly.yaml`, and `.github/actions/{test,claude}-setup/action.yaml` — every `version: "=X.Y.Z"` against `cargo info <crate>`. Today: `cargo-insta`, `cargo-nextest`, `cargo-llvm-cov`, `cargo-msrv`, `cargo-udeps`, `lychee`, `worktrunk`. The `cargo-affected` install has no version pin (follows default branch) — leave it alone. Verify each crate's `rust-version` against the pinned toolchain and note compatibility in the PR body (see PR #1657 for the format).
-- **`hustcer/setup-nu@v3`** `version:` input — latest from `gh api repos/nushell/nushell/releases/latest --jq '.tag_name'`. Three call sites: `ci.yaml` (`code-coverage`), `nightly.yaml` (`benchmarks`), and `actions/test-setup/action.yaml`.
+- **`hustcer/setup-nu@v3`** `version:` input — latest from `gh api repos/nushell/nushell/releases/latest --jq '.tag_name'`. Four call sites: `ci.yaml` (`code-coverage`), `nightly.yaml` (`feature-powerset`), `benchmarks.yaml` (`benchmarks`), and `actions/test-setup/action.yaml`.
 - **`taiki-e/install-action@v2.x`** `tool: zola@<ver>` in the `check-docs` job — latest from `gh api repos/getzola/zola/releases/latest --jq '.tag_name'`.
 - **Runner images** — `ubuntu-24.04`, `macos-15`, `windows-2022`. Keep `windows-2022` pinned (actions/runner-images#12677 — windows-2025 lacks the D: drive).
 

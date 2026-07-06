@@ -33,7 +33,9 @@ branch-shaped lead — all task).
 
 ## What to do
 
-Steps 1–3 come before any other work.
+Steps 1–3 run on every invocation, before any other work. The invocation is
+itself the explicit request to create the worktree; a research or read-only
+task gets one all the same.
 
 <!-- Maintainers: rationale.md (same directory) covers the harness rules and
 design choices behind this — read it before re-adding guards or routes. -->
@@ -63,13 +65,25 @@ design choices behind this — read it before re-adding guards or routes. -->
 
    - **Accepted** → the session is re-rooted in the worktree. Do the task (or,
      with no task text, confirm it's ready and wait).
-   - **Rejected** → the worktree is in another repo (`EnterWorktree` re-roots
-     only within the repo your cwd is in; the rejection is graceful and creates
-     nothing). You can still `cd` into the worktree and work there if it's
-     inside an allowed directory — an entry in `permissions.additionalDirectories`,
-     such as `~/workspace`. So `cd <path>` and read the result:
+   - **Rejected** → graceful, and nothing is created. `EnterWorktree`
+     re-roots only into a worktree the session is permitted to enter, and that
+     permitted set is fixed by two factors: the repo your cwd resolves to, and
+     the session's state. Each rejection is just that set coming up empty or
+     without the target: no repo resolves (cwd is outside any git repo, e.g. a
+     non-git parent such as `~/workspace` that only holds repos, as in a
+     background job), which fails with `the current directory is not in a git
+     repository`; the target belongs to a different repo than the one resolved;
+     or the session is already rooted in a worktree (or is a pinned agent), a
+     state that narrows the set to the resolved repo's `.claude/worktrees/` and
+     so excludes even a same-repo `wt` sibling. All reduce to the same recovery
+     test: whether you can `cd` into the worktree, which works when it's inside
+     an allowed directory (a `permissions.additionalDirectories` entry such as
+     `~/workspace`). So `cd <path>` and read the result:
      - no `Shell cwd was reset` notice → it stuck; the worktree is reachable.
-       Work there and do the task.
+       Work there, but a bare `cd` is not a tracked re-root, so the cwd can
+       revert to the session's launch worktree across turns (and in spawned
+       subagents); pin commands with `git -C <path>` / `wt -C <path>` rather
+       than trusting the `cd` to persist.
      - `Shell cwd was reset` → not reachable. Stop and ask the user to make it
        reachable: add the repo, or a parent like `~/workspace`, to
        `permissions.additionalDirectories` (durable, every session), or run
@@ -87,6 +101,6 @@ entered by `path`, so removal is always `wt remove <branch>`.
 
 ## Scope
 
-This command authorizes creating/entering ONE worktree (in the named repo, if
-one was given) and doing the requested task. Commits, pushes, and merges still
-each require explicit user permission.
+The command's mandate is ONE worktree (in the named repo, if one was given)
+and the requested task inside it. Commits, pushes, and merges still each
+require explicit user permission.

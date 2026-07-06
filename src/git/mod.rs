@@ -76,11 +76,12 @@ pub use remove::{
 };
 pub use repository::sha_cache;
 pub use repository::{
-    Branch, CommitMessageDetail, IntegrationTargets, RefSnapshot, Repository, ResolvedWorktree,
-    TempIndex, WorkingTree, set_base_path,
+    Branch, BranchDiffSpec, CommitMessageDetail, IntegrationTargets, RefSnapshot, Repository,
+    ResolvedWorktree, TempIndex, WorkingTree, select_comparison_base, set_base_path,
 };
 pub use url::parse_owner_repo;
 pub use url::{GitRemoteUrl, GitRepoInfo, GitRepoProvider};
+pub(crate) use url::{canonical_url_path_segment, url_path_segments_eq};
 /// Why branch content is considered integrated into the target branch.
 ///
 /// Used by both `wt list` (for status symbols) and `wt remove` (for messages).

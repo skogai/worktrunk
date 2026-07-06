@@ -4,6 +4,10 @@ use crate::common::{
     TestRepo, configure_directive_files, directive_files, make_snapshot_cmd,
     make_snapshot_cmd_with_global_flags, repo, setup_snapshot_settings, wt_bin,
 };
+// Used only by the `#[cfg(unix)]` signal tests below; gate the import to match,
+// or it reads as unused on Windows under `-D warnings`.
+#[cfg(unix)]
+use crate::common::SLEEP_FOR_ABSENCE_CHECK;
 use insta_cmd::assert_cmd_snapshot;
 use rstest::rstest;
 use std::io::Write;
@@ -1288,6 +1292,13 @@ trapped = "trap 'echo got-term >> trap.log; exit 143' TERM; echo started >> star
 
     let status = child.wait().expect("failed to wait for wt");
 
+    // wt forwarded SIGTERM to the wrapper sh by PID (the contract this test
+    // pins), so the trap's `exit` orphaned the backgrounded `sleep 30` in wt's
+    // process group. wt led that group (`process_group(0)` above) and is now
+    // reaped, so SIGKILL the whole group (negative pgid) to reap the sleep
+    // before returning — otherwise it lingers ~30s as a stray process.
+    let _ = kill(Pid::from_raw(-wt_pid.as_raw()), Signal::SIGKILL);
+
     // The trap marker proves the alias shell received SIGTERM. Without the
     // PID-targeted forwarding, this file would never appear and wt would
     // block on the 30s sleep.
@@ -1351,6 +1362,13 @@ trapped = "trap 'echo got-int >> trap.log; exit 130' INT; echo started >> start.
     kill(wt_pid, Signal::SIGINT).expect("failed to send SIGINT to wt");
 
     let status = child.wait().expect("failed to wait for wt");
+
+    // wt forwarded SIGINT to the wrapper sh by PID (the contract this test
+    // pins), so the trap's `exit` orphaned the backgrounded `sleep 30` in wt's
+    // process group. wt led that group (`process_group(0)` above) and is now
+    // reaped, so SIGKILL the whole group (negative pgid) to reap the sleep
+    // before returning — otherwise it lingers ~30s as a stray process.
+    let _ = kill(Pid::from_raw(-wt_pid.as_raw()), Signal::SIGKILL);
 
     let trap_marker = repo.root_path().join("trap.log");
     let recorded = std::fs::read_to_string(&trap_marker).unwrap_or_else(|e| {
@@ -1427,7 +1445,7 @@ two = "sh -c 'echo start-two >> slow_two.log; sleep 30; echo done-two >> slow_tw
     );
 
     // Grace period — the killed children must NOT reach their "done" write.
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::thread::sleep(SLEEP_FOR_ABSENCE_CHECK);
     for log in [&one_log, &two_log] {
         let contents = std::fs::read_to_string(log).unwrap_or_default();
         assert!(
@@ -1487,7 +1505,7 @@ two = "sh -c 'trap \"\" INT; echo start-two >> ignored_two.log; sleep 30'"
     // (the old design), within ~400 ms SIGTERM would have killed both
     // children and wt would be in the process of exiting. With the new
     // contract, both children keep sleeping and wt is still running.
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::thread::sleep(SLEEP_FOR_ABSENCE_CHECK);
 
     match child.try_wait().expect("try_wait failed") {
         None => {

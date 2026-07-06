@@ -155,7 +155,8 @@ All hooks share the same perspective — `{{ branch | hash_port }}` produces the
 `cwd` is the worktree root where the hook command runs. It equals `worktree_path` except in three cases:
 
 - `pre-switch`: hook runs in the source worktree; `worktree_path` is the destination
-- `post-remove` and `post-merge` with removal: the active worktree is gone, so the hook runs in primary or target, respectively
+- `post-remove`: the active worktree is gone, so the hook runs in the primary worktree
+- `post-merge` with removal: the active worktree is gone, so the hook runs in the target worktree
 
 Undefined variables error — use conditionals or defaults for optional behavior:
 
@@ -363,9 +364,13 @@ Global Options:
       --config <path>
           User config file path
 
+      --config-set <toml>
+          Override config with inline TOML, e.g. --config-set list.full=true (repeatable)
+
   -v, --verbose...
           Verbose output (-v: info logs + hook/alias template variables on stderr; -vv: also debug
-          logs and raw subprocess output written to .git/wt/logs/)
+          logs and raw subprocess output written to .git/wt/logs/). Set WORKTRUNK_VERBOSE=0|1|2 to
+          apply the same level everywhere — including shell completion, which no flag can reach
 
   -y, --yes
           Skip approval prompts

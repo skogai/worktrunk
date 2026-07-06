@@ -6,20 +6,24 @@
 //!
 //! # When Diagnostics Are Generated
 //!
-//! Diagnostic files are written on every `-vv` run (one file per command,
-//! overwritten each time). Without `-vv`, the hint simply tells users to
-//! rerun with `-vv`. This ensures the diagnostic file contains the trace
-//! the report inlines.
+//! A `diagnostic.md` bundle is written on every `-vv` run (one file per
+//! command, overwritten each time). Without `-vv`, the hint simply tells users
+//! to rerun with `-vv`. This ensures the diagnostic file contains the trace the
+//! report inlines.
 //!
 //! # Report Format
 //!
 //! The report is a markdown file designed for easy pasting into GitHub issues:
 //!
 //! 1. **Header** — Timestamp, command that was run, and result
-//! 2. **Environment** — wt version, OS, git version, shell integration
-//! 3. **Worktrees** — Raw `git worktree list --porcelain` output
-//! 4. **Config** — User and project config contents
-//! 5. **Verbose log** — Debug log output, truncated to ~50KB if large
+//! 2. **Performance profile** — Rendered view of `trace.jsonl`: where time went,
+//!    parallelism, and same-context cache misses (omitted if no records). Shown
+//!    first as the at-a-glance summary, expanded by default; the raw dumps
+//!    below stay collapsed.
+//! 3. **Environment** — wt version, OS, git version, shell integration
+//! 4. **Worktrees** — Raw `git worktree list --porcelain` output
+//! 5. **Config** — User and project config contents
+//! 6. **Verbose log** — Debug log output, truncated to ~50KB if large
 //!
 //! # Privacy
 //!
@@ -33,7 +37,8 @@
 //! # File Location
 //!
 //! Reports are written to `<git-common-dir>/wt/logs/diagnostic.md` (typically
-//! `.git/wt/logs/diagnostic.md`). Companion log files (`trace.log`, `subprocess.log`) live in the same directory.
+//! `.git/wt/logs/diagnostic.md`). Companion log files (`trace.log`,
+//! `trace.jsonl`, `subprocess.log`) live in the same directory.
 //!
 //! # Usage
 //!
@@ -53,7 +58,9 @@ use minijinja::{Environment, context};
 use worktrunk::git::Repository;
 use worktrunk::path::format_path_for_display;
 use worktrunk::shell_exec::Cmd;
-use worktrunk::styling::{eprintln, hint_message, success_message, warning_message};
+use worktrunk::styling::{
+    eprintln, format_with_gutter, hint_message, info_message, warning_message,
+};
 
 use crate::cli::version_str;
 use crate::output;
@@ -67,6 +74,16 @@ const REPORT_TEMPLATE: &str = r#"## Diagnostic Report
 **Generated:** {{ timestamp }}
 **Command:** `{{ command }}`
 **Result:** {{ context }}
+{%- if performance_profile %}
+
+<details open>
+<summary>Performance profile</summary>
+
+```
+{{ performance_profile }}
+```
+</details>
+{%- endif %}
 
 <details>
 <summary>Environment</summary>
@@ -129,12 +146,24 @@ impl DiagnosticReport {
     /// * `command` - The command that was run (e.g., "wt list -vv")
     /// * `context` - Context describing the result (error message or success)
     pub fn collect(repo: &Repository, command: &str, context: String) -> Self {
-        let content = Self::format_report(repo, command, &context);
+        // Render the profile once from `trace.jsonl`; the markdown bundle
+        // inlines it as its lead section.
+        let profile = crate::log_files::TRACE_JSONL
+            .path()
+            .and_then(|path| std::fs::read_to_string(&path).ok())
+            .as_deref()
+            .and_then(render_trace_profile);
+        let content = Self::format_report(repo, command, &context, profile.as_deref());
         Self { content }
     }
 
     /// Format the complete diagnostic report as markdown using minijinja template.
-    fn format_report(repo: &Repository, command: &str, context: &str) -> String {
+    fn format_report(
+        repo: &Repository,
+        command: &str,
+        context: &str,
+        performance_profile: Option<&str>,
+    ) -> String {
         // Strip ANSI codes from context - the diagnostic is a markdown file for GitHub
         let context = context.ansi_strip();
 
@@ -157,12 +186,16 @@ impl DiagnosticReport {
         // Get config show output (if available)
         let config_show = config_show_output(repo);
 
-        // Inline the trace log (bounded). The raw subprocess
-        // output log is only *referenced* by path — it can be multi-MB and
-        // would drown out the trace records that matter in a bug report.
-        let trace_log = crate::log_files::TRACE
+        // Read the trace once, then derive two views: a bounded raw inline (the
+        // records themselves) and a rendered performance profile (the summary of
+        // where time went). The raw subprocess output log is only *referenced* by
+        // path — it can be multi-MB and would drown out the trace records that
+        // matter in a bug report.
+        let trace_content = crate::log_files::TRACE
             .path()
-            .and_then(|path| std::fs::read_to_string(&path).ok())
+            .and_then(|path| std::fs::read_to_string(&path).ok());
+        let trace_log = trace_content
+            .as_deref()
             .map(|content| truncate_log(content.trim()))
             .filter(|s| !s.is_empty());
         // Forward slashes on both platforms so the rendered markdown reads the
@@ -186,6 +219,7 @@ impl DiagnosticReport {
                 shell_integration,
                 worktree_list,
                 config_show,
+                performance_profile,
                 trace_log,
                 subprocess_log_path,
             })
@@ -260,15 +294,37 @@ pub(crate) fn write_if_verbose(verbose: u8, command_line: &str, error_msg: Optio
         None => "Command completed successfully".to_string(),
     };
 
-    // Collect and write diagnostic
+    // Collect and write the diagnostic bundle. It leads with the performance
+    // profile and inlines a (truncated) `trace.log`, so `diagnostic.md` is the
+    // human-facing doc — the headline names what it captured. The raw
+    // companions it doesn't carry in full (`trace.jsonl` machine source,
+    // `subprocess.log` uncapped bodies) are listed beneath it.
     let report = DiagnosticReport::collect(&repo, command_line, context);
+
     match report.write_diagnostic_file(&repo) {
         Some(path) => {
             let path_display = format_path_for_display(&path);
             eprintln!(
                 "{}",
-                success_message(format!("Diagnostic saved @ {path_display}"))
+                info_message(format!(
+                    "Logs, performance profile, and diagnostics saved @ {path_display}"
+                ))
             );
+
+            // The raw companions diagnostic.md doesn't carry in full, when their
+            // sinks opened; `trace.log` and the profile are omitted because the
+            // bundle already inlines them.
+            let companions: Vec<String> = [
+                crate::log_files::TRACE_JSONL.path(),
+                crate::log_files::SUBPROCESS.path(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|p| format_path_for_display(&p))
+            .collect();
+            if !companions.is_empty() {
+                eprintln!("{}", format_with_gutter(&companions.join("\n"), None));
+            }
 
             // Only show gh command if gh is installed
             if is_gh_installed() {
@@ -296,6 +352,19 @@ fn is_gh_installed() -> bool {
         .run()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Render the captured trace as a human-readable performance profile for the
+/// report — a derived view of `trace.jsonl` (where time went, parallelism,
+/// same-context cache misses), ANSI-stripped for the markdown bundle. `None`
+/// when the capture has no trace records, so the section is omitted.
+fn render_trace_profile(trace_jsonl: &str) -> Option<String> {
+    let entries = worktrunk::trace::parse_lines(trace_jsonl);
+    if entries.is_empty() {
+        return None;
+    }
+    let rendered = worktrunk::trace::Profile::from_entries(&entries).render_text("trace.jsonl");
+    Some(rendered.ansi_strip().to_string())
 }
 
 /// Truncate log content to ~50KB if it's too large.
@@ -440,6 +509,26 @@ mod tests {
         let result = format_config_section(&path, "Test");
         assert!(result.contains("(truncated)"));
         assert!(result.len() < 5000);
+    }
+
+    #[test]
+    fn test_render_trace_profile_summarizes_records() {
+        let trace = r#"{"kind":"cmd_completed","ts":1000,"tid":1,"context":"main","cmd":"git status","dur_us":12000,"ok":true}
+{"kind":"cmd_completed","ts":1000,"tid":2,"context":"feature","cmd":"git status","dur_us":8000,"ok":true}
+"#;
+        let rendered = render_trace_profile(trace).expect("records present");
+        assert!(rendered.contains("PERFORMANCE PROFILE"), "{rendered}");
+        assert!(rendered.contains("BY COMMAND TYPE"), "{rendered}");
+        // ANSI is stripped for the markdown bundle.
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "should be ANSI-free: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_render_trace_profile_none_without_records() {
+        assert!(render_trace_profile("not a trace line\nanother line\n").is_none());
     }
 
     #[test]

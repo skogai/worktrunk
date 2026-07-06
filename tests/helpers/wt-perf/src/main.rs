@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use worktrunk::trace::{TraceEntry, TraceEntryKind, TraceResult};
-use wt_perf::{canonicalize, create_repo_at, invalidate_caches_auto, parse_config};
+use wt_perf::{
+    canonicalize, create_mixed_repo_at, create_repo_at, invalidate_caches_auto, parse_config,
+};
 
 #[derive(Parser)]
 #[command(name = "wt-perf")]
@@ -23,7 +25,7 @@ struct Cli {
 enum Commands {
     /// Set up a benchmark repository
     Setup {
-        /// Config name: typical-N, branches-N, branches-N-M, divergent, picker-test
+        /// Config name: typical-N, branches-N, branches-N-M, divergent, mixed-W-B, picker-test
         config: String,
 
         /// Directory to create repo in (default: temp directory)
@@ -41,12 +43,13 @@ enum Commands {
         repo: PathBuf,
     },
 
-    /// Parse trace logs and output Chrome Trace Format JSON
+    /// Parse a trace.jsonl and output Chrome Trace Format JSON
     #[command(after_long_help = r#"EXAMPLES:
-  # Generate trace from wt command
-  # --progressive is required — without it, TTY-gated events (Skeleton
-  # rendered, First result received) don't fire when stdout is a pipe.
-  RUST_LOG=debug wt list --progressive 2>&1 | wt-perf trace > trace.json
+  # Capture a trace, then convert it. --progressive is required — without it,
+  # TTY-gated events (Skeleton rendered, First result received) don't fire
+  # when stdout is a pipe.
+  wt -vv list --progressive
+  wt-perf trace .git/wt/logs/trace.jsonl > trace.json
 
   # Then either:
   #   - Open trace.json in chrome://tracing or https://ui.perfetto.dev
@@ -59,31 +62,27 @@ enum Commands {
   curl -LO https://get.perfetto.dev/trace_processor && chmod +x trace_processor
 "#)]
     Trace {
-        /// Path to trace log file (reads from stdin if omitted)
+        /// Path to a trace.jsonl file (reads from stdin if omitted)
         file: Option<PathBuf>,
     },
 
-    /// Analyze trace logs for duplicate commands (cache effectiveness)
+    /// Analyze a trace.jsonl for duplicate commands (cache effectiveness)
     #[command(after_long_help = r#"EXAMPLES:
   # Check cache effectiveness for wt list
-  RUST_LOG=debug wt list --progressive 2>&1 | wt-perf cache-check
-
-  # From a file
-  wt-perf cache-check trace.log
+  wt -vv list --progressive
+  wt-perf cache-check .git/wt/logs/trace.jsonl
 "#)]
     CacheCheck {
-        /// Path to trace log file (reads from stdin if omitted)
+        /// Path to a trace.jsonl file (reads from stdin if omitted)
         file: Option<PathBuf>,
     },
 
     /// Run a `wt` command with tracing on and render a timeline.
     ///
-    /// Sets `RUST_LOG=debug` on the child so `[wt-trace]` records emit on
-    /// stderr alongside the rest of debug output, parses out the trace
-    /// records, sorts them by start time, and prints a column-aligned
-    /// timeline to stdout. With `--chrome`, emits Chrome Trace Format JSON
-    /// instead — pipe to a file and open in chrome://tracing or
-    /// https://ui.perfetto.dev.
+    /// Runs the child with `-vv` so it writes `trace.jsonl`, reads that back,
+    /// sorts the records by start time, and prints a column-aligned timeline
+    /// to stdout. With `--chrome`, emits Chrome Trace Format JSON instead —
+    /// pipe to a file and open in chrome://tracing or https://ui.perfetto.dev.
     #[command(after_long_help = r#"EXAMPLES:
   # Text timeline of `wt list` in the current repo
   wt-perf timeline -- list
@@ -125,19 +124,31 @@ fn main() {
             path,
             persist,
         } => {
-            let repo_config = parse_config(&config).unwrap_or_else(|| {
-                eprintln!("Unknown config: {}", config);
-                eprintln!();
-                eprintln!("Available configs:");
-                eprintln!(
-                    "  typical-N       - Typical repo with N worktrees (500 commits, 100 files)"
-                );
-                eprintln!("  branches-N      - N branches with 1 commit each");
-                eprintln!("  branches-N-M    - N branches with M commits each");
-                eprintln!("  divergent       - 200 branches × 20 commits (GH #461 scenario)");
-                eprintln!("  picker-test     - Config for wt switch interactive picker testing");
-                std::process::exit(1);
-            });
+            // `mixed-W-B`: W worktrees + B branches in varied states (warm
+            // re-run benchmark fixture); handled separately since it doesn't
+            // map onto the flat `RepoConfig`.
+            let mixed = parse_mixed(&config);
+
+            let repo_config = if mixed.is_some() {
+                None
+            } else {
+                Some(parse_config(&config).unwrap_or_else(|| {
+                    eprintln!("Unknown config: {}", config);
+                    eprintln!();
+                    eprintln!("Available configs:");
+                    eprintln!(
+                        "  typical-N       - Typical repo with N worktrees (500 commits, 100 files)"
+                    );
+                    eprintln!("  branches-N      - N branches with 1 commit each");
+                    eprintln!("  branches-N-M    - N branches with M commits each");
+                    eprintln!("  divergent       - 200 branches × 20 commits (GH #461 scenario)");
+                    eprintln!("  mixed-W-B       - W worktrees + B branches in varied states");
+                    eprintln!(
+                        "  picker-test     - Config for wt switch interactive picker testing"
+                    );
+                    std::process::exit(1);
+                }))
+            };
 
             let base_path = if let Some(p) = path {
                 std::fs::create_dir_all(&p).unwrap();
@@ -152,14 +163,24 @@ fn main() {
             };
 
             eprintln!("Creating {} repo...", config);
-            create_repo_at(&repo_config, &base_path);
+            let (worktrees, branches) = match (mixed, &repo_config) {
+                (Some((w, b)), _) => {
+                    create_mixed_repo_at(w, b, &base_path);
+                    (w, b)
+                }
+                (None, Some(cfg)) => {
+                    create_repo_at(cfg, &base_path);
+                    (cfg.worktrees, cfg.branches)
+                }
+                (None, None) => unreachable!("repo_config is Some when mixed is None"),
+            };
 
             let mut parts = vec![format!("main @ {}", base_path.display())];
-            if repo_config.worktrees > 1 {
-                parts.push(format!("{} worktrees", repo_config.worktrees));
+            if worktrees > 1 {
+                parts.push(format!("{} worktrees", worktrees));
             }
-            if repo_config.branches > 0 {
-                parts.push(format!("{} branches", repo_config.branches));
+            if branches > 0 {
+                parts.push(format!("{} branches", branches));
             }
             eprintln!("Created: {}", parts.join(", "));
             eprintln!();
@@ -222,6 +243,13 @@ fn main() {
     }
 }
 
+/// Parse a `mixed-W-B` config string into `(worktrees, branches)`.
+fn parse_mixed(config: &str) -> Option<(usize, usize)> {
+    let rest = config.strip_prefix("mixed-")?;
+    let (w, b) = rest.split_once('-')?;
+    Some((w.parse().ok()?, b.parse().ok()?))
+}
+
 /// Resolve the `wt` binary as a sibling of the current executable
 /// (`target/{debug,release}/wt-perf` → `target/{debug,release}/wt`).
 /// `EXE_SUFFIX` keeps this correct on Windows, where Cargo builds
@@ -243,16 +271,22 @@ fn resolve_wt_binary() -> PathBuf {
     candidate
 }
 
-/// Run a `wt` command with `RUST_LOG=debug`, capture stderr, and render.
+/// Run a `wt -vv` command and render the `trace.jsonl` it writes.
+///
+/// `-vv` writes the machine trace to `<git-common-dir>/wt/logs/trace.jsonl` in
+/// the repo wt operated on (the humanized stderr/`trace.log` isn't parseable).
+/// We locate that repo the same way wt does — a `-C` in the args, else the
+/// cwd — and read the file back after the run.
 fn run_timeline(cold: bool, repo: Option<PathBuf>, chrome: bool, wt_args: &[String]) {
     let wt = resolve_wt_binary();
+    // The trace lands in the repo wt operates on — resolved from `-C`/cwd the
+    // same way wt resolves it, so we never read a different repo than wt wrote.
+    // `--repo` governs only `--cold` invalidation.
+    let trace_dir = wt_target_dir(wt_args);
 
     if cold {
-        let path = repo
-            .clone()
-            .unwrap_or_else(|| std::env::current_dir().unwrap());
-        let path = canonicalize(&path).unwrap_or_else(|e| {
-            eprintln!("Invalid repo path {}: {}", path.display(), e);
+        let path = canonicalize(repo.as_deref().unwrap_or(&trace_dir)).unwrap_or_else(|e| {
+            eprintln!("Invalid --cold repo path: {e}");
             std::process::exit(1);
         });
         if !path.join(".git").exists() {
@@ -261,6 +295,18 @@ fn run_timeline(cold: bool, repo: Option<PathBuf>, chrome: bool, wt_args: &[Stri
         }
         invalidate_caches_auto(&path);
     }
+
+    let jsonl = trace_jsonl_path(&trace_dir).unwrap_or_else(|| {
+        eprintln!(
+            "Could not locate a git repository for the trace at {} — run from inside a repo or pass a `-C <path>` in the wt args.",
+            trace_dir.display()
+        );
+        std::process::exit(1);
+    });
+    // Drop any prior run's trace first, so an early-exiting child (e.g. clap
+    // intercepting `--help`/`--version` before `init_logging`) surfaces the
+    // absent-file error below rather than a stale timeline.
+    let _ = std::fs::remove_file(&jsonl);
 
     // Measure spawn → wait wall externally. The trace can't see the
     // process prelude (argv parsing, dyld, the time before `init_logging`
@@ -271,8 +317,8 @@ fn run_timeline(cold: bool, repo: Option<PathBuf>, chrome: bool, wt_args: &[Stri
     // doesn't mix `4.5ms` and `19.161583ms`.
     let started = Instant::now();
     let output = Command::new(&wt)
+        .arg("-vv")
         .args(wt_args)
-        .env("RUST_LOG", "debug")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -283,17 +329,23 @@ fn run_timeline(cold: bool, repo: Option<PathBuf>, chrome: bool, wt_args: &[Stri
         });
     let wall = Duration::from_micros(started.elapsed().as_micros() as u64);
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let entries = worktrunk::trace::parse_lines(&stderr);
+    let content = std::fs::read_to_string(&jsonl).unwrap_or_else(|e| {
+        eprintln!("Failed to read {}: {e}", jsonl.display());
+        eprintln!("wt exited with {}; check that the command runs past `init_logging` (e.g. avoid `--version`/`--help`).", output.status);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.is_empty() {
+            eprintln!("--- wt stderr ---\n{stderr}");
+        }
+        std::process::exit(1);
+    });
+    let entries = worktrunk::trace::parse_lines(&content);
 
     if entries.is_empty() {
         eprintln!(
-            "No [wt-trace] entries captured. wt exited with {}; check that the command runs past `init_logging` (e.g. avoid `--version`/`--help`).",
+            "No trace records in {}. wt exited with {}.",
+            jsonl.display(),
             output.status,
         );
-        if !output.stderr.is_empty() {
-            eprintln!("--- wt stderr ---\n{stderr}");
-        }
         std::process::exit(1);
     }
 
@@ -307,6 +359,47 @@ fn run_timeline(cold: bool, repo: Option<PathBuf>, chrome: bool, wt_args: &[Stri
         eprintln!("note: wt exited with {}", output.status);
         std::process::exit(1);
     }
+}
+
+/// The repo wt will operate on, mirroring wt's own resolution: a `-C <path>` /
+/// `-C<path>` in the args (wt's global flag), else the current directory. This
+/// is the directory whose `trace.jsonl` wt writes, so reading it back can't
+/// drift to a different repo.
+fn wt_target_dir(wt_args: &[String]) -> PathBuf {
+    let mut args = wt_args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "-C" {
+            if let Some(path) = args.next() {
+                return PathBuf::from(path);
+            }
+        } else if let Some(path) = arg.strip_prefix("-C") {
+            return PathBuf::from(path);
+        }
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// `<git-common-dir>/wt/logs/trace.jsonl` for the repo at `dir`, or `None`
+/// when `dir` isn't inside a git repository. The common dir is shared across
+/// linked worktrees, so this resolves to the same file wt writes.
+fn trace_jsonl_path(dir: &std::path::Path) -> Option<PathBuf> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let common = String::from_utf8(out.stdout).ok()?;
+    let common = PathBuf::from(common.trim());
+    let common = if common.is_absolute() {
+        common
+    } else {
+        dir.join(common)
+    };
+    Some(common.join("wt").join("logs").join("trace.jsonl"))
 }
 
 /// Render parsed entries as a column-aligned, start-time-sorted timeline.
@@ -380,9 +473,7 @@ fn render_timeline(entries: &[TraceEntry], wall: Duration) -> String {
     } else {
         out.push_str("0 subprocesses\n");
     }
-    out.push_str(&format!(
-        "traced: {traced:?} (first → last [wt-trace] record)\n"
-    ));
+    out.push_str(&format!("traced: {traced:?} (first → last record)\n"));
     out.push_str(&format!(
         "wall:   {wall:?} (spawn → wait; +{untraced:?} untraced prelude/epilogue)\n"
     ));
@@ -396,6 +487,7 @@ fn describe(e: &TraceEntry) -> (&'static str, Duration, String) {
             command,
             duration,
             result,
+            ..
         } => {
             let mut label = match e.context.as_deref() {
                 Some(c) => format!("{command} [{c}]"),
@@ -454,9 +546,9 @@ fn read_trace_entries(file: Option<&std::path::Path>) -> Vec<worktrunk::trace::T
 
     if entries.is_empty() {
         eprintln!(
-            "No [wt-trace] entries found in input.\n\
-             Run the target command with RUST_LOG=debug to emit trace records.\n\
-             See `wt-perf <subcommand> --help` for the capture pipeline."
+            "No trace records found in input.\n\
+             Capture one by running the target command with `-vv`, then read\n\
+             `.git/wt/logs/trace.jsonl`. See `wt-perf <subcommand> --help`."
         );
         std::process::exit(1);
     }
@@ -466,106 +558,34 @@ fn read_trace_entries(file: Option<&std::path::Path>) -> Vec<worktrunk::trace::T
 
 /// Analyze trace entries for cache effectiveness.
 ///
-/// Outputs structured JSON to stdout, composable with jq.
-///
-/// For each (command, context) pair called N times, the first call is "necessary"
-/// and the remaining N-1 are "extra". Wasted time is computed by keeping the
-/// slowest call (likely a cache-miss/cold call) and summing the rest.
+/// Outputs structured JSON to stdout, composable with jq. The analysis lives in
+/// `worktrunk::trace::CacheReport` so `wt config state logs profile` and this
+/// helper share one implementation: each `(command, context)` pair run N times
+/// counts the first call as necessary and the rest as extra, with wasted time
+/// summed over all but the slowest (likely cold) run per context. Commands that
+/// read stdin (`stdin=true`) are excluded — their input isn't in the command
+/// string, so identical lines aren't necessarily redundant.
 fn cache_check(entries: &[worktrunk::trace::TraceEntry]) {
-    use std::collections::{BTreeMap, HashMap, HashSet};
-    use worktrunk::trace::TraceEntryKind;
-
-    let mut total_commands = 0;
-    let mut cmd_counts: HashMap<&str, usize> = HashMap::new();
-    let mut contexts: HashSet<&str> = HashSet::new();
-
-    // Collect all durations per (command, context) pair
-    let mut pair_durations: HashMap<(&str, &str), Vec<u64>> = HashMap::new();
-
-    for entry in entries {
-        if let TraceEntryKind::Command {
-            command, duration, ..
-        } = &entry.kind
-        {
-            let ctx = entry.context.as_deref().unwrap_or("(none)");
-            *cmd_counts.entry(command.as_str()).or_default() += 1;
-            pair_durations
-                .entry((command.as_str(), ctx))
-                .or_default()
-                .push(duration.as_micros() as u64);
-            contexts.insert(ctx);
-            total_commands += 1;
-        }
-    }
-
-    // Build structured duplicates list: group by command
-    let mut cmd_ctx_info: BTreeMap<&str, Vec<(&str, &Vec<u64>)>> = BTreeMap::new();
-    for ((cmd, ctx), durations) in &pair_durations {
-        if durations.len() > 1 {
-            cmd_ctx_info.entry(cmd).or_default().push((ctx, durations));
-        }
-    }
-
-    let mut duplicates = Vec::new();
-    let mut total_extra = 0usize;
-    let mut total_extra_us = 0u64;
-    for (cmd, ctx_list) in &cmd_ctx_info {
-        let max_count = ctx_list.iter().map(|(_, d)| d.len()).max().unwrap();
-        let extra: usize = ctx_list.iter().map(|(_, d)| d.len() - 1).sum();
-        total_extra += extra;
-
-        // Wasted time: for each context, keep the slowest call, sum the rest
-        let extra_us: u64 = ctx_list
-            .iter()
-            .map(|(_, durations)| {
-                let max = durations.iter().max().unwrap();
-                durations.iter().sum::<u64>() - max
-            })
-            .sum();
-        total_extra_us += extra_us;
-
-        let contexts: Vec<_> = ctx_list
-            .iter()
-            .map(|(ctx, durations)| {
-                let total_us: u64 = durations.iter().sum();
-                serde_json::json!({
-                    "context": ctx,
-                    "count": durations.len(),
-                    "total_us": total_us,
-                })
-            })
-            .collect();
-        duplicates.push(serde_json::json!({
-            "command": cmd,
-            "max_per_context": max_count,
-            "extra_calls": extra,
-            "extra_us": extra_us,
-            "contexts": contexts,
-        }));
-    }
-    duplicates.sort_by(|a, b| b["extra_us"].as_u64().cmp(&a["extra_us"].as_u64()));
-
-    let total_time_us: u64 = pair_durations.values().flat_map(|d| d.iter()).sum();
-    let dup_count = cmd_counts.values().filter(|c| **c > 1).count();
-    let dup_total: usize = cmd_counts.values().filter(|c| **c > 1).map(|c| c - 1).sum();
-
-    let output = serde_json::json!({
-        "total_commands": total_commands,
-        "unique_commands": cmd_counts.len(),
-        "contexts": contexts.len(),
-        "total_time_us": total_time_us,
-        "duplicated_commands": dup_count,
-        "extra_calls": dup_total,
-        "same_context_duplicates": duplicates,
-        "same_context_extra_calls": total_extra,
-        "same_context_extra_us": total_extra_us,
-    });
-    println!("{}", serde_json::to_string_pretty(&output).unwrap());
+    let report = worktrunk::trace::CacheReport::from_entries(entries);
+    println!("{}", serde_json::to_string_pretty(&report).unwrap());
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `wt_target_dir` mirrors wt's `-C` resolution so the trace is read from
+    /// the repo wt wrote it to. Covers the space form (`-C path`), the attached
+    /// form (`-C<path>`), first-occurrence wins, and the cwd fallback.
+    #[test]
+    fn wt_target_dir_resolves_minus_c() {
+        let s = |v: &[&str]| wt_target_dir(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(s(&["-C", "/tmp/repo", "list"]), PathBuf::from("/tmp/repo"));
+        assert_eq!(s(&["-C/tmp/repo", "list"]), PathBuf::from("/tmp/repo"));
+        assert_eq!(s(&["-C", "/a", "-C", "/b"]), PathBuf::from("/a")); // first wins
+        // No `-C` → current directory (not the literal "list" argument).
+        assert_eq!(s(&["list"]), std::env::current_dir().unwrap());
+    }
 
     fn span(name: &str, ts_us: u64, dur_us: u64, tid: u64) -> TraceEntry {
         TraceEntry {
@@ -593,6 +613,7 @@ mod tests {
                 command: cmd.to_string(),
                 duration: Duration::from_micros(dur_us),
                 result: TraceResult::Completed { success: ok },
+                reads_stdin: false,
             },
             start_time_us: Some(ts_us),
             thread_id: Some(tid),
@@ -623,7 +644,7 @@ mod tests {
         4.200   280µs  38   span  user_config_load
 
         1 subprocess totaling 4ms (slowest: 4ms git rev-parse HEAD [repo])
-        traced: 4.48ms (first → last [wt-trace] record)
+        traced: 4.48ms (first → last record)
         wall:   6ms (spawn → wait; +1.52ms untraced prelude/epilogue)
         "
         );
@@ -639,7 +660,7 @@ mod tests {
         0.000   1ms  1    cmd   git foo  (ok=false)
 
         1 subprocess totaling 1ms (slowest: 1ms git foo  (ok=false))
-        traced: 1ms (first → last [wt-trace] record)
+        traced: 1ms (first → last record)
         wall:   2ms (spawn → wait; +1ms untraced prelude/epilogue)
         "
         );
