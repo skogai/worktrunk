@@ -1,5 +1,67 @@
 # Changelog
 
+## 0.67.0
+
+### Improved
+
+- **Experimental `--reap` flag for `wt remove`**: `wt remove --reap` terminates processes still running in the worktree (a `post-start` dev server, a file watcher, a language server) before removing it, freeing the ports and file handles they hold. Processes are discovered by working directory and terminated with `SIGTERM`, then `SIGKILL` for survivors; the list prints before any signal is sent. A process holding a controlling terminal (an interactive shell, a terminal editor with unsaved buffers) is never touched. Unix only. [Docs](https://worktrunk.dev/remove/#reaping-processes) ([#3396](https://github.com/max-sixty/worktrunk/pull/3396))
+
+- **`wt switch -x` without a branch opens the picker**: `--execute` no longer requires a branch argument — `wt switch -x claude` opens the interactive picker and runs the command against the selected worktree. It composes with every picker mode (`--branches`, `--remotes`, `--prs`), and the picker path shares the same pipeline as the argument path, so hooks, approval, and template expansion behave identically. ([#3394](https://github.com/max-sixty/worktrunk/pull/3394), closes [#3370](https://github.com/max-sixty/worktrunk/issues/3370), thanks @gbcreation for the request)
+
+- **`wt config state logs profile` groups subprocess time by worktree**: The report gained a BY CONTEXT table (and a `by_context` array in `--format=json`) — subprocess time per context, typically the worktree name — so a slow parallel phase can be attributed to the worktree causing it without exporting the trace to an external tool. ([#3403](https://github.com/max-sixty/worktrunk/pull/3403))
+
+- **`-vv` diagnostics surface pager and terminal environment**: The diagnostic report (`.git/wt/logs/diagnostic.md`, written on every `-vv` run) gained an "Environment variables" section listing a curated, non-secret allowlist of the pager / terminal / locale knobs (`PAGER`, `GIT_PAGER`, `TERM`, `COLUMNS`, `NO_COLOR`, `LANG`, …) plus git's resolved `core.pager`. These are the inputs that most often explain a rendering bug — like a pager interaction suspending `wt config show` ([#3322](https://github.com/max-sixty/worktrunk/issues/3322)) — and they were previously invisible in the report. The list is a strict allowlist, never a blanket `env` dump, so no credential-bearing variable can leak into an uploaded report.
+
+- **`wt config update` pins `[list] json-schema` while unset**: The schema hint from 0.66.0 now comes with the standard one-command fix — `wt config update` pins `json-schema = 1` (the behavior-preserving choice) when the key is unset, and the hint offers the command only when running it would actually write the pin. ([#3411](https://github.com/max-sixty/worktrunk/pull/3411))
+
+### Fixed
+
+- **Claude plugin hooks load again**: The Claude activity (🤖/💬) and `WorktreeCreate`/`WorktreeRemove` hooks stopped loading after the hooks file was renamed to `claude-hooks.json` in [#3382](https://github.com/max-sixty/worktrunk/pull/3382). Claude Code discovers plugin hooks by convention at `hooks/hooks.json` and does not honor `plugin.json`'s string-path `hooks` override for plugin loads, so the renamed file was never read — `/hooks` showed no worktrunk handlers and the markers silently stopped updating. The file is restored to the conventional `hooks/hooks.json`; the #3362 Codex collision the rename guarded against stays closed because the Codex manifest defines its hooks inline, which overrides Codex's convention discovery independently of the filename. ([#3417](https://github.com/max-sixty/worktrunk/issues/3417), thanks @avdi for reporting)
+
+- **`wt switch` no longer crashes on ragged tables in PR comments**: A PR/MR comment table with more cells in a data row than in its header could panic termimad's column fitter at narrow widths, and because the comments preview renders on a background worker, the panic aborted the whole picker. The table render is now contained; the preview falls back to the table's plain text. ([#3408](https://github.com/max-sixty/worktrunk/pull/3408), closes [#3407](https://github.com/max-sixty/worktrunk/issues/3407), thanks @ortonomy for reporting)
+
+- **`wt config show` no longer suspends on the zsh completion probe**: The interactive zsh probe that detects a missing `compinit` claims the terminal foreground when job control is on; a slow or prompting zsh startup could hit the probe's kill-on-timeout before the foreground was restored, leaving `wt` in a background process group and its pager suspended with `suspended (tty output)`. Both interactive probes now run with job control disabled (`zsh +m`), so a timed-out probe can't strand the terminal. ([#3327](https://github.com/max-sixty/worktrunk/pull/3327), closes [#3322](https://github.com/max-sixty/worktrunk/issues/3322), thanks @karmeleon for reporting)
+
+- **`wt step for-each` and the `--execute` fallback no longer inherit `wt`'s `GIT_*` discovery vars**: The command that for-each runs in each worktree — and the `--execute` payload, when `wt` executes it directly because shell integration isn't active — now discovers its repository from the worktree `wt` placed it in, rather than an inherited `GIT_DIR`/`GIT_WORK_TREE`. Previously such a command's `git` calls resolved against the one inherited repo (e.g. the invoking worktree, when `wt` runs as a `!wt` git alias from a linked worktree) while the per-worktree headers claimed otherwise. This extends the hook-spawn scrub from [#3374](https://github.com/max-sixty/worktrunk/pull/3374) to the remaining spawn sites that relocate a user command into a `wt`-chosen worktree; aliases and `commit.generation` commands run in the user's own context and keep the inherited environment. ([#3400](https://github.com/max-sixty/worktrunk/pull/3400), [#3373](https://github.com/max-sixty/worktrunk/issues/3373))
+
+- **`wt list` holds steady when the shell prompt returns**: The progressive table reserves two blank rows beneath its footer, so the multi-line prompt printed at exit renders into pre-scrolled rows instead of scrolling the settled table up. ([#3409](https://github.com/max-sixty/worktrunk/pull/3409))
+
+- **JSON schema 2: no self-relation on a remote-only default-branch row**: `wt list --format=json` with schema 2 gave a remote-only row of the default branch (`origin/main`) a self-referential relation; the default-branch check now compares the remote-stripped branch name. ([#3383](https://github.com/max-sixty/worktrunk/pull/3383))
+
+### Documentation
+
+- **Code Signing Policy page**: A new page documents Worktrunk's code-signing policy for the Windows binaries under the [SignPath Foundation](https://signpath.org/) open-source program: certificate provenance, the signing pipeline, and per-release approval. Signing addresses Microsoft Defender's false positives on unsigned native binaries. [Docs](https://worktrunk.dev/code-signing/) ([#3366](https://github.com/max-sixty/worktrunk/pull/3366), thanks @bemnlam for reporting [#3355](https://github.com/max-sixty/worktrunk/issues/3355))
+
+### Internal
+
+- **skim 5.0**: The picker's fuzzy-finder library moves from 4.10 to 5.0, dropping roughly 1,000 lines of transitive dependencies from the lockfile. ([#3378](https://github.com/max-sixty/worktrunk/pull/3378))
+
+- **Prune benchmarks**: A rust-repo-scale prune fixture, Criterion benches, and trace spans over the removal path. ([#3401](https://github.com/max-sixty/worktrunk/pull/3401))
+
+- **Nix flake test sandbox provides `lsof`**, and flake changes now trigger the nix-flake CI job. ([#3410](https://github.com/max-sixty/worktrunk/pull/3410))
+
+## 0.66.0
+
+### Improved
+
+- **Opt-in JSON schema 2 for `wt list`**: `wt list --format=json` and `wt list statusline --format=json` can now emit a v2 schema, selected via the `[list] json-schema` config key. Schema 2 wraps the rows in an envelope (`schema`, `repo.default_branch`, `repo.forge`, `collected`) and separates "nothing to report" (field absent) from "requested but undetermined" (field `null` — a probe still pending, timed out, or failed). Schema 1 — the existing bare array — remains the default, byte-for-byte; with the key unset, a once-per-process stderr hint shows both values (`= 1` to pin, `= 2` to opt in; suppressed on the statusline surface). [Docs](https://worktrunk.dev/list/#json-output) ([#3357](https://github.com/max-sixty/worktrunk/pull/3357))
+
+- **`wt config approvals list` and `clear --stale`**: `list` shows every command the project config declares — hooks in lifecycle order, aliases, commit-message guidance — grouped into approved and unapproved, with approvals recorded for commands no longer in the config flagged as stale. `clear --stale` removes only those left-behind approvals, echoing each one; valid approvals survive, and a full wipe remains plain `clear`. [Docs](https://worktrunk.dev/config/#wt-config-approvals) ([#3380](https://github.com/max-sixty/worktrunk/pull/3380))
+
+- **Codex sessions show activity markers**: The Codex plugin now ships Codex-native activity hooks, so `wt list` shows 🤖 (working) / 💬 (waiting) for Codex sessions as it does for Claude Code, OpenCode, and Gemini — and Claude-branded events no longer surface inside Codex sessions. Codex has no session-exit event, so the marker rests at 💬 after a session ends until the next session or `wt config state marker clear`. ([#3364](https://github.com/max-sixty/worktrunk/pull/3364), closes [#3362](https://github.com/max-sixty/worktrunk/issues/3362), thanks @ofek for reporting)
+
+### Fixed
+
+- **User hooks no longer inherit `wt`'s `GIT_*` discovery vars**: A user hook that shells out to `git` now discovers its repository from the worktree `wt` sets as its cwd, rather than an inherited `GIT_DIR`/`GIT_WORK_TREE` (e.g. from `wt` run as a `!wt` git alias, or nested under another tool's git hook). `wt` now scrubs the `GIT_*` discovery vars at every hook spawn site — foreground, background, and concurrent. Previously the inherited context leaked into hooks: with both `GIT_DIR` and `GIT_WORK_TREE` present, a hook that ran `git init` would write `core.worktree` into the inherited repo's config, silently redirecting later plain git commands there. `wt`'s own internal git plumbing keeps the inherited context (the absolutize-and-forward behavior from [#1914](https://github.com/max-sixty/worktrunk/pull/1914)); aliases keep it too, since a top-level `wt <alias>` is the user's own command. ([#3374](https://github.com/max-sixty/worktrunk/pull/3374), closes [#3373](https://github.com/max-sixty/worktrunk/issues/3373), thanks @silvanshade for reporting)
+
+- **SCP-style SSH remotes with custom usernames**: Remote URLs like `org-12345678@github.com:owner/repo.git` (GitHub account/org aliases) now parse canonically, so `wt switch pr:<n>` matches the local remote instead of failing with `No remote found`. Malformed and local-path forms that merely resemble SCP syntax are still rejected. ([#3371](https://github.com/max-sixty/worktrunk/pull/3371), thanks @fcoury-oai)
+
+### Documentation
+
+- **Windows app-alias guidance matches current Settings**: The instructions for disabling Windows Terminal's `wt` app-execution alias now point at the current Settings path (Apps → Advanced app settings → App execution aliases). ([#3372](https://github.com/max-sixty/worktrunk/pull/3372), thanks @ofek)
+
+- **`/wt-switch-create` always creates a worktree**: The plugin skill's wording let a session judge that a research or read-only task didn't need isolation and skip the worktree; invoking the command now counts as the explicit request, so the worktree is created unconditionally. ([#3356](https://github.com/max-sixty/worktrunk/pull/3356))
+
 ## 0.65.0
 
 ### Improved

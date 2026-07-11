@@ -3265,6 +3265,9 @@ fn test_config_update_print_on_clean_config_is_silent(repo: TestRepo) {
     fs::write(
         repo.test_config_path(),
         r#"worktree-path = "../{{ repo }}.{{ branch }}"
+
+[list]
+json-schema = 1
 "#,
     )
     .unwrap();
@@ -3325,10 +3328,13 @@ fn test_config_update_print_emits_migrated_without_writing(repo: TestRepo) {
 /// `wt config update` with no deprecated settings reports nothing to do
 #[rstest]
 fn test_config_update_no_deprecations(repo: TestRepo) {
-    // Write a clean config with no deprecated patterns
+    // Clean config: no deprecated patterns, json-schema explicitly pinned
     fs::write(
         repo.test_config_path(),
         r#"worktree-path = "../{{ repo }}.{{ branch }}"
+
+[list]
+json-schema = 1
 "#,
     )
     .unwrap();
@@ -3340,6 +3346,66 @@ fn test_config_update_no_deprecations(repo: TestRepo) {
 
         assert_cmd_snapshot!(cmd);
     });
+}
+
+/// `wt config update` pins `[list] json-schema = 1` when the key is unset,
+/// and a second run has nothing left to do — the pending-default loop closes.
+#[rstest]
+fn test_config_update_pins_json_schema(repo: TestRepo) {
+    fs::write(
+        repo.test_config_path(),
+        "worktree-path = \"../{{ repo }}.{{ branch }}\"\n",
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings(&repo);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.args(["config", "update", "--yes"]);
+
+        assert_cmd_snapshot!(cmd);
+    });
+
+    assert_eq!(
+        fs::read_to_string(repo.test_config_path()).unwrap(),
+        "worktree-path = \"../{{ repo }}.{{ branch }}\"\n\n[list]\njson-schema = 1\n"
+    );
+
+    let output = repo
+        .wt_command()
+        .args(["config", "update", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("No deprecated settings found"),
+        "second run should have nothing to update"
+    );
+}
+
+/// A system config that sets `[list] json-schema` makes the resolved value
+/// explicit, so `wt config update` must not pin the user file — a user-file
+/// pin would override the system value and flip JSON output.
+#[rstest]
+fn test_config_update_json_schema_pin_defers_to_system_config(repo: TestRepo) {
+    let system_config_dir = tempfile::tempdir().unwrap();
+    let system_config_path = system_config_dir.path().join("config.toml");
+    fs::write(&system_config_path, "[list]\njson-schema = 2\n").unwrap();
+
+    // A user config with an unrelated deprecation: update applies that
+    // rewrite but must not insert the pin alongside it.
+    fs::write(repo.test_config_path(), "[merge]\nno-ff = true\n").unwrap();
+
+    let mut cmd = repo.wt_command();
+    cmd.args(["config", "update", "--yes"]);
+    cmd.env("WORKTRUNK_SYSTEM_CONFIG_PATH", &system_config_path);
+    let output = cmd.output().unwrap();
+    assert!(output.status.success());
+
+    assert_eq!(
+        fs::read_to_string(repo.test_config_path()).unwrap(),
+        "[merge]\nff = false\n",
+        "the no-ff rewrite applies; the json-schema pin must not"
+    );
 }
 
 /// `wt config update --yes` applies template variable migration
@@ -3847,14 +3913,44 @@ fn test_codex_plugin_metadata_is_valid_json() {
             .contains("claude-code"),
         "plugin.json interface.websiteURL must point at the canonical site"
     );
-    // The Codex plugin ships no activity-marker hooks: Codex's
-    // HookEventNameWire vocabulary (codex-cli 0.130.0) has no `Stop`/turn-end
-    // event, so a 🤖 set on UserPromptSubmit could never return to 💬 within a
-    // session. Keep the Codex manifest free of a `hooks` key, and its wrapper
-    // dir manifest-only, until Codex adds a turn-end hook event — see CLAUDE.md
-    // → "Plugin Layout". (plugins/worktrunk/hooks/ exists post-consolidation,
-    // but it is the *Claude* plugin's — Codex's manifest never references it.)
-    assert_eq!(plugin.get("hooks"), None);
+    // The Codex plugin ships activity-marker hooks *inline* in its manifest
+    // (`hooks` object, not a path). This is the functional definition of its
+    // Codex-native events, and it also overrides Codex's convention discovery
+    // (an absent `hooks` key makes Codex auto-discover a `hooks/hooks.json` at
+    // the plugin root). The Claude hooks file sits at that same conventional
+    // `hooks/hooks.json` (Claude's loader discovers it there — #3417), but the
+    // inline Codex override means Codex never loads it, so the #3362 collision
+    // (Codex surfacing the *Claude* file's events) stays closed. Codex added a
+    // `Stop` turn-end event (post codex-cli 0.130.0), so 🤖 returns to 💬 at
+    // turn end. See CLAUDE.md → "Plugin Layout".
+    let codex_hooks = plugin
+        .get("hooks")
+        .and_then(|h| h.get("hooks"))
+        .expect("Codex manifest must carry an inline `hooks` object");
+    // Exactly the Codex-native events — no `Notification`/`SessionEnd`/
+    // `WorktreeCreate`/`WorktreeRemove`, which are Claude-only and would be
+    // silently dropped by Codex.
+    for event in ["UserPromptSubmit", "PermissionRequest", "Stop"] {
+        assert!(
+            codex_hooks.get(event).is_some(),
+            "Codex hooks must define the {event} event"
+        );
+    }
+    // Commands use Codex's native `$PLUGIN_ROOT`, never the Claude-branded
+    // `$CLAUDE_PLUGIN_ROOT` compat alias — nothing Claude-branded in a Codex
+    // session (#3362).
+    let hooks_json = serde_json::to_string(codex_hooks).unwrap();
+    assert!(
+        hooks_json.contains("$PLUGIN_ROOT/hooks/wt.sh"),
+        "Codex hook commands must call the shim via $PLUGIN_ROOT"
+    );
+    assert!(
+        !hooks_json.contains("CLAUDE_PLUGIN_ROOT"),
+        "Codex hooks must not reference the Claude-branded $CLAUDE_PLUGIN_ROOT alias"
+    );
+    // Hooks are inline, so the wrapper dir still holds only plugin.json — no
+    // separate hooks file, and the inline override keeps Codex off the shared
+    // Claude `hooks/hooks.json`.
     assert!(
         !project_root
             .join("plugins/worktrunk/.codex-plugin/hooks")
@@ -3918,6 +4014,24 @@ fn test_plugin_layout_is_consolidated() {
         root.join("plugins/worktrunk/hooks/hooks.json").exists()
             && root.join("plugins/worktrunk/hooks/wt.sh").exists(),
         "Claude hooks must live at the plugin root's hooks/"
+    );
+    // The Claude hooks file must sit at the conventional hooks/hooks.json.
+    // Claude Code discovers plugin hooks by that convention path and does NOT
+    // honor plugin.json's string-path `hooks` override for plugin loads, so a
+    // Claude-scoped name (hooks/claude-hooks.json) silently stops the hooks
+    // from loading — /hooks shows nothing and the 🤖/💬 markers never update
+    // (#3417). Sitting at the conventional path does NOT resurface the #3362
+    // Codex collision: the Codex manifest defines its hooks inline (verified
+    // above), taking Codex's Some(Inline) branch, which overrides convention
+    // discovery — so Codex never loads this file even though it is now at the
+    // discoverable path. Structural scoping via the filename is what broke
+    // Claude; the inline Codex manifest is what actually keeps Codex clean.
+    assert!(
+        !root
+            .join("plugins/worktrunk/hooks/claude-hooks.json")
+            .exists(),
+        "the Claude hooks file must sit at the conventional hooks/hooks.json that Claude \
+         Code's loader discovers, not a Claude-scoped name the string-path override can't rescue (#3417)"
     );
     assert!(
         !read("plugins/worktrunk/hooks/hooks.json").contains(".claude-plugin/hooks/"),

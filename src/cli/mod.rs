@@ -350,15 +350,15 @@ pub(crate) struct SwitchArgs {
     pub(crate) branch: Option<String>,
 
     /// Include branches without worktrees
-    #[arg(long, help_heading = "Picker Options", conflicts_with_all = ["create", "base", "execute", "execute_args", "clobber"])]
+    #[arg(long, help_heading = "Picker Options", conflicts_with_all = ["create", "base", "clobber"])]
     pub(crate) branches: bool,
 
     /// Include remote branches
-    #[arg(long, help_heading = "Picker Options", conflicts_with_all = ["create", "base", "execute", "execute_args", "clobber"])]
+    #[arg(long, help_heading = "Picker Options", conflicts_with_all = ["create", "base", "clobber"])]
     pub(crate) remotes: bool,
 
     /// Include open PRs/MRs
-    #[arg(long, help_heading = "Picker Options", conflicts_with_all = ["create", "base", "execute", "execute_args", "clobber"])]
+    #[arg(long, help_heading = "Picker Options", conflicts_with_all = ["create", "base", "clobber"])]
     pub(crate) prs: bool,
 
     /// Create a new branch
@@ -377,6 +377,10 @@ pub(crate) struct SwitchArgs {
     /// Replaces the wt process with the command after switching, giving
     /// it full terminal control. Useful for launching editors, AI agents,
     /// or other interactive tools.
+    ///
+    /// Without a branch argument, the interactive picker opens and the
+    /// command runs against the selected worktree — so `wt switch -x claude`
+    /// picks a worktree, then launches Claude Code there.
     ///
     /// Supports [hook template variables](@/hook.md#template-variables)
     /// (`{{ branch }}`, `{{ worktree_path }}`, etc.) and filters.
@@ -397,7 +401,7 @@ pub(crate) struct SwitchArgs {
     /// Template example: `-x code -- '{{ worktree_path }}'` opens VS Code
     /// at the worktree, `-x tmux -- new -s '{{ branch | sanitize }}'` starts
     /// a tmux session named after the branch.
-    #[arg(short = 'x', long, requires = "branch")]
+    #[arg(short = 'x', long)]
     pub(crate) execute: Option<String>,
 
     /// Additional arguments for --execute command (after --)
@@ -492,6 +496,15 @@ pub(crate) struct RemoveArgs {
     /// Run removal in foreground (block until complete)
     #[arg(long)]
     pub(crate) foreground: bool,
+
+    /// Kill processes started in the worktree \[experimental\]
+    ///
+    /// Before removal, terminate processes whose working directory is under
+    /// the worktree — dev servers, watchers, language servers. Processes
+    /// holding a controlling terminal (interactive shells, terminal editors)
+    /// are left alone. Unix only.
+    #[arg(long)]
+    pub(crate) reap: bool,
 
     #[command(flatten)]
     pub(crate) hooks: HookFlags,
@@ -945,7 +958,97 @@ These appear across all columns while the table is loading:
 
 ## JSON output
 
-Query structured data with `--format=json`:
+`--format=json` emits structured data in one of two schemas while the format
+migrates: `[list] json-schema = 2` selects the envelope format below, `= 1`
+the original bare-array format. Unset emits schema 1 with a warning
+(`wt config update` pins `= 1`); a future release flips the default to
+schema 2 and later removes schema 1.
+
+### Schema 2
+
+One envelope object. Items carry independent facts; rendered strings
+(including the collapsed Status value) live under `display`:
+
+```json
+{
+  "schema": 2,
+  "repo": {
+    "default_branch": "main",
+    "forge": {"url": "https://github.com/org/repo", "provider": "github",
+              "host": "github.com", "owner": "org", "name": "repo", "remote": "origin"}
+  },
+  "collected": {"ci": false, "summary": false},
+  "items": [
+    {
+      "branch": "feature",
+      "head": {"sha": "05a4a45d…", "short_sha": "05a4a45", "subject": "Add login page",
+               "committed_at": "2025-01-01T08:00:00Z"},
+      "worktree": {"path": "/home/user/repo.feature", "main": false, "current": true,
+                   "previous": false, "detached": false, "branch_mismatch": false,
+                   "changes": {"staged": false, "modified": true, "untracked": false,
+                               "renamed": false, "deleted": false, "conflicted": false,
+                               "diff": {"added": 10, "deleted": 2}}},
+      "default_branch": {"ahead": 3, "behind": 1, "diff": {"added": 50, "deleted": 20},
+                         "orphan": false, "integration": null, "merge_conflicts": false},
+      "upstream": {"remote": "origin", "branch": "feature", "ahead": 0, "behind": 2},
+      "display": {"state": "diverged", "symbols": "!↕", "statusline": "feature …"}
+    }
+  ]
+}
+```
+
+How "no value" reads:
+
+- **Absent** — nothing to report: not applicable (`worktree` on a branch-only
+  row), not requested this run (the envelope's `collected` records what was),
+  or determined-empty (no PR, no lock, not integrated).
+- **`null`** — requested but not determined: a task timed out, the branch was
+  too stale for the expensive checks, or a forge fetch failed. This is the
+  JSON form of the table's `·` placeholder.
+
+jq treats absent and `null` identically in path expressions, so filters need
+no null checks; `has()` distinguishes the two when it matters.
+
+Item fields:
+
+| Field | Description |
+|-------|-------------|
+| `branch` | Branch name; null for a detached-HEAD worktree. Remote rows carry the bare name with the remote in `remote` |
+| `remote` | Remote name, present only on remote-only branch rows |
+| `head` | `{sha, short_sha, subject, committed_at}`; null for unborn branches. `committed_at` is RFC 3339 UTC |
+| `worktree` | `{path, main, current, previous, detached, locked, prunable, branch_mismatch, operation, changes}`; absent on branch-only rows. `locked`/`prunable` are `{reason}` objects and can co-occur; `operation` is `"rebase"` or `"merge"`; `changes` holds the five working-tree flags plus `conflicted` and `diff {added, deleted}` |
+| `default_branch` | Relation to the default branch: `{ahead, behind, diff, orphan, integration, merge_conflicts}`; absent on the default branch itself. `integration.reason` is one of `same_commit`, `ancestor`, `no_added_changes`, `trees_match`, `merge_adds_nothing`, `patch_id_match`; a dirty tree skips the checks, leaving `integration` null |
+| `upstream` | Tracking branch: `{remote, branch, ahead, behind}`; absent when none is configured |
+| `pr` | Open PR/MR: `{number, url, review, mergeable, repo}`; collected with `--full` or a listed `ci` column. `review` uses the schema 1 `ci.review_state` vocabulary; `mergeable` is false when the forge reports conflicts, null otherwise |
+| `checks` | CI pipeline: `{status, source, stale}`; `status` is `passed`, `running`, or `failed` — null when a conflicts report masks it |
+| `dev_server` | `{url, listening}` from the project's `list.url` template |
+| `summary` | LLM branch summary (requires `[list] summary = true`) |
+| `vars` | Per-branch variables from [`wt config state vars`](@/config.md#wt-config-state-vars) |
+| `display` | Rendered strings: `state` (schema 1's `main_state` vocabulary), `symbols`, `statusline` (with ANSI colors), `columns` (custom-column cells keyed by header) |
+
+Schema 1 names map directly: `commit` → `head`, `working_tree` →
+`worktree.changes`, `main` + `main_state` → `default_branch` +
+`display.state`, `remote` → `upstream`, `ci` → `pr` + `checks`, `url` +
+`url_active` → `dev_server`, `statusline`/`symbols`/`columns` → `display.*`,
+and the per-item `repo` moves to the envelope's `repo.forge`.
+
+```console
+# Current worktree path (for scripts)
+$ wt list --format=json | jq -r '.items[] | select(.worktree.current) | .worktree.path'
+
+# Branches with uncommitted changes
+$ wt list --format=json | jq '.items[] | select(.worktree.changes.modified)'
+
+# Integrated branches (safe to remove)
+$ wt list --format=json | jq '.items[] | select(.display.state == "integrated" or .display.state == "empty") | .branch'
+
+# Worktrees ahead of upstream (needs pushing)
+$ wt list --format=json | jq '.items[] | select(.upstream.ahead > 0) | .branch'
+```
+
+### Schema 1
+
+The original bare-array format, and the default while unset:
 
 ```console
 # Current worktree path (for scripts)
@@ -1191,6 +1294,26 @@ Use `--no-delete-branch` to keep the branch regardless of merge status.
 Removal runs in the background by default — the command returns immediately. The worktree is renamed into `.git/wt/trash/` (instant same-filesystem rename), git metadata is pruned, the branch is deleted, and a detached `rm -rf` finishes cleanup. Cross-filesystem worktrees fall back to `git worktree remove`. Logs: `.git/wt/logs/{branch}/internal/remove.log`. Use `--foreground` to run in the foreground.
 
 After each `wt remove`, entries in `.git/wt/trash/` older than 24 hours are swept by a detached `rm -rf` — eventual cleanup for directories orphaned when a previous background removal was interrupted (SIGKILL, reboot, disk full).
+
+## Reaping processes [experimental]
+
+`--reap` terminates processes left running in the worktree before it is removed — a `post-start` dev server, a file watcher, a language server — freeing the ports and file handles they hold. Processes are discovered by working directory: any process whose current directory is at or under the worktree path (`SIGTERM`, then `SIGKILL` for survivors).
+
+```console
+$ wt remove --reap feature
+◎ Reaping 2 processes under feature worktree
+   ┃ 51234 node
+   ┃ 51240 esbuild
+✓ Reaped 2 processes
+◎ Removing feature worktree & branch in background (same commit as main, _)
+```
+
+To avoid killing work the user did not mean to kill, two guards keep `--reap` conservative:
+
+- **Interactive processes are spared.** A process holding a controlling terminal — an interactive shell, or a terminal editor such as `vim` with unsaved buffers — is never reaped. Only detached processes remain candidates.
+- **Discovery is by working directory only.** A process that started in the worktree and later changed directory, or a daemon that reparented to `init`, no longer reports a directory under the worktree and is not found. To reliably reap those, launch them with [`wt step tether`](@/step.md#wt-step-tether), which kills the whole process group when the worktree is removed.
+
+Reaping runs before the worktree directory is touched, so it is independent of foreground/background removal and the `--force` flag. Unix only; on Windows `--reap` is rejected.
 
 ## Hooks
 
@@ -1913,6 +2036,8 @@ full = false       # Show CI status and LLM summaries (--full)
 branches = false   # Include branches without worktrees (--branches)
 remotes = false    # Include remote-only branches (--remotes)
 
+json-schema = 1    # JSON output schema: 1 (current, bare array) or 2 (envelope); unset emits 1 with a warning
+
 columns = ["branch", "status", "ci", "path"]   # Columns to show, in order — built-ins or custom headers (omit for the default set)
 
 task-timeout-ms = 0   # Kill individual git commands after N ms; 0 disables
@@ -1953,8 +2078,10 @@ named one. A column whose data source is missing still stays hidden — `summary
 needs an LLM command (`[commit.generation]`), `url` needs a `[list] url`
 template — since listing can't supply the data.
 
-The selection drives the table and the `wt switch` picker; `wt list --format
-json` ignores it and emits every field.
+The selection drives the table and the `wt switch` picker. `wt list --format
+json` always emits every field, but a listed gated column (`ci`, `summary`)
+still forces its data collection on, so the JSON carries the same data the
+table shows.
 
 #### Custom columns [experimental]
 

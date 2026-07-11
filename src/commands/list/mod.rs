@@ -123,6 +123,7 @@ pub(crate) mod collect;
 pub(crate) mod columns;
 pub(crate) mod custom_columns;
 pub mod json_output;
+pub mod json_v2;
 pub(crate) mod layout;
 pub mod model;
 pub mod progressive;
@@ -151,6 +152,11 @@ pub fn handle_list(
 ) -> anyhow::Result<()> {
     let render_target = RenderTarget::detect(format, progressive_flag);
 
+    // Resolve the JSON schema before collecting, so the unset-nag lands
+    // above the output rather than after a long collection.
+    let json_schema =
+        matches!(render_target, RenderTarget::Json).then(|| resolve_json_schema(&repo));
+
     let list_data = collect::collect(
         &repo,
         collect::ShowConfig::DeferredToParallel {
@@ -164,20 +170,112 @@ pub fn handle_list(
     let Some(ListData {
         items,
         custom_columns,
+        collected,
     }) = list_data
     else {
         return Ok(());
     };
 
-    if matches!(render_target, RenderTarget::Json) {
-        let json_items = json_output::to_json_items(&items, &custom_columns, &repo);
-        let json =
-            serde_json::to_string_pretty(&json_items).context("Failed to serialize to JSON")?;
-        println!("{}", json);
+    match json_schema {
+        // Table modes already rendered inside `collect()`.
+        None => {}
+        Some(2) => print_json(&json_v2::to_json_envelope(
+            &items,
+            &custom_columns,
+            &repo,
+            collected,
+        ))?,
+        Some(_) => print_json(&json_output::to_json_items(&items, &custom_columns, &repo))?,
     }
-    // Table modes already rendered inside `collect()`.
 
     Ok(())
+}
+
+/// Serialize a JSON answer to stdout (pretty, one trailing newline).
+pub(crate) fn print_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
+    let json = serde_json::to_string_pretty(value).context("Failed to serialize to JSON")?;
+    println!("{}", json);
+    Ok(())
+}
+
+/// Resolve `[list] json-schema` (per-project resolved config) to 1 or 2.
+///
+/// Unset defaults to schema 1 and nags once per process; an out-of-range
+/// value warns and defaults to schema 1, matching how config load treats a
+/// type error in the same key (warn and degrade, never brick a command).
+/// Both messages honor warning suppression — on the statusline, stderr
+/// would corrupt the consumer's prompt, and the same user sees the nag on
+/// their next interactive run.
+///
+/// The unset state is the `PendingDefault` row in `DEPRECATION_RULES`, but
+/// its warning fires here rather than at config load: the setting only
+/// matters to JSON consumers, so a load-time warning would nag every command
+/// for every user without the key. `wt config update` pins the current
+/// `json-schema = 1` (the behavior-preserving choice; adopting schema 2 is a
+/// deliberate manual edit), so the nag's hint offers that command exactly
+/// when running it would write the pin — decided by the same detection
+/// update runs, so a missing, unreadable, or malformed user config falls
+/// back to naming the manual setting instead (migration plan in
+/// design/list-json-v2.md, reviewed in #3357).
+pub(crate) fn resolve_json_schema(repo: &Repository) -> u8 {
+    use std::sync::Once;
+
+    use color_print::cformat;
+    use worktrunk::styling::{eprintln, hint_message, warning_message};
+
+    static WARNED: Once = Once::new();
+    match repo.config().list.json_schema {
+        Some(v @ (1 | 2)) => v,
+        Some(other) => {
+            WARNED.call_once(|| {
+                if worktrunk::config::warnings_suppressed() {
+                    return;
+                }
+                eprintln!(
+                    "{}",
+                    warning_message(cformat!(
+                        "[list] json-schema is <bold>{other}</>, expected 1 or 2; using schema 1"
+                    ))
+                );
+            });
+            1
+        }
+        None => {
+            WARNED.call_once(|| {
+                if worktrunk::config::warnings_suppressed() {
+                    return;
+                }
+                eprintln!(
+                    "{}",
+                    warning_message(
+                        "JSON output is schema 1; a future release switches the default to schema 2"
+                    )
+                );
+                let update_would_pin = worktrunk::config::config_path()
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+                    .is_some_and(|content| {
+                        worktrunk::config::detect_deprecations(
+                            &content,
+                            worktrunk::config::ConfigFileKind::User,
+                        )
+                        .iter()
+                        .any(|k| matches!(k, worktrunk::config::DeprecationKind::JsonSchemaUnset))
+                    });
+                let keep = if update_would_pin {
+                    cformat!("run <underline>wt config update</>")
+                } else {
+                    cformat!("<underline>json-schema = 1</>")
+                };
+                eprintln!(
+                    "{}",
+                    hint_message(cformat!(
+                        "To adopt the new schema set <underline>[list] json-schema = 2</>; to keep this format, {keep}"
+                    ))
+                );
+            });
+            1
+        }
+    }
 }
 
 #[derive(Default)]

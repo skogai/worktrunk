@@ -230,9 +230,21 @@ This leaves any already-installed Worktrunk plugin unchanged."#
     Uninstall,
 }
 
-// Ordering: action + inverse adjacent (add, clear).
+// Ordering: read first (list), then action + inverse adjacent (add, clear).
 #[derive(Subcommand)]
 pub enum ApprovalsCommand {
+    /// List project commands and their approval status
+    #[command(
+        after_long_help = r#"Shows every command the project config declares — hooks, aliases, and commit-message guidance — grouped into APPROVED and UNAPPROVED sections. Approvals recorded for commands no longer in the project config (edited or removed since approval) are listed separately.
+
+## Examples
+
+```console
+$ wt config approvals list
+```"#
+    )]
+    List,
+
     /// Store approvals in approvals.toml
     #[command(
         after_long_help = r#"Prompts for approval of all project commands and saves them to approvals.toml.
@@ -251,12 +263,17 @@ including previously approved ones."#
         after_long_help = r#"Removes saved approvals, requiring re-approval on next command run.
 
 By default, clears approvals for the current project. Use `--global` to clear
-all approvals across all projects."#
+all approvals across all projects, or `--stale` to clear only approvals for
+commands no longer in the project config (edited or removed since approval)."#
     )]
     Clear {
         /// Clear global approvals
         #[arg(short, long)]
         global: bool,
+
+        /// Clear only stale approvals
+        #[arg(long, conflicts_with = "global")]
+        stale: bool,
     },
 }
 
@@ -288,7 +305,7 @@ $ wt config plugins claude install-statusline
 
     /// Codex plugin
     #[command(
-        after_long_help = r#"Bundles a configuration skill — documentation Codex can read to help set up LLM commits, project hooks, and worktree paths. Activity markers in `wt list` are Claude Code only: Codex exposes no turn-end hook event, so the Codex plugin omits them until it does.
+        after_long_help = r#"Bundles a configuration skill — documentation Codex can read to help set up LLM commits, project hooks, and worktree paths — plus activity-marker hooks that show 🤖/💬 in `wt list` while a Codex session runs. Codex has no session-exit event, so a marker persists after a session ends.
 
 ## Examples
 
@@ -496,11 +513,12 @@ This tests:
     /// Update deprecated config settings
     #[command(
         after_long_help = r#"Updates deprecated settings in user and project config files
-to their current equivalents. Shows a diff and asks for confirmation.
+to their current equivalents, and pins defaults that a future release
+switches — currently `[list] json-schema = 1` — so upgrading doesn't change
+behavior. Shows a diff and asks for confirmation.
 
-Migrations are computed in memory on demand — worktrunk no longer writes
-`.new` files as a side effect of loading config. Use `--print` to see the
-migrated TOML without touching any file.
+Migrations are computed in memory on demand; nothing is written outside this
+command. Use `--print` to see the migrated TOML without touching any file.
 
 ## Examples
 
@@ -531,6 +549,11 @@ $ wt config update --print
 
 ## Examples
 
+List commands and their approval status for current project:
+```console
+$ wt config approvals list
+```
+
 Pre-approve all hook and alias commands for current project:
 ```console
 $ wt config approvals add
@@ -539,6 +562,11 @@ $ wt config approvals add
 Clear approvals for current project:
 ```console
 $ wt config approvals clear
+```
+
+Clear only approvals for commands no longer in the project config:
+```console
+$ wt config approvals clear --stale
 ```
 
 Clear global approvals:
@@ -1306,9 +1334,7 @@ $ wt config state logs --format=json | jq '.hook_output[] | select(.branch | sta
     #[command(
         after_long_help = r#"Summarize where a single `wt` invocation spent its time, reading the records captured to `trace.jsonl` by a `-vv` run.
 
-Reads `.git/wt/logs/trace.jsonl` by default, or a trace given as an argument (e.g. a CI artifact, or `-` for stdin). The report answers three questions: where time goes (subprocess time by command type, plus the slowest individual jobs), how parallel the run was (concurrency factor and peak concurrency), and where work was wasted (commands re-run with the same context). For a `wt list` capture it also shows derived latencies (time to skeleton, time to first result) and a timeline of collect milestones; the skeleton/first-result markers need a terminal (TTY) capture. `--format=json` emits the same data for scripting.
-
-For an interactive timeline or a Perfetto trace, use the `wt-perf` helper (`cargo run -p wt-perf -- timeline`); both read the same `trace.jsonl`.
+Reads `.git/wt/logs/trace.jsonl` by default, or a trace given as an argument (e.g. a CI artifact, or `-` for stdin). The report answers three questions: where time goes (subprocess time by command type and by worktree, plus the slowest individual jobs), how parallel the run was (concurrency factor and peak concurrency), and where work was wasted (commands re-run with the same context). For a `wt list` capture it also shows derived latencies (time to skeleton, time to first result) and a timeline of collect milestones; the skeleton/first-result markers need a terminal (TTY) capture. `--format=json` emits the same data for scripting.
 
 ## Examples
 

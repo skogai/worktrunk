@@ -578,6 +578,49 @@ fn test_switch_internal_with_execute(repo: TestRepo) {
     );
 }
 
+/// The `--execute` no-integration fallback relocates the payload into the
+/// switch target, so inherited git-discovery vars (`GIT_DIR`/`GIT_WORK_TREE`)
+/// must be scrubbed there like at the hook and for-each spawn sites — git
+/// resolves them before the cwd, so a forwarded value would misdirect the
+/// payload's `git` calls to the inherited repo while the "Executing @ …"
+/// header names the target (issue #3373; classification in
+/// `scrub_git_discovery_env_vars`).
+///
+/// `repo.wt_command()` configures no directive files, so wt executes the
+/// payload itself (unix: exec, non-unix: spawn — each platform's CI drives
+/// its own variant). The relative marker path resolves in the payload's cwd,
+/// pinning the relocation at the same time.
+#[rstest]
+fn test_switch_execute_fallback_does_not_inherit_git_discovery_vars(mut repo: TestRepo) {
+    let feature_path = repo.add_worktree("feature");
+
+    let output = repo
+        .wt_command()
+        .args([
+            "switch",
+            "feature",
+            "--execute",
+            r#"printf '[%s][%s]' "$GIT_DIR" "$GIT_WORK_TREE" > git_env_seen.txt"#,
+        ])
+        .env("GIT_DIR", repo.root_path().join(".git"))
+        .env("GIT_WORK_TREE", repo.root_path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "switch --execute failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let seen = fs::read_to_string(feature_path.join("git_env_seen.txt"))
+        .expect("payload should have run in the target worktree");
+    assert_eq!(
+        seen, "[][]",
+        "--execute payload inherited git-discovery vars ([GIT_DIR][GIT_WORK_TREE]): {seen}"
+    );
+}
+
 /// `--execute` with trailing `-- args` containing shell metacharacters: the
 /// constructed command appended to the exec directive file must POSIX-escape
 /// each trailing arg so the user's shell wrapper (`sh -c`, `bash -c`, …)
@@ -2841,9 +2884,9 @@ fn test_switch_pr_create_conflict(#[from(repo_with_remote)] repo: TestRepo) {
     });
 }
 
-/// Test same-repo PR checkout (base.repo == head.repo)
+/// Test same-repo PR checkout with a custom SCP-style SSH user.
 #[rstest]
-fn test_switch_pr_same_repo(#[from(repo_with_remote)] mut repo: TestRepo) {
+fn test_switch_pr_same_repo_custom_ssh_user(#[from(repo_with_remote)] mut repo: TestRepo) {
     // Create a feature branch and push it to the remote
     repo.add_worktree("feature-auth");
     repo.run_git(&["push", "origin", "feature-auth"]);
@@ -2860,23 +2903,15 @@ fn test_switch_pr_same_repo(#[from(repo_with_remote)] mut repo: TestRepo) {
     .trim()
     .to_string();
 
-    // Set origin URL to GitHub-style so find_remote_for_repo() can match owner/test-repo
-    repo.run_git(&[
-        "remote",
-        "set-url",
-        "origin",
-        "https://github.com/owner/test-repo.git",
-    ]);
+    // GitHub requires this URL form when an organization enforces SSH certificates.
+    let github_url = "org-14957082@github.com:owner/test-repo.git";
+    repo.run_git(&["remote", "set-url", "origin", github_url]);
 
     // Configure git to redirect github.com URLs to the local bare remote.
     // This is necessary because:
     // 1. origin must have a GitHub URL for find_remote_for_repo() to match owner/repo
     // 2. But we need git fetch to actually succeed using the local bare remote
-    repo.run_git(&[
-        "config",
-        &format!("url.{}.insteadOf", bare_url),
-        "https://github.com/owner/test-repo.git",
-    ]);
+    repo.run_git(&["config", &format!("url.{}.insteadOf", bare_url), github_url]);
 
     // gh api repos/{owner}/{repo}/pulls/{number} format
     let gh_response = r#"{
