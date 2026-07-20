@@ -314,7 +314,7 @@ use once_cell::sync::OnceCell;
 use rayon::prelude::*;
 use worktrunk::git::{ErrorExt, LocalBranch, Repository, WorktreeInfo};
 use worktrunk::styling::{
-    INFO_SYMBOL, eprintln, format_with_gutter, hint_message, warning_message,
+    INFO_SYMBOL, eprintln, format_with_gutter, hint_message, truncate_visible, warning_message,
 };
 
 use crate::commands::is_worktree_at_expected_path;
@@ -413,8 +413,12 @@ fn print_buffered_table(header: &str, rows: &[String], summary: &str) {
     for row in rows {
         println!("{row}");
     }
-    println!();
-    println!("{summary}");
+    // The summary narrates the table rather than being part of the answer
+    // (`--format=json` omits it), so it goes to stderr and piped stdout ends
+    // cleanly after the last row. The progressive path keeps it on stdout:
+    // there it's a repainted row of the table region.
+    eprintln!();
+    eprintln!("{summary}");
 }
 
 /// Options for controlling what data to collect.
@@ -656,17 +660,57 @@ fn format_stall_footer(
     first_name: &str,
 ) -> String {
     let dim = Style::new().dimmed();
-    let kind_str: &'static str = first_kind.into();
+    let kind_name = first_kind.display_name();
     let waiting_clause = if pending_count == 1 {
-        cformat!("waiting on <underline>{kind_str}</> for <underline>{first_name}</>")
+        cformat!("waiting on <underline>{kind_name}</> for <underline>{first_name}</>")
     } else {
         cformat!(
-            "waiting on {pending_count} tasks, including <underline>{kind_str}</> for <underline>{first_name}</>"
+            "waiting on {pending_count} tasks, including <underline>{kind_name}</> for <underline>{first_name}</>"
         )
     };
     cformat!(
         "{INFO_SYMBOL} {dim}{footer_base} ({completed}/{total} loaded, no recent progress; {waiting_clause}){dim:#}"
     )
+}
+
+/// Caps on the message shown per failed task: at most `MAX_LINES` lines,
+/// each at most `MAX_COLS` columns. Real git errors fit well under both
+/// (the index.lock guidance is ~7 short lines); the caps exist so a
+/// crashing task command (an LLM summary tool dumping a stack trace, or
+/// one enormous line of output) can't flood the warning block. The `-vv`
+/// diagnostic hint that follows the warning is the route to full output.
+const TASK_FAILURE_MESSAGE_MAX_LINES: usize = 12;
+const TASK_FAILURE_MESSAGE_MAX_COLS: usize = 500;
+
+/// Render one entry of the task-failure warning: `branch: task-name`,
+/// with a single-line message inline in parens and a multi-line message
+/// indented underneath — git's recovery guidance (e.g. the index.lock
+/// "remove the file manually" paragraph) must survive display. The
+/// caller joins entries and wraps them in one gutter block.
+fn format_task_failure(name: &str, kind: TaskKind, message: &str) -> String {
+    let mut rendered = cformat!("<bold>{}</>: {}", name, kind.display_name());
+    let message = message.trim();
+    let line_count = message.lines().count();
+    if line_count > 1 {
+        for line in message.lines().take(TASK_FAILURE_MESSAGE_MAX_LINES) {
+            let line = truncate_visible(line.trim_end(), TASK_FAILURE_MESSAGE_MAX_COLS);
+            rendered.push('\n');
+            if !line.is_empty() {
+                rendered.push_str("  ");
+                rendered.push_str(&line);
+            }
+        }
+        if line_count > TASK_FAILURE_MESSAGE_MAX_LINES {
+            let extra = line_count - TASK_FAILURE_MESSAGE_MAX_LINES;
+            let plural = if extra == 1 { "" } else { "s" };
+            rendered.push('\n');
+            rendered.push_str(&format!("  … ({extra} more line{plural})"));
+        }
+    } else if !message.is_empty() {
+        let message = truncate_visible(message, TASK_FAILURE_MESSAGE_MAX_COLS);
+        rendered.push_str(&format!(" ({message})"));
+    }
+    rendered
 }
 
 /// Emit the drain-timeout warning + hint when the default 120s
@@ -718,8 +762,11 @@ fn format_drain_timeout_diag(
             .iter()
             .take(MAX_SHOWN)
             .map(|result| {
-                let missing_names: Vec<&str> =
-                    result.missing_kinds.iter().map(|k| k.into()).collect();
+                let missing_names: Vec<&str> = result
+                    .missing_kinds
+                    .iter()
+                    .map(|k| k.display_name())
+                    .collect();
                 cformat!("<bold>{}</>: {}", result.name, missing_names.join(", "))
             })
             .collect();
@@ -1940,8 +1987,6 @@ pub fn collect(
         item.refresh_status_symbols(primary_target);
     }
 
-    // Count errors for summary
-    let error_count = errors.len();
     let timed_out_count = errors.iter().filter(|e| e.is_timeout()).count();
 
     let table_render = render_table.then(|| TableRenderPlan {
@@ -1955,7 +2000,6 @@ pub fn collect(
             &all_items,
             show_branches || show_remotes,
             layout.hidden_column_count,
-            error_count,
             timed_out_count,
         ),
     });
@@ -1983,14 +2027,13 @@ pub fn collect(
                 .iter()
                 .map(|error| {
                     let name = all_items[error.item_idx].branch_name();
-                    let kind_str: &'static str = error.kind.into();
-                    // Take first line only - git errors can be multi-line with usage hints
-                    let msg = error.message.lines().next().unwrap_or(&error.message);
-                    cformat!("<bold>{}</>: {} ({})", name, kind_str, msg)
+                    format_task_failure(name, error.kind, &error.message)
                 })
                 .collect();
+            let count = sorted_errors.len();
+            let plural = if count == 1 { "" } else { "s" };
             warning_parts.push(format!(
-                "Some git operations failed:\n{}",
+                "{count} task{plural} failed:\n{}",
                 format_with_gutter(&error_lines.join("\n"), None)
             ));
         }
@@ -2328,6 +2371,7 @@ pub fn populate_item(
 mod tests {
     use super::*;
     use ansi_str::AnsiStr;
+    use insta::assert_snapshot;
 
     #[test]
     fn test_collect_pool_num_threads_honors_env() {
@@ -2341,9 +2385,9 @@ mod tests {
     fn test_format_stall_footer_single_pending() {
         let rendered =
             format_stall_footer("Showing 3 worktrees", 5, 12, 1, TaskKind::CiStatus, "feat");
-        insta::assert_snapshot!(
+        assert_snapshot!(
             rendered.ansi_strip(),
-            @"○ Showing 3 worktrees (5/12 loaded, no recent progress; waiting on ci-status for feat)"
+            @"○ Showing 3 worktrees (5/12 loaded, no recent progress; waiting on CI status for feat)"
         );
     }
 
@@ -2351,9 +2395,98 @@ mod tests {
     fn test_format_stall_footer_many_pending() {
         let rendered =
             format_stall_footer("Showing 3 worktrees", 5, 12, 3, TaskKind::CiStatus, "feat");
-        insta::assert_snapshot!(
+        assert_snapshot!(
             rendered.ansi_strip(),
-            @"○ Showing 3 worktrees (5/12 loaded, no recent progress; waiting on 3 tasks, including ci-status for feat)"
+            @"○ Showing 3 worktrees (5/12 loaded, no recent progress; waiting on 3 tasks, including CI status for feat)"
+        );
+    }
+
+    /// The multi-line git failure the display must preserve: recovery
+    /// guidance follows a blank line.
+    const INDEX_LOCK_MESSAGE: &str = r"fatal: Unable to create '/repo/.git/index.lock': File exists.
+
+Another git process seems to be running in this repository, e.g.
+an editor opened by 'git commit'. Please make sure all processes
+are terminated then try again. If it still fails, a git process
+may have crashed in this repository earlier:
+remove the file manually to continue.";
+
+    /// Single-line git errors stay inline; multi-line ones keep every line
+    /// (git's recovery guidance) indented under the label, capped at
+    /// `TASK_FAILURE_MESSAGE_MAX_LINES`.
+    #[test]
+    fn test_format_task_failure() {
+        assert_snapshot!(
+            format_task_failure("plugins", TaskKind::WorkingTreeDiff, "fatal: bad object HEAD")
+                .ansi_strip(),
+            @"plugins: working-tree diff (fatal: bad object HEAD)"
+        );
+        assert_snapshot!(
+            format_task_failure("plugins", TaskKind::WorkingTreeConflicts, INDEX_LOCK_MESSAGE)
+                .ansi_strip(),
+            @r"
+        plugins: working-tree conflict check
+          fatal: Unable to create '/repo/.git/index.lock': File exists.
+
+          Another git process seems to be running in this repository, e.g.
+          an editor opened by 'git commit'. Please make sure all processes
+          are terminated then try again. If it still fails, a git process
+          may have crashed in this repository earlier:
+          remove the file manually to continue.
+        "
+        );
+        assert_snapshot!(
+            format_task_failure("plugins", TaskKind::CiStatus, "").ansi_strip(),
+            @"plugins: CI status"
+        );
+        // A crashing task command (e.g. an LLM summary tool's stack trace)
+        // is capped rather than flooding the warning block.
+        let trace = (0..30)
+            .map(|i| format!("at frame {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_snapshot!(
+            format_task_failure("plugins", TaskKind::SummaryGenerate, &trace).ansi_strip(),
+            @r"
+        plugins: summary generation
+          at frame 0
+          at frame 1
+          at frame 2
+          at frame 3
+          at frame 4
+          at frame 5
+          at frame 6
+          at frame 7
+          at frame 8
+          at frame 9
+          at frame 10
+          at frame 11
+          … (18 more lines)
+        "
+        );
+        // Whitespace-only interior lines render empty, not as trailing spaces.
+        let padded = format_task_failure("plugins", TaskKind::BranchDiff, "a\n   \nb");
+        assert!(
+            padded.lines().all(|line| line == line.trim_end()),
+            "{padded:?}"
+        );
+        // Exactly one line over the cap pluralizes the elision marker.
+        let thirteen = (0..13)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let capped = format_task_failure("plugins", TaskKind::CiStatus, &thirteen);
+        let capped = capped.ansi_strip();
+        assert!(capped.ends_with("… (1 more line)"), "{capped:?}");
+        // One enormous line with no newlines is bounded too — the inline
+        // form truncates rather than word-wrapping across dozens of rows.
+        let monster = format_task_failure("plugins", TaskKind::CiStatus, &"x".repeat(2_000));
+        let monster = monster.ansi_strip();
+        assert!(monster.ends_with("…)"), "{monster:?}");
+        assert!(
+            monster.len() <= TASK_FAILURE_MESSAGE_MAX_COLS + "plugins: CI status ()…".len(),
+            "len={}",
+            monster.len()
         );
     }
 
@@ -2362,7 +2495,7 @@ mod tests {
     #[test]
     fn test_format_drain_timeout_diag_no_items() {
         let rendered = format_drain_timeout_diag(7, &[]);
-        insta::assert_snapshot!(
+        assert_snapshot!(
             rendered.ansi_strip(),
             @"Listing worktrees timed out after 120s (7 results received)"
         );
@@ -2446,12 +2579,12 @@ mod tests {
             },
         ];
         let rendered = format_drain_timeout_diag(3, &items);
-        insta::assert_snapshot!(
+        assert_snapshot!(
             rendered.ansi_strip(),
-            @r"
+            @"
         Listing worktrees timed out after 120s (3 results received); blocked tasks:
-          feature-a: ci-status, branch-diff
-          feature-b: ahead-behind
+          feature-a: CI status, branch diff
+          feature-b: ahead/behind counts
         "
         );
     }
@@ -2468,15 +2601,15 @@ mod tests {
             })
             .collect();
         let rendered = format_drain_timeout_diag(2, &items);
-        insta::assert_snapshot!(
+        assert_snapshot!(
             rendered.ansi_strip(),
-            @r"
+            @"
         Listing worktrees timed out after 120s (2 results received); blocked tasks:
-          feature-0: ahead-behind
-          feature-1: ahead-behind
-          feature-2: ahead-behind
-          feature-3: ahead-behind
-          feature-4: ahead-behind
+          feature-0: ahead/behind counts
+          feature-1: ahead/behind counts
+          feature-2: ahead/behind counts
+          feature-3: ahead/behind counts
+          feature-4: ahead/behind counts
           … and 3 more
         "
         );

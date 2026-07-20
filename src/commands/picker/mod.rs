@@ -337,7 +337,6 @@ impl AltXRemover {
         let caller_path = repo.current_worktree().root().ok();
 
         let result = {
-            let config = repo.user_config();
             let remove_target = match target {
                 PickerRemovalTarget::WorktreePath(path) => RemoveTarget::Path(path),
                 PickerRemovalTarget::Branch(branch) => RemoveTarget::Branch(branch),
@@ -346,7 +345,6 @@ impl AltXRemover {
                 remove_target,
                 BranchDeletionMode::SafeDelete,
                 false,
-                config,
                 caller_path,
                 None,
                 None,
@@ -1280,6 +1278,13 @@ impl CommandCollector for PickerCollector {
         // drop and skim's reload sees EOF. The returned handler and join handles
         // are kept alive by those threads, so let them drop here. On a spawn
         // failure we fall through and re-stream the current items unchanged.
+        // If the failure hit after `PreviewOrchestrator::refresh` ran (a
+        // thread-spawn error — resource-exhaustion territory), those rows'
+        // tokens are already superseded against a cleared cache, so their
+        // previews sit on placeholders until the next successful refresh.
+        // Accepted: un-bumping the generation would instead break a
+        // partially-started spawn's live producers (the collect thread can
+        // already be running when the `--prs` thread spawn is what failed).
         //
         // `alt-x` removal does NOT route here — it runs synchronously through
         // [`AltXRemover`] / [`resync_pool`] instead of a `reload`, so `refresh` is
@@ -1361,12 +1366,6 @@ struct PipelineFactory {
     repo: Repository,
     render_tx: Arc<OnceLock<tokio::sync::mpsc::Sender<Event>>>,
     shared_items: Arc<Mutex<Vec<Arc<dyn SkimItem>>>>,
-    /// Monotonic spawn counter. Each [`spawn`](Self::spawn) bumps it and hands
-    /// the value to that spawn's `--prs` thread, which appends its PR/MR rows to
-    /// `shared_items` only while the counter still matches — so a stale forge call
-    /// from a pre-refresh spawn can't pollute the list a later spawn rebuilt. See
-    /// [`prs::PrsShared`].
-    prs_epoch: Arc<AtomicUsize>,
     shortcut_table: ShortcutTable,
     preview_cache: PreviewCache,
     orchestrator: Arc<PreviewOrchestrator>,
@@ -1410,7 +1409,9 @@ impl PipelineFactory {
     /// relies on to end its `reload`.
     /// `rebuild_repo` controls the worktree/branch inventory source. A refresh
     /// (`alt-r`) passes `true` to rebuild a fresh `Repository`, re-enumerating
-    /// after an in-picker removal, and to clear the in-memory preview cache so
+    /// after an in-picker removal, and to run `PreviewOrchestrator::refresh` —
+    /// which supersedes the prior spawn's preview producers, rebinds preview
+    /// compute to the fresh repo, and clears the in-memory preview cache so
     /// previews recompute (see the `spawn_repo` binding, and the
     /// `preview_orchestrator` spec for what a refresh does and doesn't refresh).
     /// The initial spawn passes `false` to reuse the startup repo, whose cache
@@ -1448,22 +1449,26 @@ impl PipelineFactory {
             // The in-memory preview cache is keyed by `(branch, mode)` with no
             // SHA — the working-tree diff has no stable hash to key on — so a
             // warm entry outlives the branch's commits or working tree moving
-            // and would re-serve a stale diff / log / summary. Dropping it lets
-            // each rebuilt row recompute against its current `item.head()` from
-            // the rebuilt inventory; the on-disk caches (SHA-keyed for log /
-            // branch-diff / upstream, diff-hash-keyed for the summary) make an
-            // unchanged branch a cheap re-read, so only genuinely changed content
-            // pays a recompute. The `pr` / `comments` tabs already self-invalidate
-            // on the CI path; clearing them here too just means a refresh also
-            // re-fetches their forge data. Precompute still runs against the
-            // orchestrator's startup repo, so a moved default-branch base isn't
-            // picked up and a narrow stale-fill race remains — see the
-            // `preview_orchestrator` module spec ("Refresh") for both.
-            self.preview_cache.clear();
-            Repository::at(self.repo.discovery_path())?
+            // and would re-serve a stale diff / log / summary. `refresh`
+            // supersedes the prior spawn's still-in-flight producers, rebinds
+            // preview compute to this fresh repo, and clears the cache, so
+            // each rebuilt row recomputes against its current `item.head()`
+            // from the rebuilt inventory; the on-disk caches (SHA-keyed for
+            // log / branch-diff / upstream, diff-hash-keyed for the summary)
+            // make an unchanged branch a cheap re-read, so only genuinely
+            // changed content pays a recompute. The `pr` / `comments` tabs
+            // already self-invalidate on the CI path; clearing them here too
+            // just means a refresh also re-fetches their forge data. See the
+            // `preview_orchestrator` module spec ("Spawn generations").
+            let repo = Repository::at(self.repo.discovery_path())?;
+            self.orchestrator.refresh(repo.clone());
+            repo
         } else {
             self.repo.clone()
         };
+        // This spawn's identity token, carried by everything the spawn
+        // starts and superseded by the next refresh (see `SpawnGeneration`).
+        let spawn_gen = self.orchestrator.generation();
 
         // The skeleton→`--prs` handoff (column geometry + the branches already
         // shown for dedup). Fresh per spawn so an alt-r reload's `--prs` thread
@@ -1488,6 +1493,7 @@ impl PipelineFactory {
                 preview_cache: Arc::clone(&self.preview_cache),
                 repo: spawn_repo.clone(),
                 orchestrator: Arc::clone(&self.orchestrator),
+                spawn_gen: spawn_gen.clone(),
                 preview_dims: self.preview_dims,
                 llm_command: self.llm_command.clone(),
                 summary_hint: self.summary_hint.clone(),
@@ -1534,18 +1540,15 @@ impl PipelineFactory {
             let prs_warnings = Arc::clone(&self.stashed_warnings);
             let prs_orchestrator = Arc::clone(&self.orchestrator);
             let prs_render_tx = Arc::clone(&self.render_tx);
-            // Bump the spawn counter and capture this spawn's value: the `--prs`
-            // thread appends its rows to `shared_items` only while the counter
-            // still matches, so an earlier spawn's still-in-flight forge call
-            // can't add rows to this (or a later) spawn's list. See
-            // `PipelineFactory::prs_epoch` and `prs::PrsShared`.
-            let current_epoch = self.prs_epoch.fetch_add(1, Ordering::SeqCst) + 1;
             let prs_shared = prs::PrsShared {
                 grid_slot: Arc::clone(&grid_slot),
                 shortcut_table: Arc::clone(&self.shortcut_table),
                 shared_items: Arc::clone(&self.shared_items),
-                epoch: Arc::clone(&self.prs_epoch),
-                current_epoch,
+                // This spawn's token: the thread appends its rows (and fans
+                // out per-row fetches) only while it is still current, so an
+                // earlier spawn's still-in-flight forge call can't add rows
+                // to this (or a later) spawn's list. See `prs::PrsShared`.
+                spawn_gen: spawn_gen.clone(),
             };
             let prs_layout = prs::PrsLayout {
                 list_width: self.skim_list_width,
@@ -1702,7 +1705,12 @@ pub fn handle_picker(
         let dims = state
             .initial_layout
             .dimensions_for(term_width, term_height, 0);
-        orchestrator.spawn_preview(Arc::new(item), PreviewMode::WorkingTree, dims);
+        orchestrator.spawn_preview(
+            &orchestrator.generation(),
+            Arc::new(item),
+            PreviewMode::WorkingTree,
+            dims,
+        );
     }
 
     // The picker runs every task — it is `wt list --full` (`ShowConfig::Resolved`
@@ -1855,7 +1863,6 @@ summary = true
         repo: repo.clone(),
         render_tx: Arc::clone(&render_tx),
         shared_items: Arc::clone(&shared_items),
-        prs_epoch: Arc::new(AtomicUsize::new(0)),
         shortcut_table: Arc::clone(&shortcut_table),
         preview_cache: Arc::clone(&preview_cache),
         orchestrator: Arc::clone(&orchestrator),
@@ -2713,7 +2720,6 @@ pub mod tests {
             deletion_mode: BranchDeletionMode::SafeDelete,
             target_branch: Some("main".to_string()),
             force_worktree: false,
-            expected_path: None,
             removed_commit: None,
         };
 
@@ -2808,7 +2814,6 @@ pub mod tests {
             deletion_mode: BranchDeletionMode::SafeDelete,
             target_branch: Some("main".to_string()),
             force_worktree: false,
-            expected_path: None,
             removed_commit: None,
         };
 
@@ -2899,7 +2904,6 @@ pub mod tests {
             deletion_mode: BranchDeletionMode::SafeDelete,
             target_branch: Some("main".to_string()),
             force_worktree: false,
-            expected_path: None,
             removed_commit: None,
         };
 
@@ -2913,6 +2917,7 @@ pub mod tests {
 
     /// Build a `PickerRow` from a snapshot `ListItem`.
     fn picker_item(branch_name: &str, item: ListItem) -> Arc<dyn SkimItem> {
+        let item = Arc::new(item);
         let pr_status = Arc::new(Mutex::new(item.pr_status.clone()));
         let output_token = worktree_output_token(&item, branch_name);
         Arc::new(PickerRow {
@@ -2925,6 +2930,9 @@ pub mod tests {
             pr_status,
             notifier: super::preview_notify::PreviewNotifier::detached(),
             local: Some(LocalCheckout {
+                item,
+                demand: super::preview_orchestrator::PreviewDemand::new(),
+                spawn_gen: super::preview_orchestrator::SpawnGeneration::default(),
                 has_upstream: false,
                 summaries_enabled: false,
                 local_content: Arc::new(Mutex::new(LocalContent::default())),
@@ -2998,6 +3006,9 @@ pub mod tests {
             pr_status: Arc::new(Mutex::new(None)),
             notifier: super::preview_notify::PreviewNotifier::detached(),
             local: Some(LocalCheckout {
+                item: Arc::clone(&item_arc),
+                demand: super::preview_orchestrator::PreviewDemand::new(),
+                spawn_gen: super::preview_orchestrator::SpawnGeneration::default(),
                 has_upstream: false,
                 summaries_enabled: false,
                 local_content: Arc::clone(&local_content),
@@ -3050,7 +3061,6 @@ pub mod tests {
             repo,
             render_tx,
             shared_items: Arc::new(Mutex::new(Vec::new())),
-            prs_epoch: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             shortcut_table: Arc::new(Mutex::new(std::collections::HashMap::new())),
             preview_cache,
             orchestrator,
@@ -3581,7 +3591,6 @@ pub mod tests {
             deletion_mode: BranchDeletionMode::SafeDelete,
             target_branch: Some("main".to_string()),
             force_worktree: false,
-            expected_path: None,
             removed_commit: None,
         };
         assert_eq!(
@@ -3597,7 +3606,6 @@ pub mod tests {
             deletion_mode: BranchDeletionMode::SafeDelete,
             target_branch: Some("main".to_string()),
             force_worktree: false,
-            expected_path: None,
             removed_commit: None,
         };
         assert_eq!(
@@ -3945,7 +3953,6 @@ pub mod tests {
             deletion_mode: mode,
             target_branch: Some("main".to_string()),
             force_worktree: false,
-            expected_path: None,
             removed_commit: None,
         };
 
@@ -4043,7 +4050,6 @@ pub mod tests {
             deletion_mode: BranchDeletionMode::SafeDelete,
             target_branch: Some("main".to_string()),
             force_worktree: false,
-            expected_path: None,
             removed_commit: None,
         };
         assert!(super::removal_target_still_present(
@@ -4102,7 +4108,6 @@ pub mod tests {
             deletion_mode: BranchDeletionMode::SafeDelete,
             target_branch: Some("main".to_string()),
             force_worktree: false,
-            expected_path: None,
             removed_commit: None,
         };
         assert!(
@@ -4148,7 +4153,6 @@ pub mod tests {
             deletion_mode: BranchDeletionMode::SafeDelete,
             target_branch: Some("main".to_string()),
             force_worktree: false,
-            expected_path: None,
             removed_commit: None,
         };
         assert!(

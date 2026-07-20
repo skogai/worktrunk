@@ -1,12 +1,14 @@
 ---
-source: tests/integration_tests/remove.rs
+source: tests/integration_tests/config_show.rs
 info:
   program: wt
   args:
-    - remove
-    - feature
+    - config
+    - update
+    - "--yes"
   env:
     APPDATA: "[TEST_CONFIG_HOME]"
+    CLAUDE_CONFIG_DIR: "[TEST_CLAUDE_CONFIG]"
     CLICOLOR_FORCE: "1"
     COLUMNS: "500"
     GIT_AUTHOR_DATE: "2025-01-01T00:00:00Z"
@@ -46,5 +48,15 @@ exit_code: 0
 ----- stdout -----
 
 ----- stderr -----
-[33m▲[39m [33mBranch-worktree mismatch: [1mfeature[22m @ [1m_PARENT_/weird-path-for-feature[22m, expected @ [1m_REPO_.feature[22m [31m⚑[39m[39m
-[36m◎[39m [36mRemoving [1mfeature[22m worktree & branch in background (same commit as [1mmain[22m,[39m [2m_[22m[36m)[39m
+[33m▲[39m [33mUser config: [1m[list] json-schema[22m is unset; a future release switches the JSON default to schema 2[39m
+[2m○[22m Proposed diff:
+[107m [0m [1mdiff --git a/test-config.toml/current b/test-config.toml/migrated[m
+[107m [0m [1mindex a30ca31..894e11f 100644[m
+[107m [0m [1m--- a/test-config.toml/current[m
+[107m [0m [1m+++ b/test-config.toml/migrated[m
+[107m [0m [36m@@ -1 +1,4 @@[m
+[107m [0m  worktree-path = "../{{ repo }}.{{ branch }}"[m
+[107m [0m [32m+[m
+[107m [0m [32m+[m[32m[list][m
+[107m [0m [32m+[m[32mjson-schema = 2[m
+[32m✓[39m [32mUpdated user config[39m
