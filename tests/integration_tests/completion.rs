@@ -1710,18 +1710,22 @@ fn test_complete_switch_excludes_remote_branches_when_over_threshold(mut repo: T
     repo.commit("initial");
     repo.setup_remote("main");
 
-    // Create 50 local branches
-    for i in 0..50 {
-        repo.run_git(&["branch", &format!("local/branch-{i}")]);
-    }
+    // Only the ref COUNT matters here, so the whole fixture is built in five
+    // git spawns rather than one per branch (was ~230, and every one of them
+    // competes with the rest of the suite running at full core parallelism).
+    let local: Vec<String> = (0..50).map(|i| format!("local/branch-{i}")).collect();
+    let remote: Vec<String> = (0..60).map(|i| format!("remote/branch-{i}")).collect();
+    repo.create_branches(&local);
+    repo.create_branches(&remote);
 
-    // Create 60 remote-only branches (push then delete locally)
-    for i in 0..60 {
-        let name = format!("remote/branch-{i}");
-        repo.run_git(&["branch", &name]);
-        repo.run_git(&["push", "origin", &name]);
-        repo.run_git(&["branch", "-D", &name]);
-    }
+    // Push all 60 in one call, then delete all 60 locally in one call, so
+    // they survive only as remote-tracking refs.
+    let mut push = vec!["push", "origin"];
+    push.extend(remote.iter().map(String::as_str));
+    repo.run_git(&push);
+    let mut delete = vec!["branch", "-D"];
+    delete.extend(remote.iter().map(String::as_str));
+    repo.run_git(&delete);
     repo.run_git(&["fetch", "origin"]);
 
     // Total branches: 1 (main worktree) + 50 local + 60 remote = 111 > 100
@@ -2149,7 +2153,7 @@ fn test_complete_custom_subcommand_listed(repo: TestRepo) {
     // Complete "wt " — should include "testext" from the `wt-testext` binary
     let mut cmd = repo.completion_cmd(&["wt", ""]);
     prepend_path(&mut cmd, ext_dir.path());
-    cmd.env("MOCK_CONFIG_DIR", ext_dir.path());
+    cmd.env("WORKTRUNK_TEST_MOCK_CONFIG_DIR", ext_dir.path());
     let output = cmd.output().unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2172,8 +2176,9 @@ fn test_complete_custom_subcommand_forwards(repo: TestRepo) {
     use std::os::unix::fs::PermissionsExt;
     repo.commit("initial");
 
-    // Create a real shell script that outputs completions (not mock-stub,
-    // which needs MOCK_CONFIG_DIR and doesn't know about COMPLETE env var).
+    // Create a real shell script that outputs completions (not mock-stub, which
+    // needs WORKTRUNK_TEST_MOCK_CONFIG_DIR and doesn't know about COMPLETE env
+    // var).
     let ext_dir = tempfile::tempdir().unwrap();
     let script = ext_dir.path().join("wt-testext");
     std::fs::write(

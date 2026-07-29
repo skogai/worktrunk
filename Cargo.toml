@@ -50,7 +50,7 @@ filterset = "test(/readme_sync/)"
 
 [package]
 name = "worktrunk"
-version = "0.67.0"
+version = "0.70.0"
 edition = "2024"
 rust-version = "1.95"
 build = "build.rs"
@@ -105,8 +105,8 @@ syntax-highlighting = ["dep:tree-sitter", "dep:tree-sitter-bash", "dep:tree-sitt
 # See CLAUDE.md "Nextest Terminal Suspension" section for details.
 shell-integration-tests = []
 # Enable benchmarks whose fixture is too large for hosted CI: the rust-scale
-# prune fixture (~15 GiB of rust-lang/rust worktrees, cached in
-# target/bench-repos/). The daily benchmarks workflow runs plain `cargo bench`
+# prune fixture (~15 GiB of rust-lang/rust worktrees, cached under
+# target/wt-perf/bench-repos). The daily benchmarks workflow runs plain `cargo bench`
 # and must never build it; opt in locally with
 # `cargo bench --bench prune --features real-repo-benches`.
 real-repo-benches = []
@@ -146,6 +146,13 @@ test = false
 name = "integration"
 path = "tests/integration.rs"
 required-features = ["cli", "syntax-highlighting"]
+
+# Deliberately a second binary rather than another module under `integration`:
+# it latches process-wide cancellation state, which would take out any test
+# running beside it in the same process. See the file's module docs.
+[[test]]
+name = "cancel_background"
+path = "tests/cancel_background.rs"
 
 [dependencies]
 anyhow = "1.0.102"
@@ -279,7 +286,14 @@ wait-timeout = "0.2"
 # API, and earlier 4.x compile against an incompatible ratatui (`-Z
 # minimal-versions` otherwise resolves skim 4.6 against ratatui 0.30.1 and fails
 # to build).
-skim = { version = "5.0", optional = true, default-features = false, features = ["frizbee"] }
+# skim 5.3.1 (bumped in #3526) regressed the picker on the legacy Windows
+# console — every picker PTY test failed with "Keyboard progressive enhancement
+# not implemented for the legacy Windows API", reddening the Windows test job,
+# so the pin held at the last-Windows-green 5.1.0. 5.5.0 guards that path ("Do
+# not panic on push/pop keyboard enhancement flags failure") and is
+# Windows-green again. Kept as an exact pin; it can relax to a range now that
+# the keyboard-enhancement path no longer regresses the legacy console.
+skim = { version = "=5.5.0", optional = true, default-features = false, features = ["frizbee"] }
 # Pinned to skim's ratatui line so the `Line` type `display()` returns is the
 # same one skim consumes. `ansi-to-tui` parses ANSI SGR codes into ratatui spans.
 # Floor is 0.30.1: 0.30.0 is a broken release (its `#[instability::unstable]`

@@ -4,7 +4,6 @@
 //! full switch sequence (bare-repo fix-up, hooks, approval, execution, output)
 //! shared by the `wt switch` argument path and the interactive picker.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::display::format_relative_time_short;
@@ -14,7 +13,8 @@ use dunce::canonicalize;
 use serde::Serialize;
 use worktrunk::HookType;
 use worktrunk::config::{
-    UserConfig, ValidationScope, expand_template, template_references_var, validate_template,
+    UserConfig, ValidationScope, VarScope, referenced_vars_for_templates, template_references_var,
+    validate_template,
 };
 use worktrunk::git::remote_ref::{
     self, AzureDevOpsProvider, GitHubProvider, GitLabProvider, GiteaProvider, RemoteRefInfo,
@@ -507,6 +507,13 @@ fn resolve_base_ref(
         if remotes.len() == 1 {
             return Ok((format!("{}/{}", remotes[0], resolved), None));
         }
+        // Neither a ref nor a branch on a remote: the base may be named by the
+        // path of the worktree it is checked out in, as targets elsewhere are.
+        if resolved == base
+            && let Some((_, Some(branch))) = repo.worktree_at_input_path(base)?
+        {
+            return Ok((branch, None));
+        }
     }
 
     Ok((resolved, None))
@@ -851,29 +858,21 @@ fn plan_switch(
         None => {}
     }
 
-    // Phase 2b: Path-based fallback for detached worktrees.
-    // If the argument looks like a path (not a branch name), try to find a worktree there.
-    if !create {
-        let candidate = Path::new(branch);
-        let abs_path = if candidate.is_absolute() {
-            Some(candidate.to_path_buf())
-        } else if candidate.components().count() > 1 {
-            // Relative path with directory separators (e.g., "../repo.feature").
-            // Single-component names are ambiguous with branch names (already tried in Phase 2).
-            std::env::current_dir().ok().map(|cwd| cwd.join(candidate))
-        } else {
-            None
-        };
-        if let Some(abs_path) = abs_path
-            && let Some((path, wt_branch)) = repo.worktree_at_path(&abs_path)?
-        {
-            let canonical = canonicalize(&path).unwrap_or_else(|_| path.clone());
-            return Ok(SwitchPlan::Existing {
-                path: canonical,
-                branch: wt_branch,
-                new_previous,
-            });
-        }
+    // Phase 2b: the argument as the worktree's own path — the way to name a
+    // detached worktree, which has no branch. Not under `--create`, where the
+    // argument is the name of a branch that does not exist yet, and not when
+    // Phase 1 rewrote the argument (a shortcut, `pr:`/`mr:`, a stripped remote
+    // prefix), which is exactly when the literal token would be a nonsense path.
+    if !create
+        && target.branch == branch
+        && let Some((path, wt_branch)) = repo.worktree_at_input_path(branch)?
+    {
+        let canonical = canonicalize(&path).unwrap_or_else(|_| path.clone());
+        return Ok(SwitchPlan::Existing {
+            path: canonical,
+            branch: wt_branch,
+            new_previous,
+        });
     }
 
     // Phase 3: Compute expected path (only needed for create)
@@ -1481,6 +1480,14 @@ fn spawn_switch_background_hooks(
     hooks_display_path: Option<&Path>,
     hook_plan: &ApprovedHookPlan,
 ) -> anyhow::Result<()> {
+    // The common case (no project hooks configured): nothing to render or
+    // announce, so skip building the destination-rooted `Repository` — it
+    // would only be discarded by `HookAnnouncer::flush`'s own no-op-when-empty
+    // check below.
+    if hook_plan.is_empty() {
+        return Ok(());
+    }
+
     // Background hooks run in the new/destination worktree. `hook_repo` roots
     // the *render* context there; the command set is the frozen `hook_plan`
     // (selected at the gate from the invoking worktree's config), so no
@@ -1745,11 +1752,24 @@ impl SwitchPipeline<'_> {
                 result.path(),
                 yes,
             );
-            let template_vars = build_hook_context(&ctx, &extra_vars, None)?;
-            let vars: HashMap<&str, &str> = template_vars
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.as_str()))
-                .collect();
+            // Compute only the vars the command actually names. The map is
+            // consumed by `expand_template` and nothing else — the child
+            // receives a shell string through the EXEC directive file (or
+            // `sh -c`), never the context as JSON on stdin, and `--execute`
+            // renders no `-v` variables table. So a var the templates don't
+            // reference is a git subprocess whose result is thrown away.
+            //
+            // The union is complete: `validate_switch_templates` already
+            // parsed both positions against `ValidationScope::SwitchExecute`
+            // before the switch ran, so nothing reaching here is unparsable.
+            // No `alias_context_filter` — `args` is alias scope only, and
+            // `branch` (the implicit read behind `{{ vars.X }}`) is in
+            // `build_hook_context`'s unconditional cheap block.
+            let referenced = referenced_vars_for_templates(
+                std::iter::once(cmd).chain(execute_args.iter().map(String::as_str)),
+            );
+            let template_vars =
+                build_hook_context(&ctx, &extra_vars, VarScope::Referenced(&referenced))?;
 
             // The `--execute` payload is parsed by the active directive shell:
             // the PowerShell wrapper `Invoke-Expression`s the EXEC directive
@@ -1760,7 +1780,7 @@ impl SwitchPipeline<'_> {
             let escape_mode = directive_shell_escape_mode();
 
             // Expand template variables in command, escaped for the directive shell.
-            let expanded_cmd = expand_template(cmd, &vars, escape_mode, repo, "--execute command")?;
+            let expanded_cmd = template_vars.expand(cmd, escape_mode, repo, "--execute command")?;
 
             // Append any trailing args (after --) to the execute command.
             // Each arg is template-expanded literally, then escaped for the
@@ -1771,9 +1791,8 @@ impl SwitchPipeline<'_> {
                 let expanded_args: Result<Vec<_>, _> = execute_args
                     .iter()
                     .map(|arg| {
-                        expand_template(
+                        template_vars.expand(
                             arg,
-                            &vars,
                             ShellEscapeMode::Literal,
                             repo,
                             "--execute argument",
@@ -2059,7 +2078,7 @@ fn validate_switch_templates(
                     // Skip full validation for templates referencing {{ vars.X }} —
                     // those values come from git config at execution time, after
                     // prior pipeline steps set them. Syntax is still checked by
-                    // prepare_steps.
+                    // PreparedPipeline::validated.
                     if template_references_var(&cmd.template, "vars") {
                         continue;
                     }

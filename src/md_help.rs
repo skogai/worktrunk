@@ -494,12 +494,11 @@ fn colorize_status_symbols(text: &str) -> String {
     result = replace_dim(result, "✘", error);
 
     // Git operations, MergeTreeConflicts: WARNING (yellow)
-    result = replace_dim(result, "⤴", warning);
-    result = replace_dim(result, "⤵", warning);
+    result = replace_dim(result, "↻", warning);
     result = replace_dim(result, "✗", warning);
 
-    // Worktree state: BranchWorktreeMismatch (red), Prunable/Locked (yellow)
-    result = replace_dim(result, "⚑", error);
+    // Worktree state: Prunable/Locked (yellow), the irregular-mapping flag
+    // (dim yellow)
     result = replace_dim(result, "⊟", warning);
     result = replace_dim(result, "⊞", warning);
 
@@ -792,8 +791,8 @@ mod tests {
         assert_snapshot!(conflicts, @"[31m✘[0m conflicts");
 
         // Git operations → yellow
-        let git_ops = colorize_status_symbols(&format!("{dim}⤴{dim:#} rebase"));
-        assert_snapshot!(git_ops, @"[33m⤴[0m rebase");
+        let git_ops = colorize_status_symbols(&format!("{dim}↻{dim:#} rebase"));
+        assert_snapshot!(git_ops, @"[33m↻[0m rebase");
 
         // CI legend samples: dimmed `#` + color name recolors the sample
         let ci_passed = colorize_status_symbols(&format!("{dim}#{dim:#} green"));
