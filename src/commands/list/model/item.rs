@@ -236,6 +236,14 @@ pub struct ListItem {
     /// to abbreviate (the `git log` batch in `collect()` emits `%h` for every
     /// row, including prunable worktrees). Empty for null OIDs (unborn
     /// branches) or when the batch failed for this row.
+    ///
+    /// The only abbreviation of `head` anywhere: the Commit cell, a detached
+    /// row's Branch cell ([`Self::display_name`]), the statusline, and
+    /// `--format=json` all render this one string, so a commit reads the same
+    /// length wherever it appears. `collect()` folds it in *before* the
+    /// skeleton — the batch that carries it already gates the skeleton for
+    /// `%ct` — so those cells paint with the skeleton rather than filling in
+    /// late, and the Commit/Branch columns size to the width git chose.
     pub short_sha: String,
     /// Branch name - None for detached worktrees
     pub branch: Option<String>,
@@ -409,9 +417,13 @@ impl ListItem {
     }
 
     /// Short display name for this item — the branch if present, otherwise
-    /// the short SHA. Use when reporting which item is pending, stuck, or
+    /// [`Self::short_sha`]. Use when reporting which item is pending, stuck, or
     /// missing: `branch_name()`'s `"(detached)"` fallback collapses distinct
     /// detached items into one label.
+    ///
+    /// Also the Branch cell's text: a detached worktree has no name to put
+    /// there, so the column shows this instead (styled `DETACHED`, since a SHA
+    /// is a legal branch name too).
     pub fn display_name(&self) -> &str {
         self.branch.as_deref().unwrap_or(&self.short_sha)
     }
@@ -504,9 +516,12 @@ impl ListItem {
 
         let mut segments = Vec::new();
 
-        // 1. Branch name (priority 1)
+        // 1. Branch name (priority 1) — `display_name`, so the prompt names a
+        // detached worktree the way its `wt list` row does: the abbreviated
+        // HEAD, which also tells two detached worktrees apart where the
+        // `"(detached)"` label collapses them.
         segments.push(StatuslineSegment::from_column(
-            self.branch_name().to_string(),
+            self.display_name().to_string(),
             ColumnKind::Branch,
         ));
 
@@ -910,6 +925,21 @@ mod tests {
         let mut item = ListItem::new_branch("abc123".to_string(), "feature".to_string());
         item.branch = None; // Simulate detached
         assert_eq!(item.branch_name(), "(detached)");
+    }
+
+    /// The Branch cell of a detached row renders `display_name`, and the Commit
+    /// cell of every row renders `short_sha` — the same string, at the length
+    /// git chose, so the row that shows both agrees with itself and with
+    /// `--format=json`.
+    #[test]
+    fn test_list_item_display_name_falls_back_to_short_sha() {
+        let head = "abc123def456abc123def456abc123def456abcd";
+        let mut item = ListItem::new_branch(head.to_string(), "feature".to_string());
+        item.short_sha = "abc123d".to_string();
+        assert_eq!(item.display_name(), "feature");
+
+        item.branch = None; // Simulate detached
+        assert_eq!(item.display_name(), "abc123d");
     }
 
     #[test]

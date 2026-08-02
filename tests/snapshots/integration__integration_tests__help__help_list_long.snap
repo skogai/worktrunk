@@ -9,6 +9,13 @@ info:
     CLICOLOR_FORCE: "1"
     COLUMNS: "500"
     GIT_ALLOW_PROTOCOL: file
+    GIT_CONFIG_COUNT: "2"
+    GIT_CONFIG_GLOBAL: /nonexistent/wt/gitconfig
+    GIT_CONFIG_KEY_0: user.useConfigOnly
+    GIT_CONFIG_KEY_1: rerere.enabled
+    GIT_CONFIG_SYSTEM: /nonexistent/wt/gitconfig
+    GIT_CONFIG_VALUE_0: "true"
+    GIT_CONFIG_VALUE_1: "false"
     LANG: C
     LC_ALL: C
     LLVM_PROFILE_FILE: "[LLVM_PROFILE_FILE]"
@@ -95,35 +102,35 @@ The table renders progressively: branch names, paths, and commit hashes appear i
 List all worktrees:
 
 [107m [0m [2m[0m[2m[34mwt[0m[2m list[0m
-[107m [0m [2m  [0m[2m[34mBranch[0m[2m       Status        HEAD±    main↕     main…±  Remote⇅  Commit    Age   Message[0m
-[107m [0m [2m[0m[2m[34m@[0m[2m feature-api  +   ↕⇡     +54   [0m[2m[36m-5[0m[2m   ↑4  ↓1  +234  [0m[2m[36m-24[0m[2m   ⇡3      6814f02a  30m   Add API tests[0m
-[107m [0m [2m[0m[2m[34m^[0m[2m main             ^⇅                                    ⇡1  ⇣1  41ee0834  4d    Merge fix-auth:…[0m
-[107m [0m [2m[0m[2m[34m+[0m[2m fix-auth         ↕[0m[2m[36m|[0m[2m                [0m[2m[34m↑2[0m[2m  ↓1   +25  [0m[2m[36m-11[0m[2m     [0m[2m[36m|[0m[2m     [0m[2m[34mb772e68b[0m[2m  5h    Add secure token…[0m
-[107m [0m [2m+ fix-typos        _[0m[2m[36m|[0m[2m                                      [0m[2m[36m|[0m[2m     [0m[2m[34m41ee0834[0m[2m  4d    Merge fix-auth:…[0m
+[107m [0m [2m  [0m[2m[34mBranch[0m[2m       Status        HEAD±    main↕     main…±  Remote⇅  Commit   Age   Message[0m
+[107m [0m [2m[0m[2m[34m@[0m[2m feature-api  +   ↕⇡     +54   [0m[2m[36m-5[0m[2m   ↑4  ↓1  +234  [0m[2m[36m-24[0m[2m   ⇡3      6814f02  30m   Add API tests[0m
+[107m [0m [2m[0m[2m[34m^[0m[2m main             ^⇅                                    ⇡1  ⇣1  41ee083  4d    Merge fix-auth: h…[0m
+[107m [0m [2m[0m[2m[34m+[0m[2m fix-auth         ↕[0m[2m[36m|[0m[2m                [0m[2m[34m↑2[0m[2m  ↓1   +25  [0m[2m[36m-11[0m[2m     [0m[2m[36m|[0m[2m     [0m[2m[34mb772e68[0m[2m  5h    Add secure token…[0m
+[107m [0m [2m+ fix-typos        _[0m[2m[36m|[0m[2m                                      [0m[2m[36m|[0m[2m     [0m[2m[34m41ee083[0m[2m  4d    Merge fix-auth: h…[0m
 [107m [0m [0m
 [107m [0m [2m○ Showing 4 worktrees, 1 with changes, 2 ahead, 1 column hidden[0m
 
 Include CI status and LLM summaries:
 
 [107m [0m [2m[0m[2m[34mwt[0m[2m list [0m[2m[36m--full[0m
-[107m [0m [2m  [0m[2m[34mBranch[0m[2m       Status        HEAD±    main↕     main…±  Summary                                                Remote⇅  CI    Commit[0m
-[107m [0m [2m[0m[2m[34m@[0m[2m feature-api  +   ↕⇡     +54   [0m[2m[36m-5[0m[2m   ↑4  ↓1  +234  [0m[2m[36m-24[0m[2m  Refactor API to REST architecture with middleware       ⇡3      #412  6814f02a[0m
-[107m [0m [2m[0m[2m[34m^[0m[2m main             ^⇅                                                                                           ⇡1  ⇣1  #     41ee0834[0m
-[107m [0m [2m[0m[2m[34m+[0m[2m fix-auth         ↕[0m[2m[36m|[0m[2m                [0m[2m[34m↑2[0m[2m  ↓1   +25  [0m[2m[36m-11[0m[2m  Harden auth with constant-time token validation           [0m[2m[36m|[0m[2m     #408  b772e68b[0m
-[107m [0m [2m[0m[2m[34m+[0m[2m fix-typos        _[0m[2m[36m|[0m[2m                                                                                             [0m[2m[36m|[0m[2m     #410  41ee0834[0m
+[107m [0m [2m  [0m[2m[34mBranch[0m[2m       Status        HEAD±    main↕     main…±  Summary                                                 Remote⇅  CI    Commit[0m
+[107m [0m [2m[0m[2m[34m@[0m[2m feature-api  +   ↕⇡     +54   [0m[2m[36m-5[0m[2m   ↑4  ↓1  +234  [0m[2m[36m-24[0m[2m  Refactor API to REST architecture with middleware        ⇡3      #412  6814f02[0m
+[107m [0m [2m[0m[2m[34m^[0m[2m main             ^⇅                                                                                            ⇡1  ⇣1  #     41ee083[0m
+[107m [0m [2m[0m[2m[34m+[0m[2m fix-auth         ↕[0m[2m[36m|[0m[2m                [0m[2m[34m↑2[0m[2m  ↓1   +25  [0m[2m[36m-11[0m[2m  Harden auth with constant-time token validation            [0m[2m[36m|[0m[2m     #408  b772e68[0m
+[107m [0m [2m[0m[2m[34m+[0m[2m fix-typos        _[0m[2m[36m|[0m[2m                                                                                              [0m[2m[36m|[0m[2m     #410  41ee083[0m
 [107m [0m [0m
 [107m [0m [2m[0m[2m[34m○[0m[2m Showing 4 worktrees, 1 with changes, 2 ahead, 3 columns hidden[0m
 
 Include branches that don't have worktrees:
 
 [107m [0m [2m[0m[2m[34mwt[0m[2m list [0m[2m[36m--branches[0m[2m [0m[2m[36m--full[0m
-[107m [0m [2m  [0m[2m[34mBranch[0m[2m       Status        HEAD±    main↕     main…±  Summary                                                Remote⇅  CI    Commit[0m
-[107m [0m [2m[0m[2m[34m@[0m[2m feature-api  +   ↕⇡     +54   [0m[2m[36m-5[0m[2m   ↑4  ↓1  +234  [0m[2m[36m-24[0m[2m  Refactor API to REST architecture with middleware       ⇡3      #412  6814f02a[0m
-[107m [0m [2m[0m[2m[34m^[0m[2m main             ^⇅                                                                                           ⇡1  ⇣1  #     41ee0834[0m
-[107m [0m [2m[0m[2m[34m+[0m[2m fix-auth         ↕[0m[2m[36m|[0m[2m                [0m[2m[34m↑2[0m[2m  ↓1   +25  [0m[2m[36m-11[0m[2m  Harden auth with constant-time token validation           [0m[2m[36m|[0m[2m     #408  b772e68b[0m
-[107m [0m [2m[0m[2m[34m+[0m[2m fix-typos        _[0m[2m[36m|[0m[2m                                                                                             [0m[2m[36m|[0m[2m     #410  41ee0834[0m
-[107m [0m [2m[0m[2m[34m/[0m[2m exp             /↕                 ↑2  ↓1  +137       Explore GraphQL schema and resolvers                                  96379229[0m
-[107m [0m [2m[0m[2m[34m/[0m[2m wip             /↕                 ↑1  ↓1   +33       Start API documentation                                               b40716dc[0m
+[107m [0m [2m  [0m[2m[34mBranch[0m[2m       Status        HEAD±    main↕     main…±  Summary                                                 Remote⇅  CI    Commit[0m
+[107m [0m [2m[0m[2m[34m@[0m[2m feature-api  +   ↕⇡     +54   [0m[2m[36m-5[0m[2m   ↑4  ↓1  +234  [0m[2m[36m-24[0m[2m  Refactor API to REST architecture with middleware        ⇡3      #412  6814f02[0m
+[107m [0m [2m[0m[2m[34m^[0m[2m main             ^⇅                                                                                            ⇡1  ⇣1  #     41ee083[0m
+[107m [0m [2m[0m[2m[34m+[0m[2m fix-auth         ↕[0m[2m[36m|[0m[2m                [0m[2m[34m↑2[0m[2m  ↓1   +25  [0m[2m[36m-11[0m[2m  Harden auth with constant-time token validation            [0m[2m[36m|[0m[2m     #408  b772e68[0m
+[107m [0m [2m[0m[2m[34m+[0m[2m fix-typos        _[0m[2m[36m|[0m[2m                                                                                              [0m[2m[36m|[0m[2m     #410  41ee083[0m
+[107m [0m [2m[0m[2m[34m/[0m[2m exp             /↕                 ↑2  ↓1  +137       Explore GraphQL schema and resolvers                                   9637922[0m
+[107m [0m [2m[0m[2m[34m/[0m[2m wip             /↕                 ↑1  ↓1   +33       Start API documentation                                                b40716d[0m
 [107m [0m [0m
 [107m [0m [2m[0m[2m[34m○[0m[2m Showing 4 worktrees, 2 branches, 1 with changes, 4 ahead, 3 columns hidden[0m
 
@@ -135,7 +142,7 @@ Output as JSON for scripting:
 
   Column                                                 Shows                                                
  ──────── ─────────────────────────────────────────────────────────────────────────────────────────────────── 
- Branch   Branch name                                                                                         
+ Branch   Branch name; a detached worktree has none, so it shows its short hash in dim yellow                 
  Status   Compact symbols (see below)                                                                         
  HEAD±    Uncommitted changes: +added -deleted lines                                                          
  main↕    Commits ahead/behind default branch                                                                 
@@ -146,7 +153,7 @@ Output as JSON for scripting:
  Path     Worktree directory                                                                                  
  URL      Dev server URL from project config; dimmed if port is not listening                                 
  (custom) User-defined custom columns from [2m[list.custom-columns][0m user config [experimental]                   
- Commit   Short hash (8 chars)                                                                                
+ Commit   Short hash, abbreviated per [2mcore.abbrev[0m                                                             
  Age      Time since last commit                                                                              
  Message  Last commit message (truncated)                                                                     
 
@@ -229,7 +236,7 @@ An in-progress git operation, a worktree-location attribute, or a branch with no
  [33m⊟[0m      [2mworktree.state[0m [2m"prunable"[0m                                            Prunable (worktree directory missing)                                                                                                 
  [33m⊞[0m      [2mworktree.state[0m [2m"locked"[0m                                              Locked worktree                                                                                                                       
  [2m[33m⚑[0m      [2mworktree.state[0m [2m"duplicate_branch"[0m                                    Branch checked out in more than one worktree, so [2mwt[0m resolves it to whichever git lists first; every worktree on the branch is flagged 
- [2m[33m⚑[0m      [2mworktree.state[0m [2m"branch_worktree_mismatch"[0m                            Branch name doesn't match the worktree path                                                                                           
+ [2m[33m⚑[0m      [2mworktree.state[0m [2m"branch_worktree_mismatch"[0m                            Worktree isn't at the path its branch implies — including a detached one, which has no branch to imply a path and so is never at home 
  [2m/[0m      [2mkind[0m [2m"branch"[0m                                                        Branch without a worktree (no [2mworktree[0m object)                                                                                        
 
 [32mDefault branch[0m

@@ -31,11 +31,11 @@ The table renders progressively: branch names, paths, and commit hashes appear i
 List all worktrees:
 
 {% terminal(cmd="wt list") %}
-&#32;&#32;<b>Branch</b>       <b>Status</b>        <b>HEAD±</b>    <b>main↕</b>     <b>main…±</b>  <b>Remote⇅</b>  <b>Commit</b>    <b>Age</b>   <b>Message</b>
-@ feature-api  <span class=c>+</span>   <span class=d>↕</span><span class=d>⇡</span>     <span class=g>+54</span>   <span class=r>-5</span>   <span class=g>↑4</span>  <span class=d><span class=r>↓1</span></span>  <span class=g>+234</span>  <span class=r>-24</span>   <span class=g>⇡3</span>      <span class=d>6814f02a</span>  <span class=d>30m</span>   <span class=d>Add API tests</span>
-^ main             <span class=d>^</span><span class=d>⇅</span>                                    <span class=g>⇡1</span>  <span class=d><span class=r>⇣1</span></span>  <span class=d>41ee0834</span>  <span class=d>4d</span>    <span class=d>Merge fix-auth:…</span>
-+ fix-auth         <span class=d>↕</span><span class=d>|</span>                <span class=g>↑2</span>  <span class=d><span class=r>↓1</span></span>   <span class=g>+25</span>  <span class=r>-11</span>     <span class=d>|</span>     <span class=d>b772e68b</span>  <span class=d>5h</span>    <span class=d>Add secure token…</span>
-+ <span class=d>fix-typos</span>        <span class=d>_</span><span class=d>|</span>                                      <span class=d>|</span>     <span class=d>41ee0834</span>  <span class=d>4d</span>    <span class=d>Merge fix-auth:…</span>
+&#32;&#32;<b>Branch</b>       <b>Status</b>        <b>HEAD±</b>    <b>main↕</b>     <b>main…±</b>  <b>Remote⇅</b>  <b>Commit</b>   <b>Age</b>   <b>Message</b>
+@ feature-api  <span class=c>+</span>   <span class=d>↕</span><span class=d>⇡</span>     <span class=g>+54</span>   <span class=r>-5</span>   <span class=g>↑4</span>  <span class=d><span class=r>↓1</span></span>  <span class=g>+234</span>  <span class=r>-24</span>   <span class=g>⇡3</span>      <span class=d>6814f02</span>  <span class=d>30m</span>   <span class=d>Add API tests</span>
+^ main             <span class=d>^</span><span class=d>⇅</span>                                    <span class=g>⇡1</span>  <span class=d><span class=r>⇣1</span></span>  <span class=d>41ee083</span>  <span class=d>4d</span>    <span class=d>Merge fix-auth: h…</span>
++ fix-auth         <span class=d>↕</span><span class=d>|</span>                <span class=g>↑2</span>  <span class=d><span class=r>↓1</span></span>   <span class=g>+25</span>  <span class=r>-11</span>     <span class=d>|</span>     <span class=d>b772e68</span>  <span class=d>5h</span>    <span class=d>Add secure token…</span>
++ <span class=d>fix-typos</span>        <span class=d>_</span><span class=d>|</span>                                      <span class=d>|</span>     <span class=d>41ee083</span>  <span class=d>4d</span>    <span class=d>Merge fix-auth: h…</span>
 
 <span class=d>○</span> <span class=d>Showing 4 worktrees, 1 with changes, 2 ahead, 1 column hidden</span>
 {% end %}
@@ -43,11 +43,11 @@ List all worktrees:
 Include CI status and LLM summaries:
 
 {% terminal(cmd="wt list --full") %}
-&#32;&#32;<b>Branch</b>       <b>Status</b>        <b>HEAD±</b>    <b>main↕</b>     <b>main…±</b>  <b>Summary</b>                                                <b>Remote⇅</b>  <b>CI</b>    <b>Commit</b>
-@ feature-api  <span class=c>+</span>   <span class=d>↕</span><span class=d>⇡</span>     <span class=g>+54</span>   <span class=r>-5</span>   <span class=g>↑4</span>  <span class=d><span class=r>↓1</span></span>  <span class=g>+234</span>  <span class=r>-24</span>  Refactor API to REST architecture with middleware       <span class=g>⇡3</span>      <span class=d><span style='color:var(--blue,#00a)'>#412</span></span>  <span class=d>6814f02a</span>
-^ main             <span class=d>^</span><span class=d>⇅</span>                                                                                           <span class=g>⇡1</span>  <span class=d><span class=r>⇣1</span></span>  <span class=g>#</span>     <span class=d>41ee0834</span>
-+ fix-auth         <span class=d>↕</span><span class=d>|</span>                <span class=g>↑2</span>  <span class=d><span class=r>↓1</span></span>   <span class=g>+25</span>  <span class=r>-11</span>  Harden auth with constant-time token validation           <span class=d>|</span>     <span class=g>#408</span>  <span class=d>b772e68b</span>
-+ <span class=d>fix-typos</span>        <span class=d>_</span><span class=d>|</span>                                                                                             <span class=d>|</span>     <span class=g>#410</span>  <span class=d>41ee0834</span>
+&#32;&#32;<b>Branch</b>       <b>Status</b>        <b>HEAD±</b>    <b>main↕</b>     <b>main…±</b>  <b>Summary</b>                                                 <b>Remote⇅</b>  <b>CI</b>    <b>Commit</b>
+@ feature-api  <span class=c>+</span>   <span class=d>↕</span><span class=d>⇡</span>     <span class=g>+54</span>   <span class=r>-5</span>   <span class=g>↑4</span>  <span class=d><span class=r>↓1</span></span>  <span class=g>+234</span>  <span class=r>-24</span>  Refactor API to REST architecture with middleware        <span class=g>⇡3</span>      <span class=d><span style='color:var(--blue,#00a)'>#412</span></span>  <span class=d>6814f02</span>
+^ main             <span class=d>^</span><span class=d>⇅</span>                                                                                            <span class=g>⇡1</span>  <span class=d><span class=r>⇣1</span></span>  <span class=g>#</span>     <span class=d>41ee083</span>
++ fix-auth         <span class=d>↕</span><span class=d>|</span>                <span class=g>↑2</span>  <span class=d><span class=r>↓1</span></span>   <span class=g>+25</span>  <span class=r>-11</span>  Harden auth with constant-time token validation            <span class=d>|</span>     <span class=g>#408</span>  <span class=d>b772e68</span>
++ <span class=d>fix-typos</span>        <span class=d>_</span><span class=d>|</span>                                                                                              <span class=d>|</span>     <span class=g>#410</span>  <span class=d>41ee083</span>
 
 <span class=d>○</span> <span class=d>Showing 4 worktrees, 1 with changes, 2 ahead, 3 columns hidden</span>
 {% end %}
@@ -55,13 +55,13 @@ Include CI status and LLM summaries:
 Include branches that don't have worktrees:
 
 {% terminal(cmd="wt list --branches --full") %}
-&#32;&#32;<b>Branch</b>       <b>Status</b>        <b>HEAD±</b>    <b>main↕</b>     <b>main…±</b>  <b>Summary</b>                                                <b>Remote⇅</b>  <b>CI</b>    <b>Commit</b>
-@ feature-api  <span class=c>+</span>   <span class=d>↕</span><span class=d>⇡</span>     <span class=g>+54</span>   <span class=r>-5</span>   <span class=g>↑4</span>  <span class=d><span class=r>↓1</span></span>  <span class=g>+234</span>  <span class=r>-24</span>  Refactor API to REST architecture with middleware       <span class=g>⇡3</span>      <span class=d><span style='color:var(--blue,#00a)'>#412</span></span>  <span class=d>6814f02a</span>
-^ main             <span class=d>^</span><span class=d>⇅</span>                                                                                           <span class=g>⇡1</span>  <span class=d><span class=r>⇣1</span></span>  <span class=g>#</span>     <span class=d>41ee0834</span>
-+ fix-auth         <span class=d>↕</span><span class=d>|</span>                <span class=g>↑2</span>  <span class=d><span class=r>↓1</span></span>   <span class=g>+25</span>  <span class=r>-11</span>  Harden auth with constant-time token validation           <span class=d>|</span>     <span class=g>#408</span>  <span class=d>b772e68b</span>
-+ <span class=d>fix-typos</span>        <span class=d>_</span><span class=d>|</span>                                                                                             <span class=d>|</span>     <span class=g>#410</span>  <span class=d>41ee0834</span>
-<span class=d>/ </span>exp             <span class=d>/</span><span class=d>↕</span>                 <span class=g>↑2</span>  <span class=d><span class=r>↓1</span></span>  <span class=g>+137</span>       Explore GraphQL schema and resolvers                                  <span class=d>96379229</span>
-<span class=d>/ </span>wip             <span class=d>/</span><span class=d>↕</span>                 <span class=g>↑1</span>  <span class=d><span class=r>↓1</span></span>   <span class=g>+33</span>       Start API documentation                                               <span class=d>b40716dc</span>
+&#32;&#32;<b>Branch</b>       <b>Status</b>        <b>HEAD±</b>    <b>main↕</b>     <b>main…±</b>  <b>Summary</b>                                                 <b>Remote⇅</b>  <b>CI</b>    <b>Commit</b>
+@ feature-api  <span class=c>+</span>   <span class=d>↕</span><span class=d>⇡</span>     <span class=g>+54</span>   <span class=r>-5</span>   <span class=g>↑4</span>  <span class=d><span class=r>↓1</span></span>  <span class=g>+234</span>  <span class=r>-24</span>  Refactor API to REST architecture with middleware        <span class=g>⇡3</span>      <span class=d><span style='color:var(--blue,#00a)'>#412</span></span>  <span class=d>6814f02</span>
+^ main             <span class=d>^</span><span class=d>⇅</span>                                                                                            <span class=g>⇡1</span>  <span class=d><span class=r>⇣1</span></span>  <span class=g>#</span>     <span class=d>41ee083</span>
++ fix-auth         <span class=d>↕</span><span class=d>|</span>                <span class=g>↑2</span>  <span class=d><span class=r>↓1</span></span>   <span class=g>+25</span>  <span class=r>-11</span>  Harden auth with constant-time token validation            <span class=d>|</span>     <span class=g>#408</span>  <span class=d>b772e68</span>
++ <span class=d>fix-typos</span>        <span class=d>_</span><span class=d>|</span>                                                                                              <span class=d>|</span>     <span class=g>#410</span>  <span class=d>41ee083</span>
+<span class=d>/ </span>exp             <span class=d>/</span><span class=d>↕</span>                 <span class=g>↑2</span>  <span class=d><span class=r>↓1</span></span>  <span class=g>+137</span>       Explore GraphQL schema and resolvers                                   <span class=d>9637922</span>
+<span class=d>/ </span>wip             <span class=d>/</span><span class=d>↕</span>                 <span class=g>↑1</span>  <span class=d><span class=r>↓1</span></span>   <span class=g>+33</span>       Start API documentation                                                <span class=d>b40716d</span>
 
 <span class=d>○</span> <span class=d>Showing 4 worktrees, 2 branches, 1 with changes, 4 ahead, 3 columns hidden</span>
 {% end %}
@@ -74,7 +74,7 @@ Output as JSON for scripting:
 
 | Column | Shows |
 |--------|-------|
-| Branch | Branch name |
+| Branch | Branch name; a detached worktree has none, so it shows its short hash in dim yellow |
 | Status | Compact symbols (see below) |
 | HEAD± | Uncommitted changes: +added -deleted lines |
 | main↕ | Commits ahead/behind default branch |
@@ -85,7 +85,7 @@ Output as JSON for scripting:
 | Path | Worktree directory |
 | URL | Dev server URL from project config; dimmed if port is not listening |
 | *(custom)* | User-defined [custom columns](#custom-columns) from `[list.custom-columns]` user config <span class="badge-experimental"></span> |
-| Commit | Short hash (8 chars) |
+| Commit | Short hash, abbreviated per `core.abbrev` |
 | Age | Time since last commit |
 | Message | Last commit message (truncated) |
 
@@ -173,7 +173,7 @@ An in-progress git operation, a worktree-location attribute, or a branch with no
 | `⊟` | `worktree.state` `"prunable"` | Prunable (worktree directory missing) |
 | `⊞` | `worktree.state` `"locked"` | Locked worktree |
 | `⚑` | `worktree.state` `"duplicate_branch"` | Branch checked out in more than one worktree, so `wt` resolves it to whichever git lists first; every worktree on the branch is flagged |
-| `⚑` | `worktree.state` `"branch_worktree_mismatch"` | Branch name doesn't match the worktree path |
+| `⚑` | `worktree.state` `"branch_worktree_mismatch"` | Worktree isn't at the path its branch implies — including a detached one, which has no branch to imply a path and so is never at home |
 | `/` | `kind` `"branch"` | Branch without a worktree (no `worktree` object) |
 
 ### Default branch

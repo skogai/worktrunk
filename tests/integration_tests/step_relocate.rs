@@ -1057,6 +1057,59 @@ worktree-path = "{{ nonexistent_variable }}"
     );
 }
 
+/// Regression test: the human-readable summary count must include
+/// template-error branches, matching the `--format=json` skip set.
+///
+/// When a valid candidate and a template-error branch coexist, the JSON path
+/// folds template errors into `all_skipped` but the human summary previously
+/// counted only validation/executor skips, undercounting by the number of
+/// template errors. The template here fails only for branch `bad` (via a
+/// branch-gated undefined variable) while `good` expands cleanly, so relocate
+/// moves `good` and skips `bad`.
+#[rstest]
+fn test_relocate_template_error_counted_in_summary(repo: TestRepo) {
+    let parent = worktree_parent(&repo);
+
+    // `good`: a mismatched worktree that will relocate successfully.
+    let good_wrong = parent.join("good-wrong");
+    repo.run_git(&[
+        "worktree",
+        "add",
+        "-b",
+        "good",
+        good_wrong.to_str().unwrap(),
+    ]);
+    // `bad`: a worktree whose template expansion fails.
+    let bad_path = parent.join("bad-loc");
+    repo.run_git(&["worktree", "add", "-b", "bad", bad_path.to_str().unwrap()]);
+
+    // Template errors only for branch `bad`; `good` renders the standard path.
+    let worktrunk_config = "worktree-path = \"{% if branch == 'bad' %}{{ undefined_var }}{% endif %}{{ repo_path }}/../{{ repo }}.{{ branch }}\"\n";
+    fs::write(repo.test_config_path(), worktrunk_config).unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["step", "relocate"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "relocate should succeed");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Relocated 1 worktree, skipped 1 worktree"),
+        "summary must count the template-error branch as skipped; stderr was:\n{stderr}"
+    );
+
+    // `good` relocated to its expected sibling path; `bad` untouched.
+    assert!(
+        parent.join("repo.good").exists(),
+        "good should have relocated"
+    );
+    assert!(
+        bad_path.exists(),
+        "bad should be untouched (template error)"
+    );
+}
+
 /// Regression test: main worktree relocation must surface a failed
 /// `git checkout <default_branch>` rather than silently claiming success.
 ///
@@ -1369,6 +1422,66 @@ fn test_relocate_preserves_subdir(repo: TestRepo) {
     assert!(
         cd_content.contains(&*expected_str),
         "CD file should contain relocated subdirectory path {expected_str}, got: {cd_content}"
+    );
+}
+
+/// A shell started before the split directive protocol cannot follow a
+/// relocated current worktree. The relocation still succeeds, but it must
+/// explain that the wrapper is stale and how to repair it rather than silently
+/// leaving the shell in the renamed-away directory.
+///
+/// Ignored on Windows for the same reason as the adjacent subdirectory test:
+/// relocating a worktree while this process holds its cwd there fails with a
+/// sharing violation before the directive-warning path is reachable.
+#[rstest]
+#[cfg_attr(windows, ignore)]
+fn test_relocate_current_with_retired_wrapper_warns(repo: TestRepo) {
+    let parent = worktree_parent(&repo);
+    let wrong_path = parent.join("wrong-location");
+    repo.run_git(&[
+        "worktree",
+        "add",
+        "-b",
+        "feature",
+        wrong_path.to_str().unwrap(),
+    ]);
+
+    let directive_dir = tempfile::TempDir::new().unwrap();
+    let retired_path = directive_dir.path().join("directive");
+    fs::write(&retired_path, "").unwrap();
+
+    let output = repo
+        .wt_command()
+        .env("WORKTRUNK_DIRECTIVE_FILE", &retired_path)
+        .args(["step", "relocate"])
+        .current_dir(&wrong_path)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "relocation should still succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!wrong_path.exists(), "the old worktree path should be gone");
+    assert!(
+        parent.join("repo.feature").exists(),
+        "the worktree should reach its expected path"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("shell wrapper is out of date"),
+        "the stale wrapper must not fail silently:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("wt config shell install"),
+        "the warning must include the repair action:\n{stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(&retired_path).unwrap(),
+        "",
+        "wt must never write to the retired directive file"
     );
 }
 

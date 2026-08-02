@@ -384,7 +384,9 @@ pub(crate) struct SwitchArgs {
     ///
     /// Supports [hook template variables](@/hook.md#template-variables)
     /// (`{{ branch }}`, `{{ worktree_path }}`, etc.) and filters.
-    /// `{{ base }}` and `{{ base_worktree_path }}` require `--create`.
+    /// `{{ base }}` and `{{ base_worktree_path }}` describe the source: the
+    /// selected base with `--create`, or the invoking worktree when switching
+    /// to an existing worktree.
     ///
     /// Especially useful with shell aliases:
     ///
@@ -708,7 +710,7 @@ Typing a gutter sigil filters by row kind: `+` narrows to linked worktrees and `
 4. **remote⇅** — Ahead/behind diff vs upstream tracking branch
 5. **summary** — LLM-generated branch summary; requires `[list] summary = true` and [`commit.generation`](@/config.md#commit)
 6. **pr** — The selected row's PR/MR, for any row whose branch has one
-7. **comments** — The PR/MR's comment thread, fetched from the forge on `--prs` rows
+7. **comments** — The PR/MR's comment thread, fetched from the forge for any row whose branch has one
 
 On narrow previews the tab bar compacts to digits — only the active tab keeps its label — so every `Alt-N` accelerator stays visible.
 
@@ -774,11 +776,11 @@ List all worktrees:
 <!-- wt list -->
 ```console
 $ wt list
-  Branch       Status        HEAD±    main↕     main…±  Remote⇅  Commit    Age   Message
-@ feature-api  +   ↕⇡     +54   -5   ↑4  ↓1  +234  -24   ⇡3      6814f02a  30m   Add API tests
-^ main             ^⇅                                    ⇡1  ⇣1  41ee0834  4d    Merge fix-auth:…
-+ fix-auth         ↕|                ↑2  ↓1   +25  -11     |     b772e68b  5h    Add secure token…
-+ fix-typos        _|                                      |     41ee0834  4d    Merge fix-auth:…
+  Branch       Status        HEAD±    main↕     main…±  Remote⇅  Commit   Age   Message
+@ feature-api  +   ↕⇡     +54   -5   ↑4  ↓1  +234  -24   ⇡3      6814f02  30m   Add API tests
+^ main             ^⇅                                    ⇡1  ⇣1  41ee083  4d    Merge fix-auth: h…
++ fix-auth         ↕|                ↑2  ↓1   +25  -11     |     b772e68  5h    Add secure token…
++ fix-typos        _|                                      |     41ee083  4d    Merge fix-auth: h…
 
 ○ Showing 4 worktrees, 1 with changes, 2 ahead, 1 column hidden
 ```
@@ -788,11 +790,11 @@ Include CI status and LLM summaries:
 <!-- wt list --full -->
 ```console
 $ wt list --full
-  Branch       Status        HEAD±    main↕     main…±  Summary                                                Remote⇅  CI    Commit
-@ feature-api  +   ↕⇡     +54   -5   ↑4  ↓1  +234  -24  Refactor API to REST architecture with middleware       ⇡3      #412  6814f02a
-^ main             ^⇅                                                                                           ⇡1  ⇣1  #     41ee0834
-+ fix-auth         ↕|                ↑2  ↓1   +25  -11  Harden auth with constant-time token validation           |     #408  b772e68b
-+ fix-typos        _|                                                                                             |     #410  41ee0834
+  Branch       Status        HEAD±    main↕     main…±  Summary                                                 Remote⇅  CI    Commit
+@ feature-api  +   ↕⇡     +54   -5   ↑4  ↓1  +234  -24  Refactor API to REST architecture with middleware        ⇡3      #412  6814f02
+^ main             ^⇅                                                                                            ⇡1  ⇣1  #     41ee083
++ fix-auth         ↕|                ↑2  ↓1   +25  -11  Harden auth with constant-time token validation            |     #408  b772e68
++ fix-typos        _|                                                                                              |     #410  41ee083
 
 ○ Showing 4 worktrees, 1 with changes, 2 ahead, 3 columns hidden
 ```
@@ -802,13 +804,13 @@ Include branches that don't have worktrees:
 <!-- wt list --branches --full -->
 ```console
 $ wt list --branches --full
-  Branch       Status        HEAD±    main↕     main…±  Summary                                                Remote⇅  CI    Commit
-@ feature-api  +   ↕⇡     +54   -5   ↑4  ↓1  +234  -24  Refactor API to REST architecture with middleware       ⇡3      #412  6814f02a
-^ main             ^⇅                                                                                           ⇡1  ⇣1  #     41ee0834
-+ fix-auth         ↕|                ↑2  ↓1   +25  -11  Harden auth with constant-time token validation           |     #408  b772e68b
-+ fix-typos        _|                                                                                             |     #410  41ee0834
-/ exp             /↕                 ↑2  ↓1  +137       Explore GraphQL schema and resolvers                                  96379229
-/ wip             /↕                 ↑1  ↓1   +33       Start API documentation                                               b40716dc
+  Branch       Status        HEAD±    main↕     main…±  Summary                                                 Remote⇅  CI    Commit
+@ feature-api  +   ↕⇡     +54   -5   ↑4  ↓1  +234  -24  Refactor API to REST architecture with middleware        ⇡3      #412  6814f02
+^ main             ^⇅                                                                                            ⇡1  ⇣1  #     41ee083
++ fix-auth         ↕|                ↑2  ↓1   +25  -11  Harden auth with constant-time token validation            |     #408  b772e68
++ fix-typos        _|                                                                                              |     #410  41ee083
+/ exp             /↕                 ↑2  ↓1  +137       Explore GraphQL schema and resolvers                                   9637922
+/ wip             /↕                 ↑1  ↓1   +33       Start API documentation                                                b40716d
 
 ○ Showing 4 worktrees, 2 branches, 1 with changes, 4 ahead, 3 columns hidden
 ```
@@ -823,7 +825,7 @@ $ wt list --format=json
 
 | Column | Shows |
 |--------|-------|
-| Branch | Branch name |
+| Branch | Branch name; a detached worktree has none, so it shows its short hash in dim yellow |
 | Status | Compact symbols (see below) |
 | HEAD± | Uncommitted changes: +added -deleted lines |
 | main↕ | Commits ahead/behind default branch |
@@ -834,7 +836,7 @@ $ wt list --format=json
 | Path | Worktree directory |
 | URL | Dev server URL from project config; dimmed if port is not listening |
 | *(custom)* | User-defined [custom columns](#custom-columns) from `[list.custom-columns]` user config [experimental] |
-| Commit | Short hash (8 chars) |
+| Commit | Short hash, abbreviated per `core.abbrev` |
 | Age | Time since last commit |
 | Message | Last commit message (truncated) |
 
@@ -918,7 +920,7 @@ An in-progress git operation, a worktree-location attribute, or a branch with no
 | `⊟` | `worktree.state` `"prunable"` | Prunable (worktree directory missing) |
 | `⊞` | `worktree.state` `"locked"` | Locked worktree |
 | `⚑` | `worktree.state` `"duplicate_branch"` | Branch checked out in more than one worktree, so `wt` resolves it to whichever git lists first; every worktree on the branch is flagged |
-| `⚑` | `worktree.state` `"branch_worktree_mismatch"` | Branch name doesn't match the worktree path |
+| `⚑` | `worktree.state` `"branch_worktree_mismatch"` | Worktree isn't at the path its branch implies — including a detached one, which has no branch to imply a path and so is never at home |
 | `/` | `kind` `"branch"` | Branch without a worktree (no `worktree` object) |
 
 ### Default branch
@@ -2393,7 +2395,7 @@ url = "http://localhost:{{ branch | hash_port }}"
 
 ## Forge platform
 
-Name the forge explicitly for SSH aliases or self-hosted instances, where it can't be detected from the remote URL:
+The forge is read from the remote's hostname: any host carrying `github`, `gitlab`, or `gitea` anywhere in it, plus the Azure DevOps service domains. Name the forge explicitly for a host carrying none of those, such as a Forgejo instance at `forge.example.com`:
 
 ```toml
 [forge]

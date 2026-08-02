@@ -4403,7 +4403,7 @@ dependencies = [
 
 [[package]]
 name = "worktrunk"
-version = "0.70.0"
+version = "0.71.0"
 dependencies = [
  "ansi-str",
  "ansi-to-html",
@@ -4472,7 +4472,6 @@ dependencies = [
  "tracing",
  "tracing-log",
  "tracing-subscriber",
- "tree-sitter",
  "tree-sitter-bash",
  "tree-sitter-highlight",
  "unicode-width 0.2.2",

@@ -1,9 +1,32 @@
 use crate::common::{
     TestRepo, make_snapshot_cmd, repo, repo_with_feature_worktree, repo_with_remote,
-    setup_snapshot_settings,
+    setup_snapshot_settings, write_git_hook,
 };
 use insta_cmd::assert_cmd_snapshot;
 use rstest::rstest;
+
+/// Install a `post-receive` hook whose body `build_body` composes from the repo
+/// root, passed in forward-slashed form.
+///
+/// The hook fires during `wt`'s own `git push`, which is the window between the
+/// autostash capture and its restore. Git runs hooks through a shell it
+/// provides on every platform, so the script is `sh` either way, and the root
+/// is forward-slashed for the same reason — a Windows path's backslashes would
+/// otherwise reach `sh` as escapes.
+fn install_post_receive_hook(root: &std::path::Path, build_body: impl FnOnce(&str) -> String) {
+    use path_slash::PathExt as _;
+
+    let body = build_body(&root.to_slash_lossy());
+    write_git_hook(
+        &root.join(".git/hooks/post-receive"),
+        &format!(
+            "#!/bin/sh\n\
+             unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_QUARANTINE_PATH\n\
+             {body}\n\
+             exit 0\n"
+        ),
+    );
+}
 
 /// Helper to create snapshot with normalized paths
 fn snapshot_push(test_name: &str, repo: &TestRepo, args: &[&str], cwd: Option<&std::path::Path>) {
@@ -55,25 +78,6 @@ fn test_push_diffstat_without_detectable_width(mut repo: TestRepo) {
         stderr.contains("a-reasonably-long-filename.txt"),
         "diffstat should show the full filename, got: {stderr}"
     );
-}
-
-#[rstest]
-fn test_push_not_fast_forward(mut repo: TestRepo) {
-    // Create commits in both worktrees
-    // Note: We use commit_in_worktree on root to match the original file layout
-    // (file named main.txt instead of file.txt that repo.commit() creates)
-    repo.commit_in_worktree(
-        repo.root_path(),
-        "main.txt",
-        "main content",
-        "Add main file",
-    );
-
-    // Create a feature worktree branching from before the main commit
-    let feature_wt = repo.add_feature();
-
-    // Try to push from feature to main (should fail - not fast-forward)
-    snapshot_push("push_not_fast_forward", &repo, &["main"], Some(&feature_wt));
 }
 
 #[rstest]
@@ -141,6 +145,125 @@ fn test_push_dirty_target_autostash(mut repo: TestRepo) {
         String::from_utf8_lossy(&stash_list.stdout)
             .trim()
             .is_empty()
+    );
+}
+
+/// Regression test for #3683: the autostash restore must not hinge on a
+/// positional `stash@{0}` selector. A stash pushed into the repo between the
+/// autostash and its restore — a concurrent `wt merge`, an editor integration —
+/// shifts the reflog indices, so restoring by position would pop (and drop) the
+/// interloper's entry and silently discard the user's uncommitted work.
+/// Restoring by the stash's immutable commit SHA is immune to the reorder.
+///
+/// A `post-receive` hook is the deterministic stand-in for the concurrent
+/// writer: it fires during `wt`'s own fast-forward `git push`, which is exactly
+/// the window between the autostash capture and its restore.
+#[rstest]
+fn test_push_autostash_survives_concurrent_stash(mut repo: TestRepo) {
+    // Uncommitted, non-conflicting work in the target worktree (repo root).
+    let notes = repo.root_path().join("notes.txt");
+    std::fs::write(&notes, "PRECIOUS-USER-WORK").unwrap();
+
+    // A post-receive hook that pushes an unrelated stash during the push,
+    // shifting the reflog indices out from under the autostash entry.
+    install_post_receive_hook(repo.root_path(), |root| {
+        format!(
+            "printf 'interloper\\n' > '{root}/interloper.txt'\n\
+             git -C '{root}' -c user.email=i@i -c user.name=I \
+                 stash push --include-untracked -m INTERLOPER >/dev/null 2>&1"
+        )
+    });
+
+    let feature_wt = repo.add_feature();
+
+    let output = repo
+        .wt_command()
+        .args(["step", "push", "main"])
+        .current_dir(&feature_wt)
+        .output()
+        .expect("failed to run push");
+    assert!(
+        output.status.success(),
+        "push failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The user's uncommitted work must survive — not the interloper's content.
+    assert_eq!(
+        std::fs::read_to_string(&notes).unwrap(),
+        "PRECIOUS-USER-WORK",
+        "autostash restored the wrong entry, discarding the user's work"
+    );
+
+    // The interloper's stash is untouched; the autostash entry is cleaned up.
+    let stash_list = repo.git_command().args(["stash", "list"]).run().unwrap();
+    let stash_list = String::from_utf8_lossy(&stash_list.stdout);
+    assert!(
+        stash_list.contains("INTERLOPER"),
+        "the concurrent writer's stash was dropped: {stash_list:?}"
+    );
+    assert!(
+        !stash_list.contains("autostash"),
+        "the autostash entry was left behind: {stash_list:?}"
+    );
+}
+
+/// A restore that genuinely can't replay — the stashed path is occupied again
+/// by the time the push finishes — must warn with a recoverable `git stash
+/// apply <sha>` rather than silently report success. Data-safety guard for
+/// #3683: the stash entry is left intact so the work is recoverable.
+#[rstest]
+fn test_push_autostash_restore_failure_warns(mut repo: TestRepo) {
+    // Untracked, non-conflicting work in the target worktree (repo root).
+    std::fs::write(repo.root_path().join("notes.txt"), "USER-WORK").unwrap();
+
+    // A post-receive hook re-creates the stashed path with different content,
+    // so `git stash apply` can't restore the untracked file and the restore
+    // fails after the push has already landed.
+    install_post_receive_hook(repo.root_path(), |root| {
+        format!("printf 'HOOK-CONFLICT\\n' > '{root}/notes.txt'")
+    });
+
+    let feature_wt = repo.add_feature();
+
+    let output = repo
+        .wt_command()
+        .args(["step", "push", "main"])
+        .current_dir(&feature_wt)
+        .output()
+        .expect("failed to run push");
+
+    // Exit non-zero: the user's changes are in a stash rather than their
+    // worktree, so reporting success would misstate where their work is.
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a restore that couldn't replay must not exit 0: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Failed to restore stashed changes"),
+        "expected a restore-failure warning, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("git stash apply"),
+        "warning must name the recovery command: {stderr}"
+    );
+
+    // The push itself landed — the non-zero exit reports the restore, not the
+    // push, so the target must still have advanced to the feature commit.
+    assert_eq!(
+        repo.git_output(&["rev-parse", "main"]),
+        repo.git_output(&["rev-parse", "feature"]),
+        "the push must still have landed on the target"
+    );
+
+    // The stash entry survives for recovery — a failed apply does not drop it.
+    let stash_list = repo.git_command().args(["stash", "list"]).run().unwrap();
+    assert!(
+        String::from_utf8_lossy(&stash_list.stdout).contains("autostash"),
+        "the recoverable stash entry must remain"
     );
 }
 
@@ -366,15 +489,6 @@ fn main_sha(repo: &TestRepo) -> String {
         .run()
         .unwrap();
     String::from_utf8_lossy(&output.stdout).trim().to_string()
-}
-
-#[rstest]
-fn test_push_no_remote(#[from(repo_with_feature_worktree)] repo: TestRepo) {
-    // Note: repo_with_feature_worktree doesn't call setup_remote(), so this tests the "no remote" error case
-    let feature_wt = repo.worktree_path("feature");
-
-    // Try to push without specifying target (should fail - no remote to get default branch)
-    snapshot_push("push_no_remote", &repo, &[], Some(feature_wt));
 }
 
 /// A push target can be named by the worktree it is checked out in, the same as

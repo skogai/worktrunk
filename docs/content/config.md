@@ -536,7 +536,7 @@ url = "http://localhost:{{ branch | hash_port }}"
 
 ## Forge platform
 
-Name the forge explicitly for SSH aliases or self-hosted instances, where it can't be detected from the remote URL:
+The forge is read from the remote's hostname: any host carrying `github`, `gitlab`, or `gitea` anywhere in it, plus the Azure DevOps service domains. Name the forge explicitly for a host carrying none of those, such as a Forgejo instance at `forge.example.com`:
 
 ```toml
 [forge]
@@ -1264,11 +1264,11 @@ Custom status text or emoji shown in the `wt list` Status column.
 Markers appear at the end of the Status column, after git symbols:
 
 {% terminal(cmd="wt list") %}
-&#32;&#32;<b>Branch</b>       <b>Status</b>        <b>HEAD±</b>    <b>main↕</b>     <b>main…±</b>  <b>Remote⇅</b>  <b>Commit</b>    <b>Age</b>   <b>Message</b>
-@ main             <span class=d>^</span><span class=d>⇡</span>                                    <span class=g>⇡1</span>      <span class=d>33323bc1</span>  <span class=d>1d</span>    <span class=d>Initial commit</span>
-+ feature-api      <span class=d>↑</span> 🤖              <span class=g>↑1</span>        <span class=g>+1</span>                <span class=d>70343f03</span>  <span class=d>1d</span>    <span class=d>Add REST API end…</span>
-+ review-ui      <span class=c>?</span> <span class=d>↑</span> 💬              <span class=g>↑1</span>        <span class=g>+1</span>                <span class=d>a585d6ed</span>  <span class=d>1d</span>    <span class=d>Add dashboard co…</span>
-+ wip-docs       <span class=c>?</span> <span class=d>–</span>                                             <span class=d>33323bc1</span>  <span class=d>1d</span>    <span class=d>Initial commit</span>
+&#32;&#32;<b>Branch</b>       <b>Status</b>        <b>HEAD±</b>    <b>main↕</b>     <b>main…±</b>  <b>Remote⇅</b>  <b>Commit</b>   <b>Age</b>   <b>Message</b>
+@ main             <span class=d>^</span><span class=d>⇡</span>                                    <span class=g>⇡1</span>      <span class=d>33323bc</span>  <span class=d>1d</span>    <span class=d>Initial commit</span>
++ feature-api      <span class=d>↑</span> 🤖              <span class=g>↑1</span>        <span class=g>+1</span>                <span class=d>70343f0</span>  <span class=d>1d</span>    <span class=d>Add REST API endp…</span>
++ review-ui      <span class=c>?</span> <span class=d>↑</span> 💬              <span class=g>↑1</span>        <span class=g>+1</span>                <span class=d>a585d6e</span>  <span class=d>1d</span>    <span class=d>Add dashboard com…</span>
++ wip-docs       <span class=c>?</span> <span class=d>–</span>                                             <span class=d>33323bc</span>  <span class=d>1d</span>    <span class=d>Initial commit</span>
 
 <span class=d>○</span> <span class=d>Showing 4 worktrees, 2 with changes, 2 ahead, 1 column hidden</span>
 {% end %}

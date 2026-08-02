@@ -5,12 +5,14 @@
 ```bash
 cargo run -- hook pre-merge --yes                                  # all tests + lints
 pre-commit run --all-files                                         # lints only
+cargo nextest run --all-features                                   # full suite, fastest runner
+cargo nextest run --all-features -E 'test(/^integration_tests::list_layout::/)' # one module
 cargo test --lib --bins                                            # unit tests
 cargo test --test integration                                      # integration (no shell tests)
 cargo test --test integration --features shell-integration-tests   # + shell tests
 ```
 
-A target-filtered run (`--lib`, `--test integration`, …) on a fresh `target/` panics with "mock-stub binary not found" (a target filter skips the helper-bin build). Fix: `cargo build -p mock-stub`, or use `cargo nextest run` / `cargo llvm-cov nextest`.
+A target filter (`--lib`, `--test integration`, …) never builds `mock-stub`, so the run gets whatever sits in `target/`: a fresh tree has none and panics with "mock-stub binary not found", and a warm one runs the tests against a stale stub, whose failures reflect the code it was built from rather than the change under test. Fix: `cargo build -p mock-stub`, or use `cargo nextest run` / `cargo llvm-cov nextest`.
 
 **Claude Code web:** `task setup-web` installs zsh/fish/nushell, `gh`, and dev tools. Install `task` first if needed: `sh -c "$(curl --location https://taskfile.dev/install.sh)" -- -d -b ~/bin` then `export PATH="$HOME/bin:$PATH"`. The permission tests (`test_permission_error_prevents_save`, `test_approval_prompt_permission_error`) skip automatically when running as root.
 
@@ -18,9 +20,31 @@ A target-filtered run (`--lib`, `--test integration`, …) on a fresh `target/` 
 
 **The gate runs one platform, so `#[cfg(unix)]` hides dead code from it.** A helper, const, or import whose every use sits behind `#[cfg(unix)]` is live locally and dead on Windows, where `-D warnings` fails `test (windows)` with "never used". Gate the item with the same predicate as its uses. Cross-compiling to check locally doesn't work: the C build scripts (tree-sitter, libmimalloc-sys) fail before the Rust lint runs.
 
+## One Result Per Test, Whatever Runs It
+
+Five runners execute this suite — `cargo test`, `cargo nextest run`, `cargo llvm-cov nextest`, `cargo bench`, and the Nix `worktrunk-tests` derivation — and CI uses several of them on the same commit. **A test's result must not depend on which one started it.**
+
+So `.config/nextest.toml` carries no setting that changes what a test observes: no `[env]`, and no setup script exporting through `$NEXTEST_ENV`. Anything load-bearing goes where every runner sees it — the harness-latched floor in `shell_exec` for git environment (see Git Config Isolation), `.cargo/config.toml` for `COLUMNS`, the fixture for behavior.
+
+A nextest-only knob doesn't fail loudly when another runner misses it. It yields a *different result*, and the runner that disagrees is typically `cargo llvm-cov` — whose numbers gate a merge, and whose disagreement therefore reads as a coverage regression rather than as missing configuration.
+
+The one setup script here, `build-bins`, is a build step rather than a behavior setting: it compiles the `mock-stub` helper a target-filtered run would otherwise skip, and the same gap under plain `cargo test` is handled by `default-members` (see Running the Suite). It carries its own TODO to disappear once cargo-dist supports per-binary exclusion. It is not precedent.
+
+## Profiling the Suite
+
+```bash
+task profile-tests   # CPU accounting plus per-test timings
+```
+
+The integration binary dominates: ~2,200 tests averaging ~1s, each spawning `wt` and `git` against a fresh fixture copy. Two thirds of the suite's CPU is kernel time, so the cost is process creation and filesystem churn rather than computation, and it sits in a broad middle rather than in a few outliers. Track `user`/`sys` from the `time` line; wall time is unreliable whenever a sibling worktree is building or testing, which on this project is most of the time. Per-test durations land in `target/nextest/default/junit.xml`.
+
+The fixtures put their temp directories under `test_temp_root()` (`$TMPDIR/wt`) rather than directly in the system temp dir, and `test_tempdir()` is the fixture-side replacement for `TempDir::new()`. Entries in the shared temp root are cheap to ignore but expensive to enumerate, and `git::recover::recover_from_path` reads every ancestor directory of a deleted CWD — its own unit test ran 14.2s against a temp root holding 454k leaked entries, 0.06s once the leak stopped. That root's short name is load-bearing: a unix socket path can't exceed 104 bytes on macOS, and `test_copy_ignored_skips_non_regular_files` binds one 89 bytes in.
+
+Process-scoped scratch space belongs in a fixed directory, not a `TempDir` in a `static`: statics don't run destructors at process exit, so under nextest's process-per-test model that leaks one directory per test into a temp root nothing reliably sweeps (macOS clears it only at boot). To check for a recurrence, run the suite with `TMPDIR` pointed at a fresh directory and see what survives.
+
 ## Coverage Investigation
 
-`task coverage` runs the suite and writes an HTML report to `target/llvm-cov/html/index.html`. Both CI (the `coverage` workflow) and local `task coverage` pass `--features shell-integration-tests`, so code behind that flag is compiled and measured.
+`task coverage` runs the suite through nextest and writes an HTML report to `target/llvm-cov/html/index.html`. Coverage uses the same process isolation as the regular suite: PTY tests must not share one crowded test process. Both CI (the `coverage` workflow) and local `task coverage` pass `--features shell-integration-tests`, so code behind that flag is compiled and measured.
 
 When `codecov/patch` fails, investigate before declaring ready (the merge gate itself is in the root `CLAUDE.md` → Coverage):
 
@@ -73,7 +97,7 @@ be isolated from the host environment to prevent:
 
 - **Directive leakage**: Test commands writing to the user's shell directive file
 - **Config pollution**: Tests reading/writing the user's real config
-- **Git interference**: Host GIT_* environment variables affecting test behavior
+- **Git interference**: Host GIT_* environment variables affecting test behavior (the developer's *config* is denied a layer lower — see Git Config Isolation below)
 - **Network access**: a fixture's `https://` remote URL becoming a real connect, with no timeout bounding it (`GIT_ALLOWED_PROTOCOLS` in `src/testing/mod.rs`)
 
 ### With a TestRepo fixture (most tests)
@@ -148,6 +172,34 @@ binaries, not just knobs `wt` itself reads: the harness sets
 `WORKTRUNK_TEST_MOCK_CONFIG_DIR` and only `mock-stub` reads it. A variable `wt`
 reads in production drops `TEST` and keeps `WORKTRUNK_`.
 
+## Git Config Isolation
+
+**No `git` the suite runs reads the developer's `~/.gitconfig`**, whatever the test drives it through and wherever the fixture lives. The guarantee is one environment set, `shell_exec::HERMETIC_TEST_GIT_ENV` — the deny pair pointing `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` at a path that does not exist, plus the settings the suite needs in the denied config's place — applied to every child at its spawn site. There is no git-config file anywhere in the repo.
+
+**Production spawn sites get the floor from a latch, not from the test.** Most test variables are set on a *child*: `git_test_env` on a git command, `configure_cli_command` on a `wt` subprocess. In-process git is not a child the test configures. `TestRepo` exposes a `repo` field of the production `Repository` type, and `Repository::run_command` builds a plain `Cmd::new("git")` — the test never holds the command, so there is no place to set env on it, and a test cannot set its own process environment instead (under `cargo test` the tests sharing the process run in parallel threads, and `std::env::set_var` beside a thread that spawns a process is the race that makes it `unsafe`). What a test *can* do safely is flip an atomic: the harness latches `shell_exec::enable_hermetic_test_env` in the fixture constructors and `configure_git_*`, and `Cmd` applies the floor to every child it spawns while the latch is set. Production code never latches it, so a user's `wt` inherits their real config; the latch is a test-serving switch in `shell_exec` accepted deliberately — see the `TODO(hermetic-env)` there for the structural alternative (threading an explicit env value through `Repository`).
+
+The harness applies the same floor at the spawn sites it does own:
+
+- `git_test_env` — reaching git through `configure_git_env` / `configure_git_cmd` (`TestRepo::git_command()`, `run_git()`, `run_git_in()`, `git_output()`, `commit_in()`) and a PTY child through `pty_env_vars` — adds the test identity, pinned dates, and locale; `configure_git_cmd` also applies the floor, since a plain `Command` child bypasses the `Cmd` latch.
+- `isolate_subprocess_env` scrubs every inherited `GIT_*` from `wt` children — a host-exported `GIT_CONFIG_*` included — then re-applies the floor explicitly, so a subprocess denies host config just as this process does.
+- a PTY child is `env_clear`ed and inherits nothing, so the floor is carried by hand at the PTY choke point every spawn routes through — `configure_pty_command` in `tests/common/mod.rs` — and again by `pty_env_vars`, whose vector declares a PTY `wt` child's complete environment. Each copy is pinned by its own test (`configure_pty_command_carries_the_git_config_floor`, `pty_env_vars_carry_the_git_config_floor`), because `useConfigOnly` fires only where an identity is missing — no PTY assertion would notice the floor going missing.
+
+**The floor carries two settings.** `user.useConfigOnly` is a backstop: denial alone leaves git *guessing* an identity from the OS username and hostname rather than failing, which is the one way a hermetic suite could still author a commit as the developer. Nothing exercises it, because every path sets an identity, and that is the reason to keep it — without it a future gap goes silent. `rerere.enabled = false` is *set* rather than left unset because git enables rerere on its own whenever `$GIT_DIR/rr-cache` exists, so leaving it unset makes the suite's rerere state depend on what a fixture happens to carry. `commit.gpgsign` is gone, since denial already leaves git on its own default, and so are `advice.mergeConflict` / `advice.resolveConflict` — the snapshot layer strips gutter-prefixed `hint:` lines because they vary across git versions (the filter in `tests/common/mod.rs`), so nothing depends on quieting them at the source.
+
+**A local run can measure a stale fixture.** The standard fixture is built once into `target/debug/wt-test-fixtures/standard-v<N>/` and copied per test, so whatever a git-config change alters *during fixture construction* survives in that copy until the cache is rebuilt. A floor change can therefore pass locally and fail on CI, which always builds fresh. Removing `rerere.enabled` did exactly that: the cached fixture already held an `rr-cache` directory from when the floor enabled rerere, git turns rerere on whenever that directory exists, and so every local test kept the behavior the change had just removed. Before trusting a local measurement of a git-config change, delete `target/debug/wt-test-fixtures/` or bump `STANDARD_FIXTURE_VERSION`.
+
+Three things follow that are easy to get wrong:
+
+- **`GIT_CONFIG_COUNT` is `-c`, so it outranks a repository's own config**, where a global *file* would yield to it. A key belongs in the floor only when no test needs to override it locally. `init.defaultBranch` is the one that doesn't qualify — `default_branch.rs` sets it in a repo to prove `wt` reads it — so every `git init` in the harness names its branch instead.
+- **Identity is not in the floor.** A harness-built git gets it from `git_test_env`; an in-process git gets it from the fixture repo's local config, which every `TestRepo` constructor writes. The floor carries only the denial and the two `-c` settings; identity has those per-command homes already, and a copy in the floor could only drift from them, with `useConfigOnly` failing loudly if a path misses both.
+- **Where fixtures live carries no isolation weight.** A conditional `includeIf "gitdir:<home>"` can't reach them wherever they sit, so `test_temp_root()`'s location is a question of ancestor-walk cost alone.
+
+What the hole cost before this: any key in the developer's config applied to fixture repos, so `commit.gpgsign` failed their commits, `core.hooksPath` ran their hooks, and `core.fsmonitor` / `credential.helper` / `filter.*` ran programs of their choosing. A conditional `includeIf` made which of those happened depend on where `$TMPDIR` sat — the suite passed by accident of the temp dir being outside `$HOME`.
+
+`cargo run -- <cmd>` is untouched: nothing in production latches the floor, so a developer's own invocations keep their aliases, credential helper, and identity.
+
+`GIT_AUTHOR_DATE` / `GIT_COMMITTER_DATE` are **not** part of this floor: `git_test_env` pins them per command, so a commit made through `Repository::run_command` still gets the wall clock. Snapshot the author, not the date.
+
 ## Config Isolation for In-Process Unit Tests
 
 `repo.wt_command()` / `wt_command()` isolate *subprocess* tests (above). An
@@ -185,24 +237,41 @@ approvals.approve_command(project, command, &approvals_path).unwrap();
 </good>
 </example>
 
-Git needs the same care. An in-process `Repository::run_command()` spawns git
-with the test process's environment, so it reads the developer's real
-`~/.gitconfig` and none of `configure_git_env`'s variables — no
-`GIT_CONFIG_GLOBAL`, no `GIT_ALLOW_PROTOCOL`. The repo's own config is the one
-layer such a command still reads, so every `TestRepo` constructor appends
-`LOCAL_TEST_CONFIG` (identity, `commit.gpgsign`, and the `protocol.allow`
-transport deny) to it. `TestRepo::assemble` is the single call site; a new
-constructor routes through it and inherits the settings, and the bare
-fixtures (`BareRepoTest`, `NestedBareRepoTest`) get them by composing over
-`TestRepo`.
+Git needs the same care, for a narrower reason. An in-process
+`Repository::run_command()` spawns git with the test process's environment, so
+none of `configure_git_env`'s per-command variables apply — no
+`GIT_ALLOW_PROTOCOL`, no per-test `GIT_CONFIG_GLOBAL`. Host *config* is not
+among the gaps: the latched floor above already denies it. The
+repo's own config is the one layer such a command still reads, so every
+`TestRepo` constructor appends `LOCAL_TEST_CONFIG` (identity
+and the `protocol.allow` transport deny) to it. The identity is required rather
+than convenient — the floor sets `user.useConfigOnly` and carries no name, so a
+repo without one fails its commit instead of authoring from the host's username.
+`TestRepo::assemble` is the single call site; a new constructor routes through it
+and inherits the settings, and the bare fixtures (`BareRepoTest`,
+`NestedBareRepoTest`) get them by composing over `TestRepo`.
 
-`approvals_path()` panics when `WORKTRUNK_APPROVALS_PATH` is unset, but
-`#[cfg(test)]` makes that guard fire only for `worktrunk` lib-crate tests. A
-bin-crate test (anything under `src/commands/`) links the lib in non-test
-mode, so the guard is compiled out and a global read hits the real config
+`approvals_path()` and `config_path()` refuse the developer's real
+`~/.config/worktrunk/` rather than resolving it. `config_path()` is the one that
+matters most: `set_skip_shell_integration_prompt` and
+`set_skip_commit_generation_prompt` reach it to **write**, so an unguarded
+fall-through edits the config the developer is using. `approvals_path()` panics;
+`config_path()` returns `None`, because its absent state is already meaningful —
+`require_config_path()` turns it into an error, so a write still fails loudly
+while a best-effort read like `prewarm_user_config` simply preloads nothing.
+
+`#[cfg(test)]` makes both guards fire for `worktrunk` lib-crate tests only. A
+bin-crate test (anything compiled into the `wt` binary — `src/commands/`,
+`src/output/`, and the other `main.rs` modules) links the lib in non-test mode,
+so the guard is compiled out there and a global read hits the real config
 silently: it passes wherever `$HOME` is writable and fails only in a sandbox
-that forbids it. `config_path()` and `system_config_path()` have no guard at
-all.
+that forbids it. Nothing exercises that today — no bin-crate test creates a
+config under a scratch `$HOME` — so it's a live requirement on new tests, not a
+known leak.
+
+`system_config_path()` is deliberately unguarded: it resolves a machine-wide
+file rather than the developer's own, and `config::deprecation`'s
+`PendingDefault` rules need the lookup.
 
 ## Timing Tests: Polling and Absence Windows
 
@@ -360,105 +429,25 @@ fn test_fish_integration() {
 **Existing feature flags:**
 - `shell-integration-tests` — Tests requiring bash/zsh/fish shells and PTY
 
-## README Examples and Snapshot Testing
+## PTY Tests and README Examples
 
-### Problem: Separated stdout/stderr in Standard Snapshots
+Use `insta_cmd` by default. It is faster and lets a test assert stdout, stderr,
+and exit status separately. Use a PTY only when the contract actually depends
+on a terminal: interactive prompts, shell functions and directives, pager
+selection, or the temporal interleaving of stdout and stderr. A README label by
+itself is not a reason to use a PTY.
 
-README examples need to show output as users see it in their terminal - with stdout and stderr interleaved in the order they appear. However, the standard `insta_cmd` snapshot testing (used in most integration tests) separates stdout and stderr into different sections:
+For README output where interleaving matters, use `build_pty_command` with
+`exec_cmd_in_pty` (or `exec_cmd_in_pty_prompted` for prompt-driven input) from
+`tests/common/pty.rs`. These return the combined stream in terminal order. The
+shell-wrapper-specific equivalent is `exec_in_pty_interactive` in
+`shell_wrapper.rs`.
 
-```yaml
------ stdout -----
-🔄 Running pre-merge test:
-  uv run pytest
-
------ stderr -----
-============================= test session starts ==============================
-collected 18 items
-...
-```
-
-This makes snapshots **not directly copyable** into README.md because:
-1. The output is split into two sections
-2. We lose the temporal ordering (which output appeared first)
-3. Users never see this separation - their terminal shows combined output
-
-### Solution: Use PTY-based Testing for README Examples
-
-For tests that generate README examples, use the PTY-based execution pattern from `tests/integration_tests/shell_wrapper.rs`:
-
-**Key functions** in `tests/common/pty.rs`:
-- `build_pty_command()` — builds a `CommandBuilder` with standard PTY isolation
-- `exec_cmd_in_pty()` — executes in a PTY, writing all input immediately (non-interactive)
-- `exec_cmd_in_pty_prompted()` — executes in a PTY, waiting for prompts before sending input
-
-These use `portable_pty` to execute commands in a pseudo-terminal, returning
-combined stdout+stderr as a single `String` with ANSI color codes and proper
-temporal ordering.
-
-**Pattern to use:**
-
-```rust
-use crate::common::pty::{build_pty_command, exec_cmd_in_pty};
-
-let cmd = build_pty_command("wt", &["merge"], &repo_path, &env_vars, None);
-let (combined_output, exit_code) = exec_cmd_in_pty(cmd, "");
-assert_snapshot!("readme_example_name", combined_output);
-```
-
-**Benefits:**
-- Output is directly copyable to README.md
-- Shows actual user experience (interleaved stdout/stderr)
-- Preserves temporal ordering of output
-- No manual merging of stdout/stderr needed
-
-**Example:** See `tests/integration_tests/shell_wrapper.rs`:
-- `ShellOutput` struct with `combined: String`
-- `exec_in_pty_interactive()` — shell-wrapper-specific PTY helper
-
-### When to Use Each Approach
-
-**Use `insta_cmd` (standard snapshots):**
-- Unit and integration tests focused on correctness
-- Tests that need to verify stdout/stderr separately
-- Tests checking exit codes and specific error messages
-- Most tests in the codebase
-
-**Use PTY-based execution (PTY-based snapshots):**
-- Tests generating output for README.md examples
-- Tests verifying shell integration (`wt` function, directives)
-- Tests needing to verify complete user experience
-- Any test where temporal ordering of stdout/stderr matters
-
-### Current Status
-
-**README examples using PTY-based approach:**
-- Shell wrapper tests (all of `tests/integration_tests/shell_wrapper.rs`)
-
-**README examples using standard snapshots (working, but require manual editing):**
-- `test_readme_example_simple()` - Quick start merge example
-- `test_readme_example_complex()` - LLM commit example
-- `test_readme_example_hooks_pre_create()` - Pre-create hooks
-- `test_readme_example_hooks_pre_merge()` - Pre-merge hooks
-
-**Current workflow:** These tests work correctly and generate accurate snapshots. However, the snapshots separate stdout and stderr into different sections, which means they cannot be directly copied into README.md. Instead, the README examples are manually edited versions that merge stdout/stderr in the correct temporal order and remove ANSI codes.
-
-**Future improvement:** Migrate README example tests to use PTY execution so snapshots are directly copyable into README.md without manual editing. This is an enhancement for developer convenience, not a bug fix.
-
-### Migration Checklist
-
-When converting a README example test from `insta_cmd` to PTY-based:
-
-1. ✅ Import `portable_pty` dependencies
-2. ✅ Use `build_pty_command()` + `exec_cmd_in_pty()` from `tests/common/pty.rs`
-3. ✅ Replace `make_snapshot_cmd()` + `assert_cmd_snapshot!()` with PTY execution + `assert_snapshot!()`
-4. ✅ Ensure environment variables include `CLICOLOR_FORCE=1` for ANSI codes
-5. ✅ Update snapshot file format (file snapshot, not inline)
-6. ✅ Verify output matches expected README format
-7. ✅ Update README.md to reference new snapshot location
-
-### Implementation Note
-
-The PTY approach is specifically for **user-facing output documentation**. It's not a replacement for standard integration tests - both approaches serve different purposes and should coexist in the test suite.
+PTY tests are conformance tests for the shell boundary, not another place to
+retest every command. Keep one representative workflow per distinct shell
+implementation, then test command semantics through ordinary integration
+tests. Add a command × shell case only when that interaction is itself the
+contract.
 
 ## Coverage in PTY Tests
 
@@ -525,9 +514,44 @@ settings.add_filter(r"_REPO_/system-config\.toml", "[TEST_SYSTEM_CONFIG_FILE]");
 
 The helper wraps the pattern in `(?:\x1b\[\d+m)*` brackets, which eat only the bold open/close immediately adjacent to the path — surrounding color spans (yellow warning, etc.) are preserved.
 
-Setup-side path-redaction placeholders in the strip list (`add_placeholder_ansi_strip_filter` in `tests/common/mod.rs`): `[TEST_CONFIG]`, `[TEST_CONFIG_NEW]`, `[TEST_APPROVALS]`, `[TEST_GIT_CONFIG]`, `[PROJECT_ID]`, `[TEMP_HOME]`, `[TEMP]`. Placeholders that hold a real value (`[VERSION]`, `[HASH]`, `[BUILD_MODE]`, `[BINARY_PATH]`) keep their bold codes so the snapshot still asserts the user-visible styling. The strip pass is invoked at the end of every `setup_*_snapshot_settings` helper, so the contract holds uniformly across `setup_snapshot_settings*`, `setup_home_snapshot_settings`, and `setup_temp_snapshot_settings`.
+Setup-side path-redaction placeholders in the strip list (`add_placeholder_ansi_strip_filter` in `tests/common/mod.rs`): `[TEST_CONFIG]`, `[TEST_CONFIG_NEW]`, `[TEST_APPROVALS]`, `[PROJECT_ID]`, `[TEMP_HOME]`, `[TEMP]`. Placeholders that hold a real value (`[VERSION]`, `[HASH]`, `[BUILD_MODE]`, `[BINARY_PATH]`) keep their bold codes so the snapshot still asserts the user-visible styling. The strip pass is invoked at the end of every `setup_*_snapshot_settings` helper, so the contract holds uniformly across `setup_snapshot_settings*`, `setup_home_snapshot_settings`, and `setup_temp_snapshot_settings`.
 
 ## Test Style
+
+### Choose the cheapest boundary
+
+Put a belief at the lowest layer that can prove it:
+
+| Belief | Test boundary |
+|--------|---------------|
+| Parsing, formatting, allocation, state transitions | Direct unit/module test |
+| Git/filesystem/process wiring | Integration test with the smallest fitting fixture |
+| TTY behavior, shell syntax, stream interleaving | PTY or real-shell test |
+
+Exercise boundary values and input matrices exhaustively at the direct layer.
+Keep one representative integration case to prove the pieces are wired
+together. Do not repeat the same matrix end-to-end: a command × shell × width
+cross-product usually measures fixture and process setup, not another product
+behavior.
+
+Equivalent coverage or identical snapshots are useful duplication signals, not
+automatic deletion rules. Before removing a test, identify the belief it owns
+and make sure another test proves that belief at an equal or better boundary.
+
+A test's setup is part of its proof. For topology, absence, and error paths,
+assert the precondition named by the test; fixture names and comments are not
+evidence. If an earlier guard can produce the observed result, the test proves
+that guard rather than the intended condition.
+
+Configuring a subprocess mock is likewise not evidence that production used
+that route. When route selection is the belief, assert the recorded call with
+`mock_calls` and make unexpected calls fail (for example, through `_default`);
+otherwise a fallback or blank response can satisfy the oracle.
+
+Assert semantics through state, structured values, and exit status; snapshot
+the pragmatic user experience when the complete rendering is the contract. A
+custom verifier must fail for every violation it claims to check—diagnostic
+`println!` output is not an oracle.
 
 ### Snapshot env drift: cosmetic vs. a leak
 
@@ -611,7 +635,7 @@ To update existing file-based snapshots (e.g., after editing CLI help text),
 use `cargo insta test --accept`:
 
 ```bash
-cargo insta test --accept -- --test integration "test_help"
+cargo insta test --accept --test integration -- test_help
 ```
 
 Do not manually edit `.snap` files — they contain ANSI escape sequences that
@@ -623,6 +647,11 @@ Group related inputs into a single test when they verify the same belief about
 the code. A test named `test_wrap_text_at_width` that exercises short text, long
 text, single words, and edge cases is better than five separate test functions
 testing each input individually.
+
+Use the minimum sufficient contrasts: one anchor case, then one case that
+changes only the factor needed for each additional claim. A new test earns a
+separate function when it has a distinct setup, oracle, or failure diagnosis—
+not merely another input label or production branch.
 
 ```rust
 // ✅ GOOD: One test for the belief "wrapping respects word boundaries"

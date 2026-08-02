@@ -11,7 +11,7 @@
 //      delete) serially under the write side of the scan lock, reusing the
 //      removal plan its scan check computed.
 //
-// The fixture is `wt_perf::create_prune_repo_at`: squash-merged candidates
+// The fixture is `wt_perf::create_prune_repo`: squash-merged candidates
 // (integrated by content — the expensive probe path, the post-PR-squash shape
 // prune typically removes) against a two-sided-diverged backdrop of unmerged
 // worktrees and branches (forked deep in history while main advanced) that
@@ -46,10 +46,9 @@ use std::path::Path;
 use std::process::Command;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use worktrunk::testing::isolate_subprocess_env;
 use wt_perf::{
-    PRUNE_REAL_MERGED, PRUNE_REAL_UNMERGED, add_squash_merged, create_prune_repo_at,
-    ensure_prune_real_repo, invalidate_caches_auto, restore_worktree_indexes,
+    CacheState, PRUNE_REAL_MERGED, PRUNE_REAL_UNMERGED, add_squash_merged, bench_wt,
+    create_prune_repo, ensure_prune_real_repo, run_and_check, wt_command,
 };
 
 /// Squash-merged candidates per population (worktrees and orphan branches) —
@@ -71,29 +70,25 @@ const DRY_RUN_ARGS: &[&str] = &[
 ];
 const LIVE_ARGS: &[&str] = &["step", "prune", "--min-age", "0s", "--format", "json"];
 
-/// Run `wt <args>` in `repo`, panicking with stderr on failure; returns stdout.
-fn run(repo: &Path, args: &[&str], label: &str) -> Vec<u8> {
-    let mut cmd = Command::new(Path::new(env!("CARGO_BIN_EXE_wt")));
-    cmd.args(args).current_dir(repo);
-    isolate_subprocess_env(&mut cmd, None);
-    let output = cmd.output().unwrap();
-    assert!(
-        output.status.success(),
-        "{label} failed:\nstderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output.stdout
+/// Build the `wt <args>` command for `repo`.
+fn wt_cmd(repo: &Path, args: &[&str]) -> Command {
+    let mut cmd = wt_command(Path::new(env!("CARGO_BIN_EXE_wt")), repo, None);
+    cmd.args(args);
+    cmd
 }
 
-/// Guard against silently measuring a degraded scan: every run must list
-/// exactly `expected` candidates as planned (dry run) or removed (live). This
-/// is what caught the invalidated-index state flipping the removability gate,
-/// and on the live variant it fails the offending iteration directly instead
-/// of the next iteration's re-creation tripping over a leftover branch. An
-/// exact count also catches integration-detection false positives against the
-/// unmerged backdrop.
-fn assert_candidates(stdout: &[u8], expected: usize, label: &str) {
-    let items: serde_json::Value = serde_json::from_slice(stdout).unwrap();
+/// One-time fixture check, run once after setup and never inside a timed
+/// loop: a dry-run scan must list exactly `expected` candidates. Catches a
+/// fixture whose candidates prune doesn't detect, and detection false
+/// positives against the unmerged backdrop (this once caught an invalidation
+/// deleting worktree indexes and silently flipping the removability gate).
+/// The timed iterations themselves assert only exit status (`bench_wt`); a
+/// live run that removes nothing surfaces on the next iteration's
+/// re-creation instead — branch names don't carry the round, so
+/// `add_squash_merged` fails loudly on the collision.
+fn verify_candidates(repo: &Path, expected: usize) {
+    let output = run_and_check(&mut wt_cmd(repo, DRY_RUN_ARGS));
+    let items: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let found = items.as_array().unwrap().len();
     assert_eq!(
         found, expected,
@@ -106,36 +101,22 @@ fn bench_prune_e2e(c: &mut Criterion) {
 
     // Dry-run repo: candidates present but never removed, so the fixture is
     // reusable across iterations without re-setup.
-    let temp_dry = tempfile::tempdir().unwrap();
-    let repo_dry = temp_dry.path().join("repo");
-    create_prune_repo_at(MERGED, UNMERGED, &repo_dry);
+    let dry_fixture = create_prune_repo(MERGED, UNMERGED);
+    verify_candidates(dry_fixture.path(), MERGED * 2);
 
-    // Cold: every iteration re-pays the integration probes that sha_cache
-    // would otherwise absorb — the "first prune after fetching main" cost.
-    // `BatchSize::PerIteration` so the invalidation runs before every
-    // measured iter (under `SmallInput`, only iter 1 per batch is cold).
-    // The index restore is load-bearing: without it the invalidated indexes
-    // make every worktree read dirty and prune's removability gate silently
-    // drops the worktree candidates (see `restore_worktree_indexes`).
-    group.bench_function("dry_run_cold", |b| {
-        b.iter_batched(
-            || {
-                invalidate_caches_auto(&repo_dry);
-                restore_worktree_indexes(&repo_dry);
-            },
-            |_| {
-                let stdout = run(&repo_dry, DRY_RUN_ARGS, "dry_run_cold");
-                assert_candidates(&stdout, MERGED * 2, "dry_run_cold");
-            },
-            criterion::BatchSize::PerIteration,
-        );
+    // Probe-cold: every iteration re-pays the integration probes that
+    // sha_cache would otherwise absorb — the "first prune after fetching
+    // main" cost, with git's own caches staying warm as after a real fetch.
+    group.bench_function("dry_run_probe_cold", |b| {
+        bench_wt(b, dry_fixture.path(), CacheState::ProbeCold, || {
+            wt_cmd(dry_fixture.path(), DRY_RUN_ARGS)
+        });
     });
 
     // Warm: the steady-state re-scan where every probe hits sha_cache.
     group.bench_function("dry_run_warm", |b| {
-        b.iter(|| {
-            let stdout = run(&repo_dry, DRY_RUN_ARGS, "dry_run_warm");
-            assert_candidates(&stdout, MERGED * 2, "dry_run_warm");
+        bench_wt(b, dry_fixture.path(), CacheState::Warm, || {
+            wt_cmd(dry_fixture.path(), DRY_RUN_ARGS)
         });
     });
 
@@ -153,20 +134,18 @@ fn bench_prune_e2e(c: &mut Criterion) {
     // `benches/remove.rs`, which removes the *current* worktree — that path
     // leaves a placeholder directory plus a background `rmdir` that would
     // race the recreation.)
-    let temp_live = tempfile::tempdir().unwrap();
-    let repo_live = temp_live.path().join("repo");
-    create_prune_repo_at(0, UNMERGED, &repo_live);
+    let live_fixture = create_prune_repo(0, UNMERGED);
+    verify_candidates(live_fixture.path(), 0);
     let round = Cell::new(0usize);
 
     group.bench_function("live", |b| {
         b.iter_batched(
             || {
-                add_squash_merged(&repo_live, MERGED, round.get());
+                add_squash_merged(live_fixture.path(), MERGED, round.get());
                 round.set(round.get() + 1);
             },
             |_| {
-                let stdout = run(&repo_live, LIVE_ARGS, "live");
-                assert_candidates(&stdout, MERGED * 2, "live");
+                run_and_check(&mut wt_cmd(live_fixture.path(), LIVE_ARGS));
             },
             criterion::BatchSize::PerIteration,
         );

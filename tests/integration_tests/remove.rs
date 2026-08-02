@@ -10,20 +10,6 @@ use path_slash::PathExt as _;
 use rstest::rstest;
 
 #[rstest]
-fn test_remove_already_on_default(repo: TestRepo) {
-    // Already on main branch
-    assert_cmd_snapshot!(make_snapshot_cmd(&repo, "remove", &[], None));
-}
-
-#[rstest]
-fn test_remove_switch_to_default(repo: TestRepo) {
-    // Create and switch to a feature branch in the main repo
-    repo.run_git(&["switch", "-c", "feature"]);
-
-    assert_cmd_snapshot!(make_snapshot_cmd(&repo, "remove", &[], None));
-}
-
-#[rstest]
 fn test_remove_from_worktree(mut repo: TestRepo) {
     let worktree_path = repo.add_worktree("feature-wt");
 
@@ -169,14 +155,6 @@ fn test_remove_as_git_subcommand(mut repo: TestRepo) {
 }
 
 #[rstest]
-fn test_remove_dirty_working_tree(repo: TestRepo) {
-    // Create a dirty file
-    std::fs::write(repo.root_path().join("dirty.txt"), "uncommitted changes").unwrap();
-
-    assert_cmd_snapshot!(make_snapshot_cmd(&repo, "remove", &[], None));
-}
-
-#[rstest]
 fn test_remove_locked_worktree(mut repo: TestRepo) {
     // Create a worktree and lock it
     let _worktree_path = repo.add_worktree("locked-feature");
@@ -229,7 +207,7 @@ fn test_remove_locked_detached_worktree(mut repo: TestRepo) {
     repo.lock_worktree("locked-detached", Some("Detached and locked"));
 
     // Try to remove from within the locked detached worktree - should fail
-    // This exercises the RemoveTarget::Current path for locked worktrees
+    // This exercises exact-path removal of the current locked worktree.
     assert_cmd_snapshot!(make_snapshot_cmd(
         &repo,
         "remove",
@@ -345,12 +323,6 @@ fn test_remove_current_by_name(mut repo: TestRepo) {
         &["feature-current"],
         Some(&worktree_path)
     ));
-}
-
-#[rstest]
-fn test_remove_nonexistent_worktree(repo: TestRepo) {
-    // Try to remove a worktree that doesn't exist
-    assert_cmd_snapshot!(make_snapshot_cmd(&repo, "remove", &["nonexistent"], None));
 }
 
 ///
@@ -1864,8 +1836,21 @@ approved-commands = ["echo 'hook ran' > {}"]
     );
 }
 
+/// The final dirty-worktree gate holds on both execution paths.
+///
+/// Planning validates cleanliness before `pre-remove` runs, so a hook that
+/// dirties the worktree can only be caught by the gate immediately before the
+/// mutation — `stage_worktree_removal`'s, the one every path shares. The
+/// background case is the load-bearing one: it's the default for `wt remove`,
+/// and it stages the worktree by renaming it out from under the user, so a
+/// missing gate there destroys the hook's output rather than refusing.
 #[rstest]
-fn test_pre_remove_hook_dirtying_worktree_blocks_foreground_remove(mut repo: TestRepo) {
+#[case::foreground(&["--foreground"])]
+#[case::background(&[])]
+fn test_pre_remove_hook_dirtying_worktree_blocks_remove(
+    mut repo: TestRepo,
+    #[case] execution_args: &[&str],
+) {
     let hook = "echo dirty > hook-created.txt";
     repo.write_project_config(&format!(r#"pre-remove = "{hook}""#));
     repo.commit("Add config");
@@ -1878,7 +1863,9 @@ approved-commands = ["{hook}"]
     let worktree_path = repo.add_worktree("feature-hook-dirties");
     let output = repo
         .wt_command()
-        .args(["remove", "--foreground", "feature-hook-dirties"])
+        .arg("remove")
+        .args(execution_args)
+        .arg("feature-hook-dirties")
         .output()
         .unwrap();
 
@@ -3533,7 +3520,7 @@ fn test_remove_foreground_with_submodules(mut repo: TestRepo) {
     // Create a local repo to use as a submodule source
     let sub_source = repo.root_path().parent().unwrap().join("sub-source");
     std::fs::create_dir_all(&sub_source).unwrap();
-    repo.run_git_in(&sub_source, &["init"]);
+    repo.run_git_in(&sub_source, &["init", "-b", "main"]);
     std::fs::write(sub_source.join("sub.txt"), "submodule content").unwrap();
     repo.run_git_in(&sub_source, &["add", "sub.txt"]);
     repo.run_git_in(&sub_source, &["commit", "-m", "sub init"]);
@@ -3614,7 +3601,7 @@ fn test_remove_worktree_submodule_dirty_fails_closed(mut repo: TestRepo) {
     // Submodule source.
     let sub_source = repo.root_path().parent().unwrap().join("sub-source-dirty");
     std::fs::create_dir_all(&sub_source).unwrap();
-    repo.run_git_in(&sub_source, &["init"]);
+    repo.run_git_in(&sub_source, &["init", "-b", "main"]);
     std::fs::write(sub_source.join("sub.txt"), "submodule content").unwrap();
     repo.run_git_in(&sub_source, &["add", "sub.txt"]);
     repo.run_git_in(&sub_source, &["commit", "-m", "sub init"]);
@@ -3777,27 +3764,6 @@ fn test_remove_json(mut repo: TestRepo) {
             "--yes",
             "--foreground",
         ])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-
-    let mut settings = insta::Settings::clone_current();
-    settings.add_filter(r#""path": "[^"]*""#, r#""path": "<PATH>""#);
-    settings.bind(|| {
-        assert_snapshot!(String::from_utf8_lossy(&output.stdout));
-    });
-}
-
-#[cfg(not(target_os = "windows"))] // foreground removal with cwd inside the worktree hits directory locking
-#[rstest]
-fn test_remove_json_current(mut repo: TestRepo) {
-    repo.commit("initial");
-    let feature_wt = repo.add_worktree("feature");
-
-    let output = repo
-        .wt_command()
-        .args(["remove", "--format=json", "--yes", "--foreground"])
-        .current_dir(&feature_wt)
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -4304,6 +4270,47 @@ fn test_remove_last_live_checkout_deletes_branch(mut repo: TestRepo) {
         !stderr.contains("still checked out"),
         "a stale entry is not a checkout to retain the branch for\nstderr:\n{stderr}",
     );
+}
+
+/// Planning sees one checkout, then an approved `pre-remove` hook creates a
+/// duplicate. The final topology guard must retain the branch and report the
+/// actual checkout race, not mislabel it as ref movement or failed integration.
+#[rstest]
+fn test_pre_remove_hook_new_checkout_retains_branch(mut repo: TestRepo) {
+    let survivor = repo
+        .root_path()
+        .parent()
+        .unwrap()
+        .join("repo.feature-hook-survivor");
+    let hook = "git worktree add --force ../repo.feature-hook-survivor feature-hook-checkout";
+    repo.write_project_config(&format!("pre-remove = {hook:?}"));
+    repo.commit("Add config");
+    repo.write_test_approvals(&format!(
+        r#"[projects."../origin"]
+approved-commands = [{hook:?}]
+"#
+    ));
+    let removed = repo.add_worktree("feature-hook-checkout");
+
+    let settings = setup_snapshot_settings(&repo);
+    settings.bind(|| {
+        assert_cmd_snapshot!(
+            "remove_pre_remove_hook_new_checkout_retains_branch",
+            make_snapshot_cmd(
+                &repo,
+                "remove",
+                &["--foreground", "feature-hook-checkout"],
+                None,
+            )
+        );
+    });
+
+    assert!(
+        !removed.exists(),
+        "the originally planned worktree is removed"
+    );
+    assert_branch_exists(&repo, "feature-hook-checkout", true, "snapshot above");
+    assert_not_orphaned(&repo, &survivor, "snapshot above");
 }
 
 /// Assert git still tracks `branch`'s worktree — that its `.git/worktrees/<id>`

@@ -716,6 +716,37 @@ fn commit_details_many_returns_subject_with_spaces() {
 }
 
 #[test]
+fn abbrev_len_follows_core_abbrev_and_covers_absent_objects() {
+    use crate::git::Repository;
+    use crate::testing::TestRepo;
+
+    let test = TestRepo::with_initial_commit();
+
+    // The width git actually uses here — the same one `%h` and `short_sha`
+    // produce, which is the whole point of asking git rather than picking a
+    // number.
+    let head_short = test.repo.short_sha("HEAD").unwrap();
+    assert_eq!(test.repo.abbrev_len(), head_short.chars().count());
+
+    // `core.abbrev` reaches it. A fresh `Repository` because the width is
+    // resolved once per repo handle and cached for the process.
+    test.repo
+        .run_command(&["config", "core.abbrev", "12"])
+        .unwrap();
+    let reread = Repository::at(test.path()).unwrap();
+    assert_eq!(reread.abbrev_len(), 12);
+
+    // The case `short_sha` can't serve per-SHA: an object that isn't in the
+    // store, as every commit the `--prs` log tab gets from a forge API is. git
+    // has nothing to disambiguate against, so this width is its whole answer.
+    let absent = "0".repeat(head_short.chars().count().max(40));
+    assert_eq!(
+        reread.short_sha(&absent).unwrap().chars().count(),
+        reread.abbrev_len(),
+    );
+}
+
+#[test]
 fn commit_details_many_empty_input_is_noop() {
     use crate::testing::TestRepo;
 
@@ -972,13 +1003,7 @@ fn build_worktree_config_bare_layout() -> (tempfile::TempDir, std::path::PathBuf
     std::fs::create_dir_all(&project_root).unwrap();
     let git_dir = project_root.join(".git");
 
-    let gitconfig = tmp.path().join("test-gitconfig");
-    std::fs::write(
-        &gitconfig,
-        "[init]\n\tdefaultBranch = main\n[user]\n\tname = test\n\temail = test@test\n",
-    )
-    .unwrap();
-    let git = || crate::testing::configure_git_env(Cmd::new("git"), &gitconfig);
+    let git = || crate::testing::configure_git_env(Cmd::new("git"));
 
     let path_str = |p: &std::path::Path| p.to_str().unwrap().to_owned();
 
@@ -1142,10 +1167,8 @@ fn prewarm_still_caches_preload_when_worktree_config_disabled() {
     let tmp = tempfile::tempdir().unwrap();
     let root = canonicalize(tmp.path()).unwrap().join("normal");
     std::fs::create_dir_all(&root).unwrap();
-    let gitconfig = tmp.path().join("test-gitconfig");
-    std::fs::write(&gitconfig, "[init]\n\tdefaultBranch = main\n").unwrap();
 
-    let out = crate::testing::configure_git_env(Cmd::new("git"), &gitconfig)
+    let out = crate::testing::configure_git_env(Cmd::new("git"))
         .args(["init", "-b", "main", root.to_str().unwrap()])
         .run()
         .unwrap();
@@ -1366,17 +1389,8 @@ fn test_worktree_for_branch_dedups_duplicate_warning() {
     let tmp = tempfile::tempdir().unwrap();
     let root = canonicalize(tmp.path()).unwrap().join("repo");
     std::fs::create_dir_all(&root).unwrap();
-    let gitconfig = tmp.path().join("test-gitconfig");
-    std::fs::write(
-        &gitconfig,
-        "[user]\n\tname = t\n\temail = t@example.com\n[init]\n\tdefaultBranch = main\n",
-    )
-    .unwrap();
     let git = |args: &[&str], dir: &Path| {
-        let out = Cmd::new("git")
-            .env("GIT_CONFIG_GLOBAL", &gitconfig)
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("LC_ALL", "C")
+        let out = crate::testing::configure_git_env(Cmd::new("git"))
             .args(args.iter().copied())
             .current_dir(dir)
             .run()

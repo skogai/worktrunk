@@ -9,6 +9,13 @@ info:
     CLICOLOR_FORCE: "1"
     COLUMNS: "80"
     GIT_ALLOW_PROTOCOL: file
+    GIT_CONFIG_COUNT: "2"
+    GIT_CONFIG_GLOBAL: /nonexistent/wt/gitconfig
+    GIT_CONFIG_KEY_0: user.useConfigOnly
+    GIT_CONFIG_KEY_1: rerere.enabled
+    GIT_CONFIG_SYSTEM: /nonexistent/wt/gitconfig
+    GIT_CONFIG_VALUE_0: "true"
+    GIT_CONFIG_VALUE_1: "false"
     LANG: C
     LC_ALL: C
     LLVM_PROFILE_FILE: "[LLVM_PROFILE_FILE]"
@@ -106,11 +113,11 @@ branch's changes. The [2mmain…±[0m line diffs are local git, so they show b
 List all worktrees:
 
 [107m [0m [2m[0m[2m[34mwt[0m[2m list[0m
-[107m [0m [2m  [0m[2m[34mBranch[0m[2m       Status        HEAD±    main↕     main…±  Remote⇅  Commit    Ag[22m[2m…[0m
-[107m [0m [2m[0m[2m[34m@[0m[2m feature-api  +   ↕⇡     +54   [0m[2m[36m-5[0m[2m   ↑4  ↓1  +234  [0m[2m[36m-24[0m[2m   ⇡3      6814f02a  30[22m[2m…[0m
-[107m [0m [2m[0m[2m[34m^[0m[2m main             ^⇅                                    ⇡1  ⇣1  41ee0834  4d[22m[2m…[0m
-[107m [0m [2m[0m[2m[34m+[0m[2m fix-auth         ↕[0m[2m[36m|[0m[2m                [0m[2m[34m↑2[0m[2m  ↓1   +25  [0m[2m[36m-11[0m[2m     [0m[2m[36m|[0m[2m     [0m[2m[34mb772e68b[0m[2m  5h[22m[2m…[0m
-[107m [0m [2m+ fix-typos        _[0m[2m[36m|[0m[2m                                      [0m[2m[36m|[0m[2m     [0m[2m[34m41ee0834[0m[2m  4d[22m[2m…[0m
+[107m [0m [2m  [0m[2m[34mBranch[0m[2m       Status        HEAD±    main↕     main…±  Remote⇅  Commit   Age[22m[2m…[0m
+[107m [0m [2m[0m[2m[34m@[0m[2m feature-api  +   ↕⇡     +54   [0m[2m[36m-5[0m[2m   ↑4  ↓1  +234  [0m[2m[36m-24[0m[2m   ⇡3      6814f02  30m[22m[2m…[0m
+[107m [0m [2m[0m[2m[34m^[0m[2m main             ^⇅                                    ⇡1  ⇣1  41ee083  4d [22m[2m…[0m
+[107m [0m [2m[0m[2m[34m+[0m[2m fix-auth         ↕[0m[2m[36m|[0m[2m                [0m[2m[34m↑2[0m[2m  ↓1   +25  [0m[2m[36m-11[0m[2m     [0m[2m[36m|[0m[2m     [0m[2m[34mb772e68[0m[2m  5h [22m[2m…[0m
+[107m [0m [2m+ fix-typos        _[0m[2m[36m|[0m[2m                                      [0m[2m[36m|[0m[2m     [0m[2m[34m41ee083[0m[2m  4d [22m[2m…[0m
 [107m [0m [0m
 [107m [0m [2m○ Showing 4 worktrees, 1 with changes, 2 ahead, 1 column hidden[0m
 
@@ -146,7 +153,8 @@ Output as JSON for scripting:
 
   Column                                  Shows                                 
  ──────── ───────────────────────────────────────────────────────────────────── 
- Branch   Branch name                                                           
+ Branch   Branch name; a detached worktree has none, so it shows its short hash 
+          in dim yellow                                                         
  Status   Compact symbols (see below)                                           
  HEAD±    Uncommitted changes: +added -deleted lines                            
  main↕    Commits ahead/behind default branch                                   
@@ -159,7 +167,7 @@ Output as JSON for scripting:
  URL      Dev server URL from project config; dimmed if port is not listening   
  (custom) User-defined custom columns from [2m[list.custom-columns][0m user config    
           [experimental]                                                        
- Commit   Short hash (8 chars)                                                  
+ Commit   Short hash, abbreviated per [2mcore.abbrev[0m                               
  Age      Time since last commit                                                
  Message  Last commit message (truncated)                                       
 
@@ -285,8 +293,10 @@ An in-progress git operation, a worktree-location attribute, or a branch with no
       [2m"duplicate_branch"[0m             worktree, so [2mwt[0m resolves it to whichever   
                                      git lists first; every worktree on the     
                                      branch is flagged                          
- [2m[33m⚑[0m    [2mworktree.state[0m                 Branch name doesn't match the worktree     
-      [2m"branch_worktree_mismatch"[0m     path                                       
+ [2m[33m⚑[0m    [2mworktree.state[0m                 Worktree isn't at the path its branch      
+      [2m"branch_worktree_mismatch"[0m     implies — including a detached one, which  
+                                     has no branch to imply a path and so is    
+                                     never at home                              
  [2m/[0m    [2mkind[0m [2m"branch"[0m                  Branch without a worktree (no [2mworktree[0m     
                                      object)                                    
 
