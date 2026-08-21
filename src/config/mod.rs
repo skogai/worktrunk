@@ -8,8 +8,11 @@
 //! 3. **Project config** (`.config/wt.toml`) - Lifecycle hooks, checked into git
 //!
 //! System and user configs share the same schema and are merged via
-//! `deep_merge_table` (user values override system values at the key level).
-//! Project config is independent — different schema, different purpose.
+//! `merge_layer`, which ranks each layer above the one beneath it as a whole:
+//! a user value overrides the system value for the same key, and a user global
+//! key also outranks a system `[projects."…"]` entry that would otherwise be
+//! the more specific match. Project config is independent — different schema,
+//! different purpose.
 //!
 //! See `wt config --help` for complete documentation.
 
@@ -171,12 +174,13 @@ pub use expansion::{
 pub use hooks::HooksConfig;
 pub use project::{
     ProjectCiConfig, ProjectCommitConfig, ProjectCommitGenerationConfig, ProjectConfig,
-    ProjectListConfig, valid_project_config_keys,
+    ProjectForgeConfig, ProjectListConfig, valid_project_config_keys,
 };
 pub use unknown_tree::{
     UnknownAnalysis, UnknownTree, UnknownWarning, collect_unknown_warnings, compute_unknown_tree,
 };
 pub(crate) use user::LoadError;
+pub(crate) use user::project_match::matching_keys as matching_project_keys;
 pub use user::{
     CommitConfig, CommitGenerationConfig, CopyIgnoredConfig, ListColumnConfig, ListConfig,
     MergeConfig, RemoveConfig, ResolvedConfig, StageMode, StepConfig, SwitchConfig,

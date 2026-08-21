@@ -51,6 +51,7 @@ pub const REPO_VARS: &[&str] = &[
     "repo",
     "repo_path",
     "owner",
+    "remote_repo",
     "primary_worktree_path",
     "default_branch",
     "remote",
@@ -2589,7 +2590,7 @@ mod tests {
             .args([
                 "config",
                 "worktrunk.state.main.vars.config",
-                r#"{"port": 3000, "debug": true}"#,
+                r#"{"port": 3000, "debug": true, "note": null}"#,
             ])
             .current_dir(test.path())
             .run()
@@ -2628,6 +2629,9 @@ mod tests {
             .unwrap(),
             "3000"
         );
+        // A JSON bool or null reaches minijinja as a real bool/none, so each
+        // renders the way minijinja renders it: `True`/`False`/`None` since
+        // 2.22, which adopted Jinja2's spelling for all three together.
         assert_eq!(
             expand_template(
                 "{{ vars.config.debug }}",
@@ -2637,7 +2641,18 @@ mod tests {
                 "test"
             )
             .unwrap(),
-            "true"
+            "True"
+        );
+        assert_eq!(
+            expand_template(
+                "{{ vars.config.note }}",
+                &vars,
+                ShellEscapeMode::Literal,
+                &test.repo,
+                "test"
+            )
+            .unwrap(),
+            "None"
         );
 
         // Array index access
@@ -2931,6 +2946,20 @@ mod tests {
             .is_ok()
         );
 
+        // Remote-derived repo vars validate in every scope
+        assert!(
+            validate_template("{{ owner }}/{{ remote_repo }}", hook, &test.repo, "test").is_ok()
+        );
+        assert!(
+            validate_template(
+                "{{ remote_repo }}",
+                ValidationScope::Alias,
+                &test.repo,
+                "test"
+            )
+            .is_ok()
+        );
+
         // Deprecated vars still valid in every scope
         assert!(validate_template("{{ main_worktree }}", hook, &test.repo, "test").is_ok());
 
@@ -3155,6 +3184,7 @@ mod tests {
         repo                  = demo
         repo_path             = /tmp/demo
         owner                 = (unset)
+        remote_repo           = (unset)
         primary_worktree_path = (unset)
         default_branch        = (unset)
         remote                = (unset)

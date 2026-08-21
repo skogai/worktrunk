@@ -137,6 +137,8 @@ Created by `wt config shell install`:
   - `Documents/PowerShell/Microsoft.PowerShell_profile.ps1` (PowerShell 7+)
   - `Documents/WindowsPowerShell/Microsoft.PowerShell_profile.ps1` (Windows PowerShell 5.1)
 
+Fish and Nushell wrappers live at a path named after the command, so install writes that file whole, replacing an existing `functions/wt.fish`, `completions/wt.fish`, or `wt.nu`. Bash, zsh, and PowerShell rc files hold the rest of a shell's setup, so install only appends a line to those.
+
 **PowerShell detection on Windows:** When running from cmd.exe or PowerShell, both PowerShell profile files are created automatically. When running from Git Bash or MSYS2, PowerShell is skipped (use `wt config shell install powershell` to create the profiles explicitly).
 
 **To remove:** `wt config shell uninstall`.
@@ -177,6 +179,8 @@ Worktrunk can delete **worktrees** and **branches**. Both have safeguards.
 
 `wt remove` mirrors `git worktree remove`: it refuses to remove worktrees with uncommitted changes (staged, modified, or untracked files). The `--force` flag removes the worktree anyway, discarding all of those changes.
 
+Removal also refuses, `--force` included, when the directory at a registered path no longer holds the worktree registered there — a clone made there after the worktree was deleted, say, or another worktree of the same repository moved onto the path. `--force` waives uncommitted changes, not the check for what the directory holds, and `git worktree remove` refuses the same cases.
+
 To protect a worktree from removal entirely (say it holds a local database), lock it:
 
 {{ terminal(cmd="git worktree lock ../myproject.feature --reason __WT_QUOT__Contains local database__WT_QUOT__") }}
@@ -195,6 +199,7 @@ A branch checked out in a second worktree is retained regardless, `-D` included.
 
 ### Other cleanup
 
+- `wt merge` / `wt step push` — the target branch's checked-out worktree is updated to the merged commits, so a file those commits delete disappears from it, and an ignored file at a path they track is overwritten — the same result a `git merge` run in that worktree would produce. Uncommitted changes at paths the merge doesn't touch stay in place, staged or not; one at a path it does touch refuses the merge upfront, naming the file
 - `wt remove` — besides the target worktree, two cleanup mechanisms run. The removed worktree's own `git fsmonitor--daemon` (git's per-worktree filesystem watcher under `core.fsmonitor=true`, which would leak once its worktree is gone) is sent `git fsmonitor--daemon stop`, then force-terminated (`SIGTERM`, then `SIGKILL`) via the PID resolved from its IPC socket if it didn't exit. A background sweep then deletes `.git/wt/trash/` entries older than 24 hours (directories orphaned when a previous background removal was interrupted) and terminates fsmonitor daemons whose worktree no longer exists (orphans from `git worktree remove`, `rm -rf`, or a crashed `wt`)
 - `wt config state clear` — removes all worktrunk data from `.git/` (config keys, caches, markers, hints, variables, logs, stale trash)
 - `wt config shell install` — when migrating an integration to a new location, removes the file left at the old one: fish `conf.d/wt.fish` (now `functions/wt.fish`) and nushell wrappers stranded under `<config-dir>/vendor/autoload` (now `<data-dir>/vendor/autoload`). The old path is where worktrunk's own wrapper lived and is named after the command being installed, so it's taken back whole without reading it — a `conf.d/wt.fish` left in place would be sourced at startup and shadow the new wrapper anyway. Only that exact filename is touched, and each removal is printed
@@ -286,7 +291,7 @@ This disables bash syntax highlighting in command output but keeps all core func
 
 ### Full integration tests
 
-Shell integration tests require bash, zsh, fish, and nushell:
+Shell integration tests require bash, zsh, fish, nushell, and pwsh, plus `jq`:
 
 {{ terminal(cmd="cargo test --test integration --features shell-integration-tests") }}
 

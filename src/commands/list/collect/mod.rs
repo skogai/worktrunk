@@ -14,16 +14,16 @@
 //!
 //! A steady-state run reaches the skeleton through five `git` subprocess
 //! forks (six in repos with `extensions.worktreeConfig=true` — see #3
-//! below). Fork *count* is O(1) — independent of worktree or branch
-//! count — because each batches as much as it can. Fork *work* scales with
-//! N (refs read, SHAs resolved); on a fast Linux system N=40 lands
-//! ~30–80 ms.
+//! below, where the sixth runs inside prewarm). Fork *count* is O(1) —
+//! independent of worktree or branch count — because each batches as much
+//! as it can. Fork *work* scales with N (refs read, SHAs resolved); on a
+//! fast Linux system N=40 lands ~30–80 ms.
 //!
 //! | # | Command | Source | Role |
 //! |---|---------|--------|------|
 //! | 1 | `git rev-parse --git-common-dir --is-inside-work-tree --show-toplevel --git-dir --symbolic-full-name HEAD` | [`Repository::prewarm`] (`prewarm_rev_parse`) | Five facts in one fork: shared `.git`, in-worktree gate, worktree root, per-worktree `.git/worktrees/<name>`, current branch. Populates process-global caches. Parallel with #2 at process startup. |
 //! | 2 | `git config --list -z` (cwd = discovery path) | [`Repository::prewarm`] (`prewarm_git_config`) | Whole merged config (system + global + local) in one shot, NUL-delimited so values containing `\n` or `=` parse unambiguously. Stashed in `GIT_CONFIG_PRELOAD` keyed by discovery path; every later `config_last("…")` reads from memory. Parallel with #1. |
-//! | 3 | `git config --list -z` (cwd = `git_common_dir`) | [`Repository::all_config`] | **Conditional.** [`Repository::at`] consumes #2's preload into `cache.all_config`, so `all_config()` is a memory hit on a normal repo. This fork only fires when `prewarm_git_config` declined the preload because `extensions.worktreeConfig=true` — there `--list` from a linked worktree misses the main-worktree `config.worktree` overrides (most importantly `core.bare = true` for the `myproject/.git + sibling worktrees` layout), so `all_config` re-forks from the common dir to see the full merged set. See `prewarm_git_config` for the full reasoning. |
+//! | 3 | `git config --list -z` (cwd = `git_common_dir`) | [`Repository::prewarm`] post-pass (`prewarm_git_config_from_common_dir`) | **Conditional.** [`Repository::at`] consumes #2's preload into `cache.all_config`, so `all_config()` is a memory hit on a normal repo. In `extensions.worktreeConfig=true` repos, #2's read is declined — `--list` from a linked worktree misses the main-worktree `config.worktree` overrides (most importantly `core.bare = true` for the `myproject/.git + sibling worktrees` layout) — and prewarm re-forks from the common dir after its threads join, preloading the full merged set. [`Repository::all_config`] forks the same command on demand only when prewarm never ran for the path (a non-base `Repository::at`, tests). See `prewarm_git_config` for the full reasoning. |
 //! | 4 | `git worktree list --porcelain` | [`Repository::list_worktrees`] | Path, HEAD SHA, branch, and flags per worktree — the row source for the skeleton. The picker prelude triggers this once for `num_items_estimate`; collect's rayon scope then hits the cache. |
 //! | 5 | `git for-each-ref --format=… refs/heads/` | [`Repository::local_branches`] inside collect's `rayon::scope` | Local branch tips (name, SHA, committer date, upstream) for branch-only rows (`branches=true`) and for the stale-default-branch check. `remotes=true` adds a sibling `refs/remotes/` fork. The scope joins; this fork gates the skeleton. |
 //! | 6 | `git log --no-walk --no-show-signature --format=… SHA₁ … SHA_N` | collect, after the scope | Batched commit metadata for every worktree HEAD + branch tip. See breakdown below. |
@@ -318,10 +318,12 @@ use once_cell::sync::OnceCell;
 use rayon::prelude::*;
 use worktrunk::git::{ErrorExt, LocalBranch, Repository, WorktreeInfo};
 use worktrunk::styling::{
-    INFO_SYMBOL, eprintln, format_with_gutter, hint_message, truncate_visible, warning_message,
+    INFO_SYMBOL, eprintln, format_with_gutter, hint_message, terminal_width, truncate_visible,
+    warning_message,
 };
 
 use crate::commands::is_worktree_at_expected_path;
+use worktrunk::styling::println;
 
 use super::model::{CommitDetails, ItemKind, ListItem, StatusSymbols, WorktreeData};
 use super::progressive::RenderTarget;
@@ -390,7 +392,7 @@ impl TableRenderPlan {
             // for `WORKTRUNK_FIRST_OUTPUT` whenever progressive rendering is on
             // (`show_progress || progressive_handler.is_some()`), so this render
             // path runs only in buffered mode.
-            print_first_buffered_line(&self.header)?;
+            println!("{}", self.header);
             return Ok(true);
         }
 
@@ -401,15 +403,6 @@ impl TableRenderPlan {
         }
         Ok(false)
     }
-}
-
-fn print_first_buffered_line(header: &str) -> anyhow::Result<()> {
-    use std::io::Write as _;
-
-    let mut stdout = std::io::stdout();
-    writeln!(stdout, "{header}")?;
-    stdout.flush()?;
-    Ok(())
 }
 
 fn print_buffered_table(header: &str, rows: &[String], summary: &str) {
@@ -1293,11 +1286,11 @@ pub fn collect(
     //   a listed `summary` that `Default` alone wouldn't plan (LLM command set,
     //   `[list] summary` off): without it the picker would hide a column `wt list`
     //   shows. CI is already covered — the picker is always `show_full`.
-    // - `--format json` → `all_columns` unioned with the selection's forced-on
-    //   columns: the every-field contract (`src/cli/mod.rs`) needs the full
-    //   set, never a narrowing — but a listed `ci` forces the fetch on, so
-    //   JSON reports the same data the table shows (and `collected.ci` says
-    //   so).
+    // - `--format json` → `all_columns` alone (source `Default`), so the
+    //   selection reaches it in neither direction: the every-field contract
+    //   (`src/cli/mod.rs`) rules out narrowing, and a display setting must not
+    //   decide whether a machine-readable call reaches a forge — `--full` is
+    //   the switch for that (#3787).
     //
     // So a branch/path `ls` alias over many dirty worktrees runs no `git status`
     // / diffs / ahead-behind walks (#3133), while a default column gated off by
@@ -1322,16 +1315,19 @@ pub fn collect(
             &gates,
         )
     };
-    let prune_to_selection =
-        render_table && progressive_handler.is_none() && !selected_columns.is_empty();
-    let tasks = if prune_to_selection {
-        listed_plan()
-    } else {
-        // Picker and JSON: the full set plus the selection's forced-on
-        // columns (a no-op when nothing is selected).
+    // The picker runs `collect` with a handler and no table render; JSON is the
+    // remaining handler-less non-table shape.
+    let tasks = if progressive_handler.is_some() {
+        // Picker: the full set plus the selection's forced-on columns (a no-op
+        // when nothing is selected).
         let mut tasks = full_plan();
         tasks.extend(listed_plan());
         tasks
+    } else if render_table && !selected_columns.is_empty() {
+        listed_plan()
+    } else {
+        // `wt list` with no selection, and every `--format json` run.
+        full_plan()
     };
 
     // The picker primes its CI cells from the local cache so the column paints
@@ -1358,9 +1354,7 @@ pub fn collect(
     // The picker passes an explicit width because the list only gets part of the
     // terminal — the rest belongs to the preview pane — and takes its rows
     // link-free because skim mangles OSC 8 (see `Destination`).
-    let width = list_width
-        .or_else(crate::display::terminal_width)
-        .unwrap_or(usize::MAX);
+    let width = list_width.or_else(terminal_width).unwrap_or(usize::MAX);
     let destination = if progressive_handler.is_some() {
         super::layout::Destination::picker(width)
     } else {
@@ -1381,7 +1375,7 @@ pub fn collect(
 
     // Single-line invariant: with no detectable width, an unlimited width
     // keeps rows untruncated rather than wrapping at a guessed width
-    let max_width = crate::display::terminal_width().unwrap_or(usize::MAX);
+    let max_width = terminal_width().unwrap_or(usize::MAX);
 
     // Which gated fact families the plan requested — recorded on `ListData`
     // so JSON output can distinguish "not requested" from "undetermined".

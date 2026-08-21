@@ -12,9 +12,9 @@ cargo test --test integration                                      # integration
 cargo test --test integration --features shell-integration-tests   # + shell tests
 ```
 
-A target filter (`--lib`, `--test integration`, …) never builds `mock-stub`, so the run gets whatever sits in `target/`: a fresh tree has none and panics with "mock-stub binary not found", and a warm one runs the tests against a stale stub, whose failures reflect the code it was built from rather than the change under test. Fix: `cargo build -p mock-stub`, or use `cargo nextest run` / `cargo llvm-cov nextest`.
+Every binary the suite spawns is `wt` itself — the mock commands are the same binary linked under other names, dispatching on argv[0] (`testing::mock_stub`) — so no run can spawn missing or stale code: cargo rebuilds a package's own binaries whenever its integration tests build, under every runner and filter, and `wt_bin()` resolves `CARGO_BIN_EXE_wt` — naming that just-built binary — into a hardlink pinned under `target/debug/wt-test-bin/`, which a concurrent `cargo build`'s uplift can't unlink mid-run (see No Retries); outside a cargo runner the suite panics ("CARGO_BIN_EXE_wt not set") rather than guessing a path. `cargo build --bin wt` recompiling right after a test run is the bin-only build being a separate cached unit (a different feature graph), not evidence the tests ran stale code.
 
-**Claude Code web:** `task setup-web` installs zsh/fish/nushell, `gh`, and dev tools. Install `task` first if needed: `sh -c "$(curl --location https://taskfile.dev/install.sh)" -- -d -b ~/bin` then `export PATH="$HOME/bin:$PATH"`. The permission tests (`test_permission_error_prevents_save`, `test_approval_prompt_permission_error`) skip automatically when running as root.
+**Claude Code web:** `task setup-web` installs zsh, fish, Nushell, PowerShell, `jq`, `lsof`, `gh`, pre-commit, and the Cargo dev tools. Install `task` first if needed: `sh -c "$(curl --location https://taskfile.dev/install.sh)" -- -d -b ~/bin` then `export PATH="$HOME/bin:$PATH"`. Tests that need an unprivileged uid skip automatically when running as root, which both this environment and Codex Cloud do; that covers the permission tests and the `wt remove` stuck-directory pair, the only automated coverage of that path.
 
 **Shell/PTY tests** (`shell-integration-tests` feature): approval prompts, picker, progressive rendering, shell wrappers.
 
@@ -24,11 +24,9 @@ A target filter (`--lib`, `--test integration`, …) never builds `mock-stub`, s
 
 Five runners execute this suite — `cargo test`, `cargo nextest run`, `cargo llvm-cov nextest`, `cargo bench`, and the Nix `worktrunk-tests` derivation — and CI uses several of them on the same commit. **A test's result must not depend on which one started it.**
 
-So `.config/nextest.toml` carries no setting that changes what a test observes: no `[env]`, and no setup script exporting through `$NEXTEST_ENV`. Anything load-bearing goes where every runner sees it — the harness-latched floor in `shell_exec` for git environment (see Git Config Isolation), `.cargo/config.toml` for `COLUMNS`, the fixture for behavior.
+So `.config/nextest.toml` carries no setting that changes what a test observes: no `[env]`, no setup scripts. Anything load-bearing goes where every runner sees it — the harness-latched floor in `shell_exec` for git environment (see Git Config Isolation), `.cargo/config.toml` for `COLUMNS`, the fixture for behavior.
 
 A nextest-only knob doesn't fail loudly when another runner misses it. It yields a *different result*, and the runner that disagrees is typically `cargo llvm-cov` — whose numbers gate a merge, and whose disagreement therefore reads as a coverage regression rather than as missing configuration.
-
-The one setup script here, `build-bins`, is a build step rather than a behavior setting: it compiles the `mock-stub` helper a target-filtered run would otherwise skip, and the same gap under plain `cargo test` is handled by `default-members` (see Running the Suite). It carries its own TODO to disappear once cargo-dist supports per-binary exclusion. It is not precedent.
 
 ## Profiling the Suite
 
@@ -118,7 +116,7 @@ cmd.args(["switch", "--create", "feature"])
 
 ```rust
 // ❌ BAD: Missing isolation - inherits host environment
-let output = Command::new(env!("CARGO_BIN_EXE_wt"))
+let output = Command::new(wt_bin())
     .args(["switch", "--create", "feature"])
     .current_dir(repo.root_path())
     .output()?;
@@ -167,10 +165,11 @@ somewhere else.
 **Name it `WORKTRUNK_TEST_*`.** `isolate_subprocess_env` scrubs the parent
 environment by prefix — `GIT_*` and `WORKTRUNK_*` — so the prefix is what makes
 a variable hermetic; an unprefixed name inherits from whatever shell ran the
-suite. The rule covers the test-only protocol between the harness and its helper
-binaries, not just knobs `wt` itself reads: the harness sets
-`WORKTRUNK_TEST_MOCK_CONFIG_DIR` and only `mock-stub` reads it. A variable `wt`
-reads in production drops `TEST` and keeps `WORKTRUNK_`.
+suite. The rule covers the test-only protocol between the harness and the mock
+playback, not just knobs that change wt's own behavior:
+`WORKTRUNK_TEST_MOCK_CONFIG_DIR` is read only by the playback dispatch
+(`testing::mock_stub`). A variable `wt` reads in production drops `TEST` and
+keeps `WORKTRUNK_`.
 
 ## Git Config Isolation
 
@@ -206,11 +205,11 @@ What the hole cost before this: any key in the developer's config applied to fix
 in-process unit test that calls library functions directly gets no such
 isolation: it runs in the test process, which inherits the real environment.
 
-The `Approvals` and `UserConfig` mutation methods take an explicit `&Path`, so
-a unit test passes a tempdir-backed path and the write stays isolated. The
-global resolvers do not isolate: `Approvals::load()`, `approvals_path()`,
-`config_path()`, and `system_config_path()` all fall back to the real
-`~/.config/worktrunk/`.
+`Approvals::approve_commands` and the `UserConfig` mutation methods take an
+explicit `&Path`, so a unit test passes a tempdir-backed path and the write stays
+isolated. The global resolvers do not isolate: `Approvals::load()`,
+`approvals_path()`, `config_path()`, and `system_config_path()` all fall back to
+the real `~/.config/worktrunk/`.
 
 <example>
 <bad reason="Approvals::load() reads the real ~/.config/worktrunk/approvals.toml">
@@ -219,7 +218,7 @@ Bad:
 
 ```rust
 let mut approvals = Approvals::load().unwrap();
-approvals.approve_command(project, command, &approvals_path).unwrap();
+approvals.approve_commands(project, vec![command], &approvals_path).unwrap();
 ```
 
 </bad>
@@ -231,7 +230,7 @@ Good:
 let temp_dir = tempfile::tempdir().unwrap();
 let approvals_path = temp_dir.path().join("approvals.toml");
 let mut approvals = Approvals::default();
-approvals.approve_command(project, command, &approvals_path).unwrap();
+approvals.approve_commands(project, vec![command], &approvals_path).unwrap();
 ```
 
 </good>
@@ -385,11 +384,16 @@ Each threshold has an env override pinning it, so the output is present or absen
 
 ## No Retries
 
-Tests run once. Worktrunk configures no nextest `retries` and writes no retry loops: a test that passes only on a second attempt is a bug report, and retrying it discards the report while leaving the bug. A green suite has to mean the code is green, not that the run's flakes stayed under a retry budget. Fix the flake at its root:
+Tests run once. Worktrunk configures no nextest `retries`, and no test re-runs its own failed body: a test that passes only on a second attempt is a bug report, and retrying it discards the report while leaving the bug. A green suite has to mean the code is green, not that the run's flakes stayed under a retry budget. Fix the flake at its root:
 
 - A racy assertion is a timing bug. Make it deterministic, per Timing Tests above: poll for the event, or drive it causally through a callback.
 - Resource pressure is a concurrency bug. Windows process creation intermittently fails with STATUS_DLL_INIT_FAILED (exit `-1073741502`) when many tests spawn git/wt children at once. Bound how many heavy tests run together; that removes the pressure instead of retrying past it.
+- A kill at the 180s slow-timeout is a duration symptom with two causes, told apart by the durations around it: many stretched durations alongside high machine load is CPU starvation, usually a sibling worktree's concurrent build; one test pinned at the timeout in an otherwise-normal run is a blocked call inside it, usually network. Starvation's only lever here would be nextest `threads-required` bounds on the heavy PTY tests, deliberately unset while these stay rare one-offs: the bound taxes every healthy run, and can't see the sibling build that caused the starvation.
+- A shared channel with more than one producer is an attribution bug. Counting events drained from a channel between steps only measures the step that produced them if nothing *else* can produce them: a background task's event landing after its step's drain is charged to the next step, so the assertion that fails names the wrong step and the wrong cause. The events are usually indistinguishable (skim's `Event::RunPreview` carries no payload), so identity assertions aren't available — quiesce the other producers instead, before the step sequence arms whatever they'd match. `on_update_pokes_run_preview_only_when_the_visible_pane_changes` is the worked example: `PreviewOrchestrator::wait_for_idle()` before each `note_awaiting`, so the skeleton precompute lands while no key matches it.
+- A spawn that fails `NotFound` is a concurrent-build bug. Cargo uplifts `target/debug/wt` by removing the path and recreating it, so a second `cargo` against the same target directory leaves the binary absent for a fraction of a millisecond per rebuild, failing whatever spawn is in flight with `Os { code: 2, kind: NotFound }` — anywhere: an `insta_cmd` snapshot, a PTY wrapper's `wt config shell init`, a hook whose marker file then never appears — and passing on re-run, which is the signature. `wt_bin()` closes the window by spawning a hardlink pinned under `target/debug/wt-test-bin/` instead of the uplifted path (`testing::pin_test_binary`), so route every `wt` spawn through it or a helper that does; `test_wt_spawns_are_pinned` makes a direct `CARGO_BIN_EXE_wt` spawn fail the suite.
 - A shared namespace is a collision bug. **Never `NamedTempFile::new()`** for a file a test needs by name: `tempfile` retries a name collision only when it surfaces as `AlreadyExists`, and on Windows `create_new` against a name already held by a *directory* — or by a file in delete-pending state — comes back `PermissionDenied`, which it hands straight back to the caller. A full suite run leaves the temp directory full of `.tmpXXXXXX` entries (every `TestRepo` makes one), and under that load the call fails ~1% of the time with `Access is denied.` — a panic that has nothing to do with what the test asserts. Take a `TempDir` and give the files fixed names inside it (`worktrunk::testing::directive_files` is the pattern); a directory collision surfaces as `AlreadyExists`, which tempfile retries.
+
+A bounded poll that rides out one identified `ErrorKind` whose window is understood is itself a root fix, and the doctrine leaves it alone: `pin_test_binary` polls `NotFound` across cargo's uplift window, and `forward_with_etxtbsy_retry` (`src/completion.rs`) polls `ExecutableFileBusy` while a concurrently-forked child holds the just-written script's write fd open. Both fail immediately on any other error, which is what keeps a poll from drifting into a retry.
 
 **Reproducing a Windows-only flake** means reproducing its *neighbours*, not starving it: run the suspect tests in a loop on a Windows runner with a full `cargo nextest run` going alongside. Pinning the CPU instead models the wrong thing whenever the failing run's own timing was normal (compare its duration against the same test passing — nextest prints it, and the `test` job uploads `junit.xml` with every test's time). Measured both ways on the same five tests: 80 iterations under a concurrent full suite reproduced a 1-in-100 Windows failure that no local run had ever shown, while pinning all four cores with busy loops instead just pushed nearly every iteration past the 30s waits — artificial failures that say nothing about the flake.
 
@@ -427,7 +431,9 @@ fn test_fish_integration() {
 - CI can enable features when dependencies are installed
 
 **Existing feature flags:**
-- `shell-integration-tests` — Tests requiring bash/zsh/fish shells and PTY
+- `shell-integration-tests` — Tests that drive real shells over a PTY: bash,
+  zsh, fish, nushell, and pwsh, plus the `jq` the Claude hook commands in
+  `plugins/worktrunk/hooks/` pipe their payload through
 
 ## PTY Tests and README Examples
 

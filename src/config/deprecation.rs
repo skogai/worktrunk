@@ -45,7 +45,7 @@ use shell_escape::unix::escape;
 use crate::config::WorktrunkConfig;
 use crate::shell_exec::Cmd;
 use crate::styling::{
-    eprintln, format_with_gutter, hint_message, info_message, suggest_command_in_dir,
+    eprint, eprintln, format_with_gutter, hint_message, info_message, suggest_command_in_dir,
     warning_message,
 };
 
@@ -1821,6 +1821,41 @@ pub fn nested_key_belongs_in<C: WorktrunkConfig>(path: &str) -> Option<&'static 
     USER_ONLY_COMMIT_GENERATION_PATHS
         .contains(&path)
         .then(C::Other::description)
+}
+
+/// Note appended to a "belongs in the other config" warning when the
+/// misplaced key also has a `[projects."<id>"]` form in user config, which is
+/// usually what the user was reaching for. A user key in project config is an
+/// attempt to scope a personal setting to one repo; a project key in user
+/// config (`forge`) is an attempt to set it without touching the repo's
+/// committed file. The `[projects."<id>"]` table does both directly.
+///
+/// `key` is the misplaced key (`worktree-path`, or a dotted path like
+/// `list.columns`); the note only fires when its top-level segment is a field
+/// of that table (see [`is_user_project_override_key`](crate::config::is_user_project_override_key)).
+/// Root-only user settings — `skip-shell-integration-prompt`,
+/// `skip-commit-generation-prompt` — have no `[projects."<id>"]` form and no
+/// per-repo semantics, so following the note would just produce a fresh
+/// "unknown field"; they get no note.
+///
+/// Keyed off the destination *description* rather than a config-type gate so
+/// both warning formatters (load-time and `config show`) can share it — they
+/// hold only the `other_description` string, not the config type.
+pub fn scope_to_repo_note(other_description: &str, key: &str) -> Option<&'static str> {
+    let top_level = key.split('.').next().unwrap_or(key);
+    if !crate::config::is_user_project_override_key(top_level) {
+        return None;
+    }
+    if other_description == crate::config::UserConfig::description() {
+        return Some(r#"to scope it to this repo, add it under [projects."<id>"] in user config"#);
+    }
+    // The reverse redirect — a project-config key found in user config — earns
+    // the note only for a whole top-level table (`forge`): its
+    // `[projects."<id>"]` field has the same shape, so the move is valid as
+    // written. A nested path (`list.url`) names a field the projects-entry
+    // type doesn't have, and its correct home really is project config.
+    (other_description == crate::config::ProjectConfig::description() && !key.contains('.'))
+        .then_some(r#"to set it from user config, add it under [projects."<id>"]"#)
 }
 
 /// Classification of an unknown config key for warning purposes.
@@ -4619,6 +4654,113 @@ ff = true
             "[commit-generation]\ncommand = \"llm\"\n",
             &path,
             ConfigFileKind::Project,
+        );
+    }
+
+    #[test]
+    fn test_nested_user_only_key_redirects_generally() {
+        use crate::config::{ProjectConfig, UnknownWarning, UserConfig, collect_unknown_warnings};
+
+        // `[list]` is a valid *shared* section (project config accepts `url`),
+        // but `columns` / `full` are user-config display settings. Placing them
+        // in project config redirects to user config rather than reading
+        // "unknown field" — the general "valid in the other config" check, not
+        // the hard-coded commit.generation list (#3469).
+        let warnings = collect_unknown_warnings::<ProjectConfig>(
+            "[list]\ncolumns = [\"branch\"]\nfull = true\n",
+        );
+        assert!(
+            warnings.iter().all(|w| matches!(
+                w,
+                UnknownWarning::NestedWrongConfig { path, other_description }
+                    if (path == "list.columns" || path == "list.full")
+                        && *other_description == "user config"
+            )) && warnings.len() == 2,
+            "expected list.columns/list.full → user config, got {warnings:?}"
+        );
+
+        // A key unknown in *both* configs stays "unknown field".
+        let warnings = collect_unknown_warnings::<ProjectConfig>("[list]\nnonsense-typo = true\n");
+        assert!(
+            matches!(
+                warnings.as_slice(),
+                [UnknownWarning::NestedUnknown { path }] if path == "list.nonsense-typo"
+            ),
+            "expected list.nonsense-typo → unknown, got {warnings:?}"
+        );
+
+        // The reverse direction: `url` is project-only, so it redirects to
+        // project config when found in user config — no scope-to-repo note
+        // there (that only applies to user-config destinations).
+        let warnings = collect_unknown_warnings::<UserConfig>("[list]\nurl = \"x\"\n");
+        assert!(
+            matches!(
+                warnings.as_slice(),
+                [UnknownWarning::NestedWrongConfig { path, other_description }]
+                    if path == "list.url" && *other_description == "project config"
+            ),
+            "expected list.url → project config, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_scope_to_repo_note_destinations() {
+        // Toward user config, the note fires for any misplaced key whose
+        // top-level segment is a `[projects."<id>"]` field.
+        assert!(scope_to_repo_note("user config", "list.columns").is_some());
+        assert!(scope_to_repo_note("user config", "worktree-path").is_some());
+
+        // Toward project config, only a whole top-level table (`forge`) earns
+        // it: the projects-entry `list` is the user type, which has no `url`,
+        // so that advice would be wrong.
+        assert!(scope_to_repo_note("project config", "forge").is_some());
+        assert!(scope_to_repo_note("project config", "list.url").is_none());
+        assert!(scope_to_repo_note("project config", "forge.platform").is_none());
+
+        // Root-only user scalars have no `[projects."<id>"]` form, so following
+        // the note would just yield a fresh "unknown field" — no note.
+        assert!(scope_to_repo_note("user config", "skip-shell-integration-prompt").is_none());
+        assert!(scope_to_repo_note("user config", "skip-commit-generation-prompt").is_none());
+
+        // It reaches the rendered load-warning for a user-config redirect...
+        let note = "to scope it to this repo";
+        let msg = format_load_warning(
+            "Project config",
+            &crate::config::UnknownWarning::NestedWrongConfig {
+                path: "list.columns".to_string(),
+                other_description: "user config",
+            },
+        );
+        assert!(
+            msg.contains(note),
+            "user-config redirect should carry note: {msg}"
+        );
+
+        // ...but not a project-config redirect.
+        let msg = format_load_warning(
+            "User config",
+            &crate::config::UnknownWarning::NestedWrongConfig {
+                path: "list.url".to_string(),
+                other_description: "project config",
+            },
+        );
+        assert!(
+            !msg.contains(note),
+            "project-config redirect should not carry note: {msg}"
+        );
+
+        // ...and not a misplaced root-only user scalar, even though its
+        // destination is user config.
+        let msg = format_load_warning(
+            "Project config",
+            &crate::config::UnknownWarning::TopLevelWrongConfig {
+                key: "skip-shell-integration-prompt".to_string(),
+                other_description: "user config",
+            },
+        );
+        assert!(
+            !msg.contains(note),
+            "root-only user scalar should not carry note: {msg}"
         );
     }
 

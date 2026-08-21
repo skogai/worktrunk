@@ -48,12 +48,54 @@ use worktrunk::styling::{eprintln, println, stderr};
 // Status messages to stderr
 eprintln!("{}", success_message("Created worktree"));
 
-// Primary output to stdout (tables, JSON, pipeable)
+// Primary output to stdout (tables, shell code, pipeable)
 println!("{}", table_output);
 
 // Flush before interactive prompts
 stderr().flush()?;
 ```
+
+Which `println!` is in scope decides whether a closed pipe panics: std's
+panics on the `BrokenPipe` write error, anstream's drops it. `wt … | head`
+closes the pipe, so command code imports the `worktrunk::styling` one and no
+`std::println!` is left in `src/`.
+
+The stderr macros carry the same rule for a different consequence: anstream's
+`eprint!` / `eprintln!` strip ANSI when stderr isn't a terminal, std's keep it,
+so a file importing one but not the other writes escapes on one line of a
+message block and not the next under `wt … 2>log`. `eprint!` is the half that
+slips — it has no newline, so it gets reached for mid-block in a file that
+imported only `eprintln`. Every bare `eprint!` / `eprintln!` under `src/` must
+resolve to anstream's: import it, or qualify the call as
+`styling::eprintln!(…)`. `check_stderr_macros_come_from_styling` in
+`tests/integration_tests/output_system_guard.rs` holds that statically, since
+no snapshot can — the suite forces `CLICOLOR_FORCE=1`, so both printers emit
+color and a snapshot agrees whichever macro is in scope. Its
+`STD_STDERR_ALLOWED_PATHS` exempts whole files, not calls, so an entry is only
+right where std's macro is right throughout.
+
+**Output whose ANSI is already decided** declares that once at the top of the
+command with `worktrunk::styling::ColorChoice::Always.write_global()` and then
+prints through the same anstream macros — the statusline a shell prompt or
+Claude Code renders, and the `--help-page` document whose escapes the docs
+pipeline turns into HTML (`--plain` and `--help-md` declare `Never` the same
+way). Neither consumer is ever a tty, so without the declaration anstream
+would strip their color every time — and the test suite would not catch it,
+because it forces color with `CLICOLOR_FORCE=1`;
+`test_color_follows_the_consumer` pins the unforced behavior. Declare `Always`
+only when the pipe is a courier rather than the destination; anything a person
+reads directly stays on plain anstream, which is what strips color on a pipe
+and honors `NO_COLOR`.
+
+**`--format=json` answers** go through `crate::output::print_json`, never a
+hand-rolled `println!("{}", serde_json::to_string_pretty(&v)?)`. It serializes
+pretty with one trailing newline and prints through anstream, so no
+`--format=json` surface panics when its consumer stops reading. Before that,
+thirty call sites had open-coded those two lines, and whether any one of them
+panicked under `| head -3` came down to which `println!` its module happened to
+import. `wt switch --format=json` is the one non-caller: it emits its single
+result as one compact line (still through anstream's `println!`), because that
+is what a shell loop reads.
 
 **Shell integration functions** (`src/output/global.rs`):
 

@@ -78,6 +78,7 @@ Controls where new worktrees are created.
 - `{{ repo_path }}` — absolute path to the repository root (e.g., `/Users/me/code/myproject`. Or for bare repos, the bare directory itself)
 - `{{ repo }}` — repository directory name (e.g., `myproject`)
 - `{{ owner }}` — primary remote owner path (may include subgroups like `group/subgroup`)
+- `{{ remote_repo }}` — repository name in the primary remote URL, without `.git` (e.g., `myproject`); differs from `{{ repo }}`, the directory on disk, when a clone was renamed
 - `{{ branch }}` — raw branch name (e.g., `feature/auth`)
 - `{{ branch | sanitize }}` — filesystem-safe: `/` and `\` become `-` (e.g., `feature-auth`)
 - `{{ branch | sanitize_db }}` — database-safe: lowercase, underscores, hash suffix (e.g., `feature_auth_x7k`)
@@ -193,11 +194,13 @@ columns = ["branch", "status", "ci", "path"]   # Columns to show, in order — b
 timeout-ms = 0     # Wall-clock budget for the entire collect phase; 0 disables
 ```
 
-`columns` selects and orders the columns to render; omit it for the default set.
-It is meant to drive a per-invocation [alias](@/extending.md#aliases)
-(`wt --config-set 'list.columns=[…]' list`), giving a named view without
-disturbing the default `wt list`. A static setting works but pins one layout
-over a table that otherwise adapts to `--full` and terminal width.
+`columns` selects and orders the columns the `wt list` table and the `wt switch`
+picker render; `--format json` ignores it and always emits every field. Omit it
+for the default set. It is meant to drive a per-invocation
+[alias](@/extending.md#aliases) (`wt --config-set 'list.columns=[…]' list`),
+giving a named view without disturbing the default `wt list`. A static setting
+works but pins one layout over a table that otherwise adapts to `--full` and
+terminal width.
 
 Valid built-in names:
 
@@ -226,11 +229,6 @@ since `--full` only bundles columns into the default table rather than gating a
 named one. A column whose data source is missing still stays hidden — `summary`
 needs an LLM command (`[commit.generation]`), `url` needs a `[list] url`
 template — since listing can't supply the data.
-
-The selection drives the table and the `wt switch` picker. `wt list --format
-json` always emits every field, but a listed gated column (`ci`, `summary`)
-still forces its data collection on, so the JSON carries the same data the
-table shows.
 
 #### Custom columns
 
@@ -344,7 +342,7 @@ User config can include a `[projects]` table for project-specific settings — w
 
 Entries are keyed by project identifier — `<host>/<owner>/<repo>` derived from the primary remote URL (no `.git` suffix), or the canonical repo path when there is no remote. Run `wt config show` inside the repo to see the identifier for the current project; it appears in the `PROJECT CONFIG` section as `Identifier: …`.
 
-Scalar values (like `worktree-path`) replace the global value; everything else (hooks, aliases, etc.) appends, global first.
+Scalar values (like `worktree-path`) replace the global value; everything else (hooks, aliases, etc.) appends, global first. See [how the layers rank](@/config.md#precedence).
 
 ```toml
 [projects."github.com/user/repo"]
@@ -356,6 +354,36 @@ pre-start.env = "cp .env.example .env"
 step.copy-ignored.exclude = [".repo-local-cache/"]
 aliases.deploy = "make deploy BRANCH={{ branch }}"
 ```
+
+#### Matching several repositories with one entry
+
+A key containing `*` matches any run of characters, `/` included, so one entry covers a whole host or namespace — including nested groups. `*` is the only wildcard; every other character, `.` among them, is literal.
+
+```toml
+# Every repository on a self-hosted forge whose hostname carries no brand
+[projects."git.company.example/*"]
+forge.platform = "gitlab"
+
+# Everything under one namespace shares a layout
+[projects."git.company.example/platform/*"]
+worktree-path = ".worktrees/{{ branch | sanitize }}"
+```
+
+Every matching entry applies, least- to most-specific, following the rule above: a more specific entry — `git.company.example/platform/*` over `git.company.example/*` — wins where both set the same setting, while hooks and aliases from every matching entry all run, least-specific first. A literal key is the most specific of all; specificity is the count of non-`*` characters in the key. End a host-wide key with `/*` — a bare `git.company.example*` also covers hosts whose names merely start with that string.
+
+`approved-commands` matches the same way, so a pattern entry approves its commands for every repository it covers. Only a key written by hand is ever a pattern: `wt config approvals add` and the interactive prompt record under the exact identifier, and `wt config approvals clear` removes only that exact entry, leaving a pattern other repositories share intact.
+
+#### Forge platform and hostname
+
+`forge` names the forge for the matched repositories — the user-level counterpart of the project config's [forge platform](@/config.md#forge-platform) block, for a self-hosted host whose name carries no `github`, `gitlab`, or `gitea` for detection to read.
+
+```toml
+[projects."git.company.example/*"]
+forge.platform = "gitlab"                    # or "github", "gitea" (experimental), "azure-devops" (experimental)
+forge.hostname = "api.git.company.example"   # API host, when the remote's own host isn't it
+```
+
+Both fields describe the host rather than the repository, which is why a pattern keyed to a hostname suits them, and why an SSH alias resolved through `~/.ssh/config` — where the name in the remote URL is local to one machine — belongs here rather than in a repository's committed config. A repository's own `[forge]` block still wins over any entry here, field by field: a repository that sets only `platform` still takes a matching entry's `hostname`.
 
 Hooks support all three [hook forms](@/hook.md#hook-forms). A table runs multiple commands concurrently; an array-of-tables pipeline runs steps in sequence. The dotted-key examples below are equivalent to the table forms — TOML treats `projects."github.com/user/repo".post-start.server = "..."` and a `[projects."github.com/user/repo".post-start]` table the same way:
 
@@ -544,6 +572,8 @@ platform = "github"  # or "gitlab", "gitea" (experimental), "azure-devops" (expe
 hostname = "github.example.com"  # Example: API host (GHE / self-hosted GitLab)
 ```
 
+When many repositories share one self-hosted host, name it once in user config with a [pattern-keyed `[projects]` entry](@/config.md#user-project-specific-settings) instead of repeating this block in each repo. A repository's own `[forge]` still wins, field by field.
+
 ## Commit-message append
 
 <span class="badge-experimental"></span>
@@ -633,7 +663,9 @@ Override the LLM command in CI to use a mock:
 | `XDG_CONFIG_DIRS` | Colon-separated system config directories (default: `/etc/xdg`) |
 | `WORKTRUNK_DIRECTIVE_CD_FILE` | Internal: set by shell wrappers. wt writes a raw path; the wrapper `cd`s to it |
 | `WORKTRUNK_DIRECTIVE_EXEC_FILE` | Internal: set by shell wrappers. wt writes shell commands; the wrapper sources the file |
+| `WORKTRUNK_SHELL_CWD` | Internal: set by wt on alias and hook bodies, so a nested `wt` preserves the user's subdirectory |
 | `WORKTRUNK_SHELL` | Internal: set by shell wrappers to indicate shell type (e.g., `powershell`) |
+| `WORKTRUNK_COMPLETE_NAME` | Internal: set by shell wrappers to the command name completions register under (defaults to the binary name) |
 | `WORKTRUNK_MAX_CONCURRENT_COMMANDS` | Max parallel git commands (default: 32). Lower if hitting file descriptor limits. |
 | `WORKTRUNK_VERBOSE` | Verbosity level (`0`/`1`/`2`), like `-v`/`-vv` but applied everywhere — including shell completion, which no flag can reach |
 | `RUST_LOG` | Logging directive (e.g. `worktrunk=debug`); overrides the verbosity baseline for what reaches stderr |
@@ -642,11 +674,26 @@ Override the LLM command in CI to use a mock:
 
 ## Inline config overrides (`--config-set`)
 
-`--config-set <toml>` overrides any user config key for a single invocation, with higher priority than both config files and `WORKTRUNK_` env vars. The value is a TOML fragment, so arrays and tables work directly; the flag is global (works before or after the subcommand), repeatable, and a later `--config-set` replaces an earlier one for the same key.
+`--config-set <toml>` overrides any user config key for a single invocation. The value is a TOML fragment, so arrays and tables work directly; the flag is global (works before or after the subcommand), repeatable, and a later `--config-set` replaces an earlier one for the same key.
 
 {{ terminal(cmd="wt --config-set list.full=true list|||wt step copy-ignored --config-set 'step.copy-ignored.exclude=[__WT_QUOT__target__WT_QUOT__, __WT_QUOT__dist__WT_QUOT__]'") }}
 
 This composes with aliases — an alias body can invoke `wt --config-set … <command>` to render a named view without changing the saved config.
+
+## Precedence
+
+Sources closer to the invocation rank higher (user config above system config), and within a config file a [project entry](@/config.md#user-project-specific-settings) outranks the global key of the same name. So `worktree-path` comes from the first of these that sets it:
+
+1. `--config-set 'worktree-path = …'`
+2. `WORKTRUNK_WORKTREE_PATH`
+3. `[projects."github.com/owner/repo"]` in the config file
+4. global `worktree-path` in the config file
+
+A `--config-set` that names a project entry is both the highest layer and the most specific key, so it beats the same flag's global key:
+
+{{ terminal(cmd="wt --config-set 'projects.__WT_QUOT__github.com/owner/repo__WT_QUOT__.worktree-path = __WT_QUOT__/tmp/scratch__WT_QUOT__' switch --create feature") }}
+
+Hooks, aliases and `step.copy-ignored.exclude` accumulate rather than replace, so an env-set hook and a project's hook both run.
 
 ## Command reference
 
@@ -766,6 +813,9 @@ List commands and their approval status for current project:
 Pre-approve all hook and alias commands for current project:
 {{ terminal(cmd="wt config approvals add") }}
 
+Pre-approve without prompting, for a container or CI job:
+{{ terminal(cmd="wt config approvals add --yes") }}
+
 Clear approvals for current project:
 {{ terminal(cmd="wt config approvals clear") }}
 
@@ -775,9 +825,33 @@ Clear only approvals for commands no longer in the project config:
 Clear global approvals:
 {{ terminal(cmd="wt config approvals clear --global") }}
 
+Check whether an unattended run would stop for approval:
+{{ terminal(cmd="wt config approvals list --format=json | jq -r .state") }}
+
 ### How approvals work
 
-Approved commands are saved to `~/.config/worktrunk/approvals.toml`. Re-approval is required when the command template changes or the project moves. Use `--yes` to bypass prompts in CI.
+Approved commands are saved to `~/.config/worktrunk/approvals.toml`. Re-approval is required when the command template changes or the project moves.
+
+`--yes` bypasses the prompt, and what it leaves behind depends on the command it is passed to. On a command that runs project commands it grants consent for that run alone and records nothing, so the next run asks again. On `wt config approvals add` the record is the whole point, so the approvals are written — which is how an unattended environment pre-approves a project it has just cloned.
+
+### Reading approval state
+
+`wt config approvals list` reads the state without prompting or writing it, so an orchestrator can find out whether a non-interactive run will stop for approval before scheduling one. `--format=json` emits:
+
+```json
+{
+  "state": "approval_required",
+  "commands": [
+    {"phase": "post-start", "name": "dev", "template": "npm run dev", "approved": false},
+    {"phase": "pre-merge", "template": "cargo test", "approved": true}
+  ],
+  "stale": ["some removed command"]
+}
+```
+
+`state` is `no_commands` (the project declares none), `approval_required` (at least one is unapproved), or `approved`. `name` is absent for an unnamed command and for the commit-template fragment.
+
+`stale` is separate rather than a fourth `state`, because it co-occurs with all three: these are approvals recorded earlier whose command has since been edited or removed from the project config. They are what `--yes` would silently re-approve, so an orchestrator preserving the approval model reads them before choosing that flag.
 
 ### Command reference
 

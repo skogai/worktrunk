@@ -4,8 +4,10 @@ use anyhow::Context;
 use color_print::cformat;
 use worktrunk::HookType;
 use worktrunk::config::{MergeConfig, UserConfig};
-use worktrunk::git::{Repository, WorktrunkError};
+use worktrunk::git::Repository;
 use worktrunk::styling::{eprintln, info_message};
+
+use crate::output::print_json;
 
 use super::command_approval::approve_commit_template_append;
 use super::command_executor::FailureStrategy;
@@ -258,7 +260,7 @@ pub fn handle_merge(opts: MergeOptions<'_>) -> anyhow::Result<()> {
     }
 
     // Worktree for target is optional: if present we use it for safety checks and as destination.
-    let target_worktree_path = repo.worktree_for_branch(&target_branch)?;
+    let target_worktree_path = repo.usable_worktree_for_branch(&target_branch)?;
     // Where `post-merge` / `post-remove` / `post-switch` run: the target
     // branch's worktree if it exists, else the primary worktree. Mirrors
     // `finish_after_merge`'s destination resolution. (Config is resolved from
@@ -427,14 +429,13 @@ pub fn handle_merge(opts: MergeOptions<'_>) -> anyhow::Result<()> {
         squashed,
         rebased,
     });
-    let stash_restore_failed = if !ff {
+    if !ff {
         // Create a merge commit on the target branch via commit-tree + update-ref
-        handle_no_ff_merge(Some(&target_branch), operations, &current_branch)?.stash_restore_failed
+        handle_no_ff_merge(Some(&target_branch), operations, &current_branch)?;
     } else {
         // Fast-forward push to target branch
-        handle_push(Some(&target_branch), PushKind::MergeFastForward, operations)?
-            .stash_restore_failed
-    };
+        handle_push(Some(&target_branch), PushKind::MergeFastForward, operations)?;
+    }
 
     let removed = finish_after_merge(
         repo,
@@ -462,20 +463,8 @@ pub fn handle_merge(opts: MergeOptions<'_>) -> anyhow::Result<()> {
             "squashed": squashed,
             "rebased": rebased,
             "removed": removed,
-            // The exit code alone leaves a consumer that reads stdout seeing a
-            // success-shaped payload, so the failure is named on both channels.
-            "stash_restore_failed": stash_restore_failed,
         });
-        println!("{}", serde_json::to_string_pretty(&output)?);
-    }
-
-    if stash_restore_failed {
-        // The merge landed and every follow-up ran; only the target worktree's
-        // autostash didn't replay, leaving the user's uncommitted changes in a
-        // stash instead of their worktree. `restore_stash` already warned with
-        // the recovery command, so this only makes the exit code say the
-        // command didn't finish what it set out to do.
-        return Err(WorktrunkError::AlreadyDisplayed { exit_code: 1 }.into());
+        print_json(&output)?;
     }
 
     Ok(())

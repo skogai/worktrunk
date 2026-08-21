@@ -7,11 +7,11 @@ use std::path::Path;
 use anyhow::Context;
 use worktrunk::HookType;
 use worktrunk::config::UserConfig;
-use worktrunk::git::{BranchDeletionMode, ErrorExt, Repository, ResolvedWorktree};
+use worktrunk::git::{BranchDeletionMode, ErrorExt, GitError, Repository, ResolvedWorktree};
 use worktrunk::styling::{eprintln, info_message};
 
 use crate::cli::{RemoveArgs, SwitchFormat};
-use crate::output::{BackgroundFallbackMode, RemovalExecution, handle_remove_output};
+use crate::output::{BackgroundFallbackMode, RemovalExecution, handle_remove_output, print_json};
 
 use super::hook_plan::{ApprovedHookPlan, HookPlanBuilder};
 use super::hooks::HookAnnouncer;
@@ -127,6 +127,16 @@ fn validate_remove_targets(
                 RemoveTarget::WorktreePath(path_canonical)
             }
             ResolvedWorktree::BranchOnly { branch } => RemoveTarget::BranchOnly(branch),
+            // Resolution tried the argument as a branch and as a worktree path
+            // and matched neither, so a directory sitting there is a leftover
+            // skeleton rather than anything wt can remove. Only a typed
+            // selector reaches this arm — the picker and `wt step prune` call
+            // `prepare_worktree_removal` with a branch read off a row, which is
+            // nobody's path.
+            ResolvedWorktree::NoWorktreeAtPath { path } => {
+                plans.record_error(GitError::WorktreeNotFoundAtPath { path }.into());
+                continue;
+            }
         };
 
         match repo.prepare_worktree_removal(
@@ -365,7 +375,7 @@ pub fn handle_remove_command(args: RemoveArgs, yes: bool) -> anyhow::Result<()> 
                 announcer.flush()?;
                 if json_mode {
                     let json = serde_json::json!([result.to_json(fate)]);
-                    println!("{}", serde_json::to_string_pretty(&json)?);
+                    print_json(&json)?;
                 }
                 // Fire-and-forget repo-wide internal cleanup (stale trash +
                 // orphaned fsmonitor daemons) — runs after primary output so
@@ -447,7 +457,7 @@ pub fn handle_remove_command(args: RemoveArgs, yes: bool) -> anyhow::Result<()> 
                         .zip(fates)
                         .map(|(removal, fate)| removal.to_json(fate))
                         .collect();
-                    println!("{}", serde_json::to_string_pretty(&json_items)?);
+                    print_json(&json_items)?;
                 }
 
                 // Fire-and-forget repo-wide internal cleanup (stale trash +

@@ -237,20 +237,39 @@ pub enum ApprovalsCommand {
     #[command(
         after_long_help = r#"Shows every command the project config declares — hooks, aliases, and commit-message guidance — grouped into APPROVED and UNAPPROVED sections. Approvals recorded for commands no longer in the project config (edited or removed since approval) are listed separately.
 
+Reading is all it does: no prompt, no write. `--format=json` emits the same four distinctions as a structured payload — see [Reading approval state](@/config.md#reading-approval-state).
+
 ## Examples
 
 ```console
 $ wt config approvals list
+```
+
+Check whether an unattended run would stop for approval:
+```console
+$ wt config approvals list --format=json | jq -r .state
 ```"#
     )]
-    List,
+    List {
+        /// Output format
+        #[arg(long, default_value = "text", help_heading = "Output")]
+        format: SwitchFormat,
+    },
 
     /// Store approvals in approvals.toml
     #[command(
         after_long_help = r#"Prompts for approval of all project commands and saves them to approvals.toml.
 
 By default, shows only unapproved commands. Use `--all` to review all commands
-including previously approved ones."#
+including previously approved ones.
+
+`--yes` writes the approvals without prompting, which is how a container or CI job pre-approves a project it has just cloned. It trusts every command the project config declares, including one whose template changed since an earlier approval. A caller that wants to look before granting them can list those first — see [Reading approval state](@/config.md#reading-approval-state).
+
+## Examples
+
+```console
+$ wt config approvals add --yes
+```"#
     )]
     Add {
         /// Show all commands
@@ -559,6 +578,11 @@ Pre-approve all hook and alias commands for current project:
 $ wt config approvals add
 ```
 
+Pre-approve without prompting, for a container or CI job:
+```console
+$ wt config approvals add --yes
+```
+
 Clear approvals for current project:
 ```console
 $ wt config approvals clear
@@ -574,9 +598,35 @@ Clear global approvals:
 $ wt config approvals clear --global
 ```
 
+Check whether an unattended run would stop for approval:
+```console
+$ wt config approvals list --format=json | jq -r .state
+```
+
 ## How approvals work
 
-Approved commands are saved to `~/.config/worktrunk/approvals.toml`. Re-approval is required when the command template changes or the project moves. Use `--yes` to bypass prompts in CI."#
+Approved commands are saved to `~/.config/worktrunk/approvals.toml`. Re-approval is required when the command template changes or the project moves.
+
+`--yes` bypasses the prompt, and what it leaves behind depends on the command it is passed to. On a command that runs project commands it grants consent for that run alone and records nothing, so the next run asks again. On `wt config approvals add` the record is the whole point, so the approvals are written — which is how an unattended environment pre-approves a project it has just cloned.
+
+## Reading approval state
+
+`wt config approvals list` reads the state without prompting or writing it, so an orchestrator can find out whether a non-interactive run will stop for approval before scheduling one. `--format=json` emits:
+
+```json
+{
+  "state": "approval_required",
+  "commands": [
+    {"phase": "post-start", "name": "dev", "template": "npm run dev", "approved": false},
+    {"phase": "pre-merge", "template": "cargo test", "approved": true}
+  ],
+  "stale": ["some removed command"]
+}
+```
+
+`state` is `no_commands` (the project declares none), `approval_required` (at least one is unapproved), or `approved`. `name` is absent for an unnamed command and for the commit-template fragment.
+
+`stale` is separate rather than a fourth `state`, because it co-occurs with all three: these are approvals recorded earlier whose command has since been edited or removed from the project config. They are what `--yes` would silently re-approve, so an orchestrator preserving the approval model reads them before choosing that flag."#
     )]
     Approvals {
         #[command(subcommand)]

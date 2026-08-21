@@ -21,12 +21,15 @@ use worktrunk::git::remote_ref::{
     RemoteRefProvider, parse_ref_url,
 };
 use worktrunk::git::{
-    ForgeKind, GitError, GitRemoteUrl, RefType, Repository, SwitchSuggestionCtx, current_or_recover,
+    ForgeKind, GitError, GitRemoteUrl, RefType, Repository, ResolvedWorktree, Selector,
+    SwitchSuggestionCtx, current_or_recover,
 };
-use worktrunk::shell_exec::{ShellEscapeMode, directive_shell_escape_mode, shell_escape_for};
+use worktrunk::shell_exec::{
+    ShellEscapeMode, directive_shell_escape_mode, shell_cwd, shell_escape_for,
+};
 use worktrunk::styling::{
-    eprintln, format_with_gutter, hint_message, info_message, progress_message, suggest_command,
-    warning_message,
+    eprintln, format_with_gutter, hint_message, info_message, println, progress_message,
+    suggest_command, warning_message,
 };
 
 use super::resolve::{compute_worktree_path, offer_bare_repo_worktree_path_fix};
@@ -47,8 +50,12 @@ use crate::output::{
 
 /// Result of resolving the switch target.
 struct ResolvedTarget {
-    /// The resolved branch name
-    branch: String,
+    /// The branch to switch to, carrying whether the token may still be tried
+    /// as a path. Two things take that off: a rewrite, since `pr:`/`mr:`
+    /// dispatch and the remote-prefix strip leave the user's literal argument
+    /// naming nothing; and `--create`, where the argument names a branch that
+    /// does not exist yet.
+    selector: Selector,
     /// How to create the worktree
     method: CreationMethod,
 }
@@ -84,7 +91,9 @@ fn format_ref_context(info: &RemoteRefInfo) -> String {
 /// Choose which provider should handle `pr:<number>` resolution.
 ///
 /// Priority:
-/// 1. `forge.platform` config (`github` / `gitea` / `azure-devops`)
+/// 1. The configured `forge.platform` (`github` / `gitea` / `azure-devops`) —
+///    the repository's own, else a matching user-config `[projects."…"]`
+///    entry, via [`Repository::configured_forge_platform`]
 /// 2. Every configured raw remote, in GitHub > Gitea > Azure DevOps > GitLab
 ///    order. [`ForgeKind::from_host`] classifies exact forge labels and Azure
 ///    DevOps service-domain suffixes.
@@ -96,10 +105,7 @@ fn format_ref_context(info: &RemoteRefInfo) -> String {
 /// GitHub error (with hint to set `forge.platform = "gitea"`), instead of a
 /// wrapped two-provider error.
 fn choose_pr_provider(repo: &Repository) -> anyhow::Result<&'static dyn RemoteRefProvider> {
-    if let Some(platform_raw) = repo
-        .load_project_config()?
-        .and_then(|c| c.forge_platform().map(str::to_string))
-    {
+    if let Some(platform_raw) = repo.configured_forge_platform() {
         match platform_raw.to_ascii_lowercase().parse::<ForgeKind>() {
             Ok(ForgeKind::GitHub) => return Ok(&GITHUB_PROVIDER),
             Ok(ForgeKind::Gitea) => return Ok(&GITEA_PROVIDER),
@@ -108,7 +114,8 @@ fn choose_pr_provider(repo: &Repository) -> anyhow::Result<&'static dyn RemoteRe
                 bail!("forge.platform is set to gitlab; use mr:<number> instead of pr:<number>")
             }
             Err(_) => bail!(
-                "Invalid forge.platform value `{platform_raw}` in .config/wt.toml; \
+                "Invalid forge.platform value `{platform_raw}` (from `[forge]` in project \
+                 config or a `[projects]` entry in user config); \
                  expected one of: github, gitlab, gitea, azure-devops"
             ),
         }
@@ -159,30 +166,6 @@ fn choose_pr_provider(repo: &Repository) -> anyhow::Result<&'static dyn RemoteRe
     }
 }
 
-fn resolve_pr_target(
-    repo: &Repository,
-    number: u32,
-    create: bool,
-    base: Option<&str>,
-) -> anyhow::Result<ResolvedTarget> {
-    if base.is_some() {
-        return Err(GitError::RefBaseConflict {
-            ref_type: RefType::Pr,
-            number,
-        }
-        .into());
-    }
-
-    resolve_remote_ref(repo, choose_pr_provider(repo)?, number, create, base)
-}
-
-fn resolve_pr_base(
-    repo: &Repository,
-    number: u32,
-) -> anyhow::Result<(String, Option<(String, String)>)> {
-    resolve_remote_ref_as_base(repo, choose_pr_provider(repo)?, number)
-}
-
 /// Fetch PR/MR info while showing a "still waiting" status.
 ///
 /// The host lookup (`gh`/`glab` API) captures its output and can stall on a slow
@@ -208,15 +191,9 @@ fn resolve_remote_ref(
     provider: &dyn RemoteRefProvider,
     number: u32,
     create: bool,
-    base: Option<&str>,
 ) -> anyhow::Result<ResolvedTarget> {
     let ref_type = provider.ref_type();
     let symbol = ref_type.symbol();
-
-    // --base is invalid with pr:/mr: syntax (check early, no network needed)
-    if base.is_some() {
-        return Err(GitError::RefBaseConflict { ref_type, number }.into());
-    }
 
     // Fetch ref info (network call via gh/glab CLI)
     eprintln!(
@@ -244,7 +221,15 @@ fn resolve_remote_ref(
     }
 
     // Same-repo ref: fetch the branch to ensure remote tracking refs exist
-    resolve_same_repo_ref(repo, &info)
+    fetch_same_repo_branch(repo, &info)?;
+    Ok(ResolvedTarget {
+        selector: Selector::rewritten_to(info.source_branch),
+        method: CreationMethod::Regular {
+            create_branch: false,
+            base_branch: None,
+            base_pr_upstream: None,
+        },
+    })
 }
 
 /// Resolve a fork (cross-repo) PR/MR.
@@ -256,7 +241,7 @@ fn resolve_fork_ref(
 ) -> anyhow::Result<ResolvedTarget> {
     let ref_type = provider.ref_type();
     let repo_root = repo.repo_path()?;
-    let local_branch = remote_ref::local_branch_name(info);
+    let local_branch = info.source_branch.clone();
     let expected_remote = match remote_ref::find_remote(repo, info) {
         Ok(remote) => Some(remote),
         Err(e) => {
@@ -282,7 +267,7 @@ fn resolve_fork_ref(
                 ))
             );
             return Ok(ResolvedTarget {
-                branch: local_branch,
+                selector: Selector::rewritten_to(local_branch),
                 method: CreationMethod::Regular {
                     create_branch: false,
                     base_branch: None,
@@ -309,7 +294,7 @@ fn resolve_fork_ref(
                         ))
                     );
                     return Ok(ResolvedTarget {
-                        branch: prefixed,
+                        selector: Selector::rewritten_to(prefixed),
                         method: CreationMethod::Regular {
                             create_branch: false,
                             base_branch: None,
@@ -330,7 +315,7 @@ fn resolve_fork_ref(
             // This is GitHub-only (GitLab doesn't support prefixed names)
             let remote = remote_ref::find_remote(repo, info)?;
             return Ok(ResolvedTarget {
-                branch: prefixed,
+                selector: Selector::rewritten_to(prefixed),
                 method: CreationMethod::ForkRef {
                     ref_type,
                     number,
@@ -392,7 +377,7 @@ fn resolve_fork_ref(
     };
 
     Ok(ResolvedTarget {
-        branch: local_branch,
+        selector: Selector::rewritten_to(local_branch),
         method: CreationMethod::ForkRef {
             ref_type,
             number,
@@ -400,23 +385,6 @@ fn resolve_fork_ref(
             fork_push_url,
             ref_url: info.url.clone(),
             remote,
-        },
-    })
-}
-
-/// Resolve a same-repo (non-fork) PR/MR.
-fn resolve_same_repo_ref(
-    repo: &Repository,
-    info: &RemoteRefInfo,
-) -> anyhow::Result<ResolvedTarget> {
-    fetch_same_repo_branch(repo, info)?;
-
-    Ok(ResolvedTarget {
-        branch: info.source_branch.clone(),
-        method: CreationMethod::Regular {
-            create_branch: false,
-            base_branch: None,
-            base_pr_upstream: None,
         },
     })
 }
@@ -462,7 +430,7 @@ fn parse_ref_shortcut(input: &str) -> Option<(RefType, u32)> {
 }
 
 /// Resolve a `--base` value, expanding `pr:`/`mr:` shortcuts. Non-shortcut
-/// inputs go through [`Repository::resolve_worktree_name`] (handles `@`/`-`/`^`).
+/// inputs go through [`Repository::expand_selector`] (handles `@`/`-`/`^`).
 ///
 /// Returns the resolved ref plus, when the user picked a `pr:`/`mr:` shortcut
 /// against a same-repo PR/MR, the `(remote, branch)` pair the new branch
@@ -478,15 +446,16 @@ fn resolve_base_ref(
     repo: &Repository,
     base: &str,
 ) -> anyhow::Result<(String, Option<(String, String)>)> {
-    match parse_ref_shortcut(base) {
-        Some((RefType::Pr, number)) => return resolve_pr_base(repo, number),
-        Some((RefType::Mr, number)) => {
-            return resolve_remote_ref_as_base(repo, &GitLabProvider, number);
-        }
-        None => {}
+    if let Some((ref_type, number)) = parse_ref_shortcut(base) {
+        let provider: &dyn RemoteRefProvider = match ref_type {
+            RefType::Pr => choose_pr_provider(repo)?,
+            RefType::Mr => &GitLabProvider,
+        };
+        return resolve_remote_ref_as_base(repo, provider, number);
     }
 
-    let resolved = repo.resolve_worktree_name(base)?;
+    let selector = repo.expand_selector(base)?;
+    let resolved = selector.token().to_string();
 
     if !repo.ref_exists(&resolved)? {
         let remotes = repo.branch(&resolved).remotes()?;
@@ -495,8 +464,8 @@ fn resolve_base_ref(
         }
         // Neither a ref nor a branch on a remote: the base may be named by the
         // path of the worktree it is checked out in, as targets elsewhere are.
-        if resolved == base
-            && let Some((_, Some(branch))) = repo.worktree_at_input_path(base)?
+        if selector.names_a_path()
+            && let Some((_, Some(branch))) = repo.worktree_at_input_path(selector.token())?
         {
             return Ok((branch, None));
         }
@@ -561,29 +530,38 @@ fn resolve_switch_target(
 ) -> anyhow::Result<ResolvedTarget> {
     // `pr:N` dispatches to GitHub, Gitea, or Azure DevOps based on remotes;
     // `mr:N` to GitLab. Forge PR/MR web URLs normalise to the same shortcuts.
-    match parse_ref_shortcut(branch) {
-        Some((RefType::Pr, number)) => return resolve_pr_target(repo, number, create, base),
-        Some((RefType::Mr, number)) => {
-            return resolve_remote_ref(repo, &GitLabProvider, number, create, base);
+    if let Some((ref_type, number)) = parse_ref_shortcut(branch) {
+        // --base is invalid with pr:/mr: syntax (check before provider selection,
+        // which may invoke a forge CLI to inspect authentication).
+        if base.is_some() {
+            return Err(GitError::RefBaseConflict { ref_type, number }.into());
         }
-        None => {}
+        let provider: &dyn RemoteRefProvider = match ref_type {
+            RefType::Pr => choose_pr_provider(repo)?,
+            RefType::Mr => &GitLabProvider,
+        };
+        return resolve_remote_ref(repo, provider, number, create);
     }
 
-    // Regular branch switch
-    let mut resolved_branch = repo
-        .resolve_worktree_name(branch)
+    // Regular branch switch. `expand_selector` normalizes the token and
+    // expands `@` / `-` / `^`, reporting whether it rewrote anything.
+    let mut selector = repo
+        .expand_selector(branch)
         .context("Failed to resolve branch name")?;
 
     // Handle remote-tracking ref names (e.g., "origin/username/feature-1" from the picker).
     // Strip the remote prefix only when there is no exact local branch/worktree,
     // so a local branch literally named `origin/foo` is not retargeted to `foo`.
     if !create
-        && repo.worktree_for_branch(&resolved_branch)?.is_none()
-        && !repo.branch(&resolved_branch).exists_locally()?
-        && let Some(local_name) = repo.strip_remote_prefix(&resolved_branch)
+        && repo.worktree_for_branch(selector.token())?.is_none()
+        && !repo.branch(selector.token()).exists_locally()?
+        && let Some(local_name) = repo.strip_remote_prefix(selector.token())
     {
-        resolved_branch = local_name;
+        // A rewrite like any other: `origin/foo` may have been a path the user
+        // typed, but `foo` is one nobody did.
+        selector = Selector::rewritten_to(local_name);
     }
+    let resolved_branch = selector.token().to_string();
 
     // Resolve and validate base (only when --create is set)
     let (resolved_base, base_pr_upstream) = if let Some(base_str) = base {
@@ -655,7 +633,14 @@ fn resolve_switch_target(
     };
 
     Ok(ResolvedTarget {
-        branch: resolved_branch,
+        // Under `--create` the argument names a branch that does not exist
+        // yet, so it is not a path to look up — stated here, where `create`
+        // lives, rather than re-tested at each arm that consults it.
+        selector: if create {
+            selector.branch_only()
+        } else {
+            selector
+        },
         method: CreationMethod::Regular {
             create_branch: create,
             base_branch,
@@ -689,7 +674,10 @@ fn validate_worktree_creation(
     {
         return Err(GitError::BranchNotFound {
             branch: branch.to_string(),
-            show_create_hint: true,
+            // Offering `--create` for a name git rejects sends the user to a
+            // command that fails; the argument was a path spelling, whether or
+            // not a directory happens to sit at it.
+            show_create_hint: worktrunk::git::is_valid_branch_name(branch),
             last_fetch_ago: format_last_fetch_ago(repo),
             pr_mr_platform: repo.detect_ref_type(),
         }
@@ -825,49 +813,50 @@ fn plan_switch(
     // Phase 1: Resolve target (handles pr:, validates --create/--base, may do network)
     let target = resolve_switch_target(repo, branch, create, base)?;
 
-    // Phase 2: Check if worktree already exists for this branch (fast path)
-    // This avoids computing the worktree path template (~7 git commands) for existing switches.
-    match repo.worktree_for_branch(&target.branch)? {
-        Some(existing_path) if existing_path.exists() => {
+    // Phase 2: the shared worktree ladder — the branch, then the argument as a
+    // worktree's own path (the way to name a detached one, which has no
+    // branch), then a verdict on what a selector matching neither was reaching
+    // for. `target.selector` carries whether Phase 1 rewrote the token, so the
+    // path arm switches itself off after a shortcut, `pr:`/`mr:`, or a stripped
+    // remote prefix.
+    //
+    // Resolving before the path template is also the fast path: an existing
+    // worktree answers without the ~7 git commands `compute_worktree_path` runs.
+    match repo.resolve_selector(&target.selector)? {
+        ResolvedWorktree::Worktree { path, branch } => {
+            // A registration whose directory is gone or broken has nothing to
+            // switch into; `wt remove` is the one command that still wants it.
+            if repo.worktree_is_unusable(&path)? {
+                return Err(GitError::WorktreeMissing {
+                    branch: branch
+                        .unwrap_or_else(|| worktrunk::git::path_dir_name(&path).to_string()),
+                }
+                .into());
+            }
             return Ok(SwitchPlan::Existing {
-                path: canonicalize(&existing_path).unwrap_or(existing_path),
-                branch: Some(target.branch),
+                path: canonicalize(&path).unwrap_or(path),
+                branch,
                 new_previous,
             });
         }
-        Some(_) => {
-            return Err(GitError::WorktreeMissing {
-                branch: target.branch,
-            }
-            .into());
+        // Nothing is registered there, and a path is all the argument could
+        // have been — so stop here rather than carrying it to Phase 4, which
+        // would report a missing branch and offer to create one under a name
+        // git rejects. `--create` never reaches this arm: its selector says
+        // the token is not a path, so `resolve_selector` returns `BranchOnly`.
+        ResolvedWorktree::NoWorktreeAtPath { path } => {
+            return Err(GitError::WorktreeNotFoundAtPath { path }.into());
         }
-        None => {}
-    }
-
-    // Phase 2b: the argument as the worktree's own path — the way to name a
-    // detached worktree, which has no branch. Not under `--create`, where the
-    // argument is the name of a branch that does not exist yet, and not when
-    // Phase 1 rewrote the argument (a shortcut, `pr:`/`mr:`, a stripped remote
-    // prefix), which is exactly when the literal token would be a nonsense path.
-    if !create
-        && target.branch == branch
-        && let Some((path, wt_branch)) = repo.worktree_at_input_path(branch)?
-    {
-        let canonical = canonicalize(&path).unwrap_or_else(|_| path.clone());
-        return Ok(SwitchPlan::Existing {
-            path: canonical,
-            branch: wt_branch,
-            new_previous,
-        });
+        _ => {}
     }
 
     // Phase 3: Compute expected path (only needed for create)
-    let expected_path = compute_worktree_path(repo, &target.branch, config)?;
+    let expected_path = compute_worktree_path(repo, target.selector.token(), config)?;
 
     // Phase 4: Validate we can create at this path
     let needs_clobber_backup = validate_worktree_creation(
         repo,
-        &target.branch,
+        target.selector.token(),
         &expected_path,
         clobber,
         &target.method,
@@ -875,7 +864,7 @@ fn plan_switch(
 
     // Phase 5: Return the plan
     Ok(SwitchPlan::Create {
-        branch: target.branch,
+        branch: target.selector.token().to_string(),
         worktree_path: expected_path,
         method: target.method,
         needs_clobber_backup,
@@ -1313,6 +1302,11 @@ impl SwitchJsonOutput {
 
 /// Emit the structured `--format=json` result to stdout when requested.
 ///
+/// One compact line rather than [`crate::output::print_json`]'s pretty form —
+/// a switch reports a single result, and a line is what a shell loop reads.
+/// The `println!` is anstream's for the same reason `print_json` uses it: a
+/// consumer that stops reading must not panic the command.
+///
 /// A no-op for `SwitchFormat::Text`.
 fn emit_switch_json(
     format: SwitchFormat,
@@ -1362,8 +1356,12 @@ fn run_pre_switch_hooks(
 ) -> anyhow::Result<()> {
     let current_wt = repo.current_worktree();
     let current_path = current_wt.path().to_path_buf();
+    // `expand_selector`, not the bare shortcut expander: the `target` var a
+    // pre-switch hook receives has to name the same branch the switch goes on
+    // to resolve, normalization included.
     let resolved_target = repo
-        .resolve_worktree_name(target_branch)
+        .expand_selector(target_branch)
+        .map(|s| s.token().to_string())
         .unwrap_or_else(|_| target_branch.to_string());
     let pre_ctx = CommandContext::new(repo, config, Some(&resolved_target), &current_path, yes);
 
@@ -1676,13 +1674,17 @@ impl SwitchPipeline<'_> {
         // user's shell won't be in the worktree, and shows the worktree-path
         // hint on first --create (before the shell integration warning).
         //
-        // When the user's CWD has been deleted, `std::env::current_dir()`
-        // fails — fall back to `repo_path()` (the main worktree root).
-        // `current_worktree().root()` resolves against the Repository's
+        // `shell_cwd()` is where the user's shell stands: the process cwd,
+        // unless a parent `wt` passed its own down (an alias or hook body runs
+        // from the worktree root, so a nested switch would otherwise resolve
+        // the user to that root — #3723). When the shell's CWD was already
+        // gone when `wt` started, `startup_cwd()` never captured one and this
+        // reads as absent — fall back to `repo_path()` (the main worktree
+        // root). `current_worktree().root()` resolves against the Repository's
         // discovery path, which is alive even after recovery, but we keep the
         // same fallback for any pathological case where rev-parse fails.
         let fallback_path = repo.repo_path()?.to_path_buf();
-        let cwd = std::env::current_dir().unwrap_or(fallback_path.clone());
+        let cwd = shell_cwd().unwrap_or(fallback_path.clone());
         let source_root = repo.current_worktree().root().unwrap_or(fallback_path);
         let hooks_display_path =
             handle_switch_output(&result, &branch_info, change_dir, Some(&source_root), &cwd)?;
