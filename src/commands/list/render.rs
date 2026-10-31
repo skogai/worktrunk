@@ -2,6 +2,7 @@ use crate::display::{format_relative_time_short, shorten_path};
 use anstyle::{Effects, Style};
 use unicode_width::UnicodeWidthStr;
 use worktrunk::styling::{DETACHED, StyledLine, truncate_visible};
+use worktrunk::utils::escape_controls;
 
 use super::columns::{ColumnKind, DiffVariant};
 use super::layout::{
@@ -653,7 +654,8 @@ impl ColumnLayout {
                     return self.placeholder_cell(placeholder);
                 };
                 let mut cell = StyledLine::new();
-                let msg = truncate_visible(&commit.commit_message, max_message_len);
+                let message = escape_controls(&commit.commit_message);
+                let msg = truncate_visible(&message, max_message_len);
                 cell.push_styled(msg, Style::new().dimmed());
                 cell
             }
@@ -1444,8 +1446,8 @@ mod tests {
     /// A row's link markup is a property of the render, not of the cell that
     /// happens to emit it: the CI reference and the dev-server port either both
     /// carry an underlined OSC 8 link or neither does. The picker renders
-    /// `Unlinked` because skim mangles the escape, and an underline there would
-    /// mark text with nothing behind it.
+    /// `Unlinked` (`layout::LinkStyle::Unlinked` has the reason), and an
+    /// underline there would mark text with nothing behind it.
     #[test]
     fn test_link_markup_is_uniform_across_a_row() {
         use super::super::ci_status::{CiSource, CiStatus, PrRef, PrStatus};

@@ -58,7 +58,7 @@ use super::preview::PreviewMode;
 use super::preview_notify::PrStatusDelta;
 use super::preview_orchestrator::{PreviewOrchestrator, SpawnGeneration};
 use crate::commands::list::collect::PickerProgressHandler;
-use crate::commands::list::model::{BranchScope, ItemKind, ListItem};
+use crate::commands::list::model::ListItem;
 
 /// Handler owned by the background collect thread. Implements the
 /// `PickerProgressHandler` trait that `collect` drives.
@@ -249,9 +249,9 @@ impl PickerHandler {
 
 /// Branch names the skeleton shows, for the `--prs` thread's dedup: a PR whose
 /// head branch is in this set is already on screen, so its row is dropped. A
-/// remote row ("origin/foo") also contributes its bare "foo" — remote names
-/// carry no '/', so the first segment is the remote — so a PR for "foo" dedups
-/// against a shown "origin/foo". Detached rows (no branch) contribute nothing.
+/// remote row ("origin/foo") also contributes its bare "foo", so a PR for
+/// "foo" dedups against a shown "origin/foo". Detached rows (no branch)
+/// contribute nothing.
 fn collect_shown_branches(items: &[ListItem]) -> HashSet<String> {
     let mut shown = HashSet::new();
     for item in items {
@@ -259,9 +259,7 @@ fn collect_shown_branches(items: &[ListItem]) -> HashSet<String> {
             continue;
         };
         shown.insert(name.to_string());
-        if matches!(item.kind(), ItemKind::Branch(BranchScope::Remote))
-            && let Some((_, bare)) = name.split_once('/')
-        {
+        if let Some((_, bare)) = item.branch_ref().remote_parts() {
             shown.insert(bare.to_string());
         }
     }
@@ -975,10 +973,9 @@ mod tests {
         // still in flight land, while `awaiting` is a key none of them match.
         // `on_skeleton` spawns a `LOCAL_GIT_MODES` precompute for this row,
         // which ends at `PreviewOrchestrator::fill` → `notify_filled` and pokes
-        // the same unlabelled `Event::RunPreview` this oracle counts. (The
-        // `comments` fetch is the other producer in production; on this
-        // no-forge `TestRepo` it fills synchronously through `fill_external`,
-        // so it is never in flight here.) Left in flight, a fill for the one
+        // the same unlabelled `Event::RunPreview` this oracle counts, as does
+        // the `comments` fetch the first live CI report spawns. Left in
+        // flight, a fill for the one
         // precompute key a later step also awaits (`WorkingTree`) pokes
         // legitimately but lands after that step's drain — charged to the *next*
         // step, which is the flake in #3725. Quiescing before each
@@ -1071,9 +1068,9 @@ mod tests {
     /// live CI fetch corrects the PR number (a stale prime, a reused branch), the
     /// now-wrong cached thread is dropped and re-fetched, so the `comments` tab
     /// can't keep serving the old PR's thread under the new number. The
-    /// `make_handler` repo has no forge, so the fetch caches a terminal pane
-    /// synchronously; the test watches the cache key being invalidated and
-    /// repopulated across the number change.
+    /// `make_handler` repo has no forge, so the fetch caches a terminal pane;
+    /// the test watches the cache key being invalidated and repopulated across
+    /// the number change.
     #[test]
     fn comments_refetch_on_pr_number_change() {
         use crate::commands::list::ci_status::{CiSource, CiStatus, PrRef, PrStatus};
@@ -1291,7 +1288,7 @@ mod tests {
         let (handler, _test, rx) = make_handler();
         let items = vec![
             ListItem::new_branch("abc".into(), "localbr".into()),
-            ListItem::new_remote_branch("abc".into(), "origin/remotebr".into()),
+            ListItem::new_remote_branch("abc".into(), "origin".into(), "remotebr".into()),
         ];
         handler.on_skeleton(
             items,
@@ -1409,7 +1406,8 @@ mod tests {
     fn collect_shown_branches_adds_remote_bare_names() {
         let items = vec![
             ListItem::new_branch("a".into(), "local-feat".into()),
-            ListItem::new_remote_branch("b".into(), "origin/remote-feat".into()),
+            ListItem::new_remote_branch("b".into(), "origin".into(), "remote-feat".into()),
+            ListItem::new_remote_branch("c".into(), "team/fork".into(), "slash-feat".into()),
         ];
         let shown = collect_shown_branches(&items);
         assert!(shown.contains("local-feat"), "local branch name");
@@ -1417,6 +1415,11 @@ mod tests {
         assert!(
             shown.contains("remote-feat"),
             "bare name so a PR head dedups against the remote row"
+        );
+        assert!(shown.contains("team/fork/slash-feat"), "slash remote ref");
+        assert!(
+            shown.contains("slash-feat"),
+            "bare name from a slash-named remote"
         );
     }
 
@@ -1826,16 +1829,18 @@ mod tests {
         let _ = rx.recv();
         let mut item = ListItem::new_branch("abc".into(), "b".into());
         let row_id = PickerRowId::local(&item);
-        // Record PR #5 in this handler's dedup slot (the fetch resolves
-        // synchronously to the "unsupported forge" pane — the test repo has
-        // no forge remote — only the recorded number matters here).
+        // Record PR #5 in this handler's dedup slot (the fetch resolves to
+        // the "unsupported forge" pane — the test repo has no forge remote —
+        // only the recorded number matters here).
         item.pr_status = status(5);
         handler.maybe_spawn_comments(0, &item);
 
         // A refresh supersedes this handler; the live spawn fetches the thread.
         handler.orchestrator.refresh(test.repo.clone());
         let key = (row_id.clone(), PreviewMode::Comments);
-        handler.orchestrator.fill_external(
+        PreviewOrchestrator::fill(
+            &handler.orchestrator.cache,
+            handler.orchestrator.notifier(),
             &handler.orchestrator.generation(),
             key.clone(),
             "live thread".to_string(),

@@ -28,6 +28,128 @@ use worktrunk::path::to_posix_path;
 // Signal handling (for PTY tests)
 // =============================================================================
 
+#[cfg(unix)]
+pub const FOREGROUND_TRACE_FILTER: &str = "worktrunk::wt_trace=debug,worktrunk::trace::emit=debug";
+
+/// Child readiness may precede the parent's spawn return. Caught-signal tests
+/// wait for wt to commit admission before delivering ordinary terminal input.
+#[cfg(unix)]
+pub fn wait_for_foreground_admission(repo: &TestRepo, children: &[i32]) {
+    let trace = resolve_git_common_dir(repo.root_path()).join("wt/logs/trace.jsonl");
+    let admissions: Vec<_> = children
+        .iter()
+        .map(|pid| format!("Foreground admitted:{pid}"))
+        .collect();
+    wait_for("foreground child admission", || {
+        std::fs::read_to_string(&trace).is_ok_and(|records| {
+            let events = worktrunk::trace::parse_lines(&records);
+            admissions.iter().all(|admission| {
+                events.iter().any(|entry| {
+                    matches!(&entry.kind, worktrunk::trace::TraceEntryKind::Instant { name } if name == admission)
+                })
+            })
+        })
+    });
+}
+
+/// wt running as a native job in a process group of its own, so a group signal
+/// reaches wt and its children as a terminal key would, but not the test runner.
+/// Signal fixtures synchronize through files and avoid background descendants.
+/// An owned, unreaped keeper reserves the native group for scoped cleanup.
+#[cfg(unix)]
+pub struct SignalJob {
+    child: Option<std::process::Child>,
+    keeper: std::process::Child,
+    pub release: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl SignalJob {
+    pub fn spawn(repo: &TestRepo, args: &[&str], stderr: std::process::Stdio) -> Self {
+        use std::os::unix::process::CommandExt;
+        // This owned, unreaped child reserves the caller group's numeric ID
+        // even after wt finishes or a group interrupt kills the keeper.
+        let keeper = std::process::Command::new("sleep")
+            .arg("300")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut job = Self {
+            child: None,
+            keeper,
+            release: repo.root_path().join("release"),
+        };
+        let mut command = repo.wt_command();
+        command.args(args);
+        command
+            .current_dir(repo.root_path())
+            .env("RUST_LOG", crate::common::FOREGROUND_TRACE_FILTER)
+            .stdout(std::process::Stdio::null())
+            .stderr(stderr)
+            .process_group(job.group().as_raw());
+        job.child = Some(command.spawn().unwrap());
+        job
+    }
+
+    pub fn pid(&self) -> nix::unistd::Pid {
+        nix::unistd::Pid::from_raw(self.child.as_ref().unwrap().id() as i32)
+    }
+
+    pub fn group(&self) -> nix::unistd::Pid {
+        nix::unistd::Pid::from_raw(self.keeper.id() as i32)
+    }
+
+    pub fn running(&mut self) -> bool {
+        self.child.as_mut().unwrap().try_wait().unwrap().is_none()
+    }
+
+    pub fn release(&self) {
+        std::fs::write(&self.release, "release").unwrap();
+    }
+
+    /// Press Ctrl-C once wt has admitted the child that wrote its PID to
+    /// `pid_file`, so wt receives the key while that child runs, not during startup.
+    /// Needs `-vv` among the spawn arguments for the admission trace.
+    pub fn interrupt_admitted_child(&self, repo: &TestRepo, pid_file: &Path) {
+        wait_for_file_content(pid_file);
+        let pid: i32 = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        wait_for_foreground_admission(repo, &[pid]);
+        nix::sys::signal::killpg(self.group(), nix::sys::signal::Signal::SIGINT).unwrap();
+    }
+
+    pub fn wait(&mut self) -> std::process::ExitStatus {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if let Some(status) = self.child.as_mut().unwrap().try_wait().unwrap() {
+                return status;
+            }
+            assert!(std::time::Instant::now() < deadline, "wt did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SignalJob {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.release, "release");
+        // No wait for the keeper precedes this signal. Its reserved PID pins
+        // the group's identity, independently of wt's cached wait status.
+        let _ = nix::sys::signal::killpg(self.group(), nix::sys::signal::Signal::SIGKILL);
+        if let Some(child) = &mut self.child {
+            let _ = child.wait();
+        }
+        let _ = self.keeper.wait();
+    }
+}
+
 /// Block SIGTTIN and SIGTTOU signals to prevent test processes from being
 /// stopped when PTY operations interact with terminal control in background
 /// process groups.
@@ -171,6 +293,18 @@ pub fn temp_home() -> TempDir {
 ///   and `.exists()`. `dunce::canonicalize` returns an ordinary path.
 pub fn canonical_temp_home(temp_home: &TempDir) -> std::path::PathBuf {
     dunce::canonicalize(temp_home.path()).unwrap()
+}
+
+/// Check out `branch` a second time at `<repo>.<suffix>`, the state only
+/// `--force` can produce.
+pub fn add_force_duplicate(repo: &TestRepo, branch: &str, suffix: &str) -> std::path::PathBuf {
+    let dup = repo
+        .root_path()
+        .parent()
+        .unwrap()
+        .join(format!("repo.{suffix}"));
+    repo.run_git(&["worktree", "add", "--force", dup.to_str().unwrap(), branch]);
+    dup
 }
 
 /// Repo with remote tracking set up.
@@ -583,6 +717,21 @@ pub fn shell_command(
     cmd
 }
 
+/// Simulate Git invoking wt while retaining Git's own subcommand helpers.
+pub fn configure_git_subcommand(cmd: &mut std::process::Command, repo: &TestRepo) {
+    let output = repo
+        .git_command()
+        .args(["--exec-path"])
+        .env_remove("GIT_EXEC_PATH")
+        .run()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    cmd.env(
+        "GIT_EXEC_PATH",
+        String::from_utf8(output.stdout).unwrap().trim(),
+    );
+}
+
 // =============================================================================
 // Snapshot settings functions (insta)
 // =============================================================================
@@ -612,9 +761,14 @@ pub fn add_standard_env_redactions(settings: &mut insta::Settings) {
     // Windows: etcetera uses APPDATA for config_dir()
     settings.add_redaction(".env.APPDATA", "[TEST_CONFIG_HOME]");
     settings.add_redaction(".env.PATH", "[PATH]");
+    settings.add_redaction(".env.GIT_EXEC_PATH", "[GIT_EXEC_PATH]");
     settings.add_redaction(".env.PWD", "[PWD]");
     // Mock commands directory (temp path for mock gh/glab binaries)
     settings.add_redaction(".env.WORKTRUNK_TEST_MOCK_CONFIG_DIR", "[TEST_MOCK_CONFIG]");
+    settings.add_redaction(
+        ".env.WORKTRUNK_TEST_MOCK_CALL_LOG_DIR",
+        "[TEST_MOCK_CALL_LOG]",
+    );
     // Nushell vendor-autoload override (temp path pinned by shell-integration tests)
     settings.add_redaction(
         ".env.WORKTRUNK_TEST_NU_VENDOR_AUTOLOAD_DIR",
@@ -831,7 +985,7 @@ fn add_placeholder_cleanup_filters(settings: &mut insta::Settings) {
 /// — macOS keeps the absolute form (canonicalized HOME `/private/var/...`
 /// doesn't prefix the uncanonicalized config path), Linux strips to a tilde
 /// (HOME == tempdir, prefix matches).
-const TEST_PATH_PREFIX: &str =
+pub(crate) const TEST_PATH_PREFIX: &str =
     r"'?(?:~(?:/\.tmp[^/\\']+)?|(?:[A-Z]:)?[/\\][^\s']+[/\\]\.tmp[^/\\']+)[/\\]";
 
 fn add_temp_path_placeholder_filters(settings: &mut insta::Settings) {
@@ -1084,6 +1238,13 @@ fn setup_snapshot_settings_for_paths_with_home(
         "$1 # $2",
     );
 
+    // Git 2.56 names ambiguous remote-tracking branches; older Git reports
+    // the same failed worktree-add lookup as an invalid reference.
+    settings.add_filter(
+        r"fatal: '([^'\r\n]+)' matched multiple \(\d+\) remote tracking branches",
+        "fatal: invalid reference: $1",
+    );
+
     // Normalize OS-specific error messages in gutter output
     // Ubuntu may produce "Broken pipe (os error 32)" instead of the expected error
     // when capturing stderr from shell commands due to timing/buffering differences
@@ -1325,6 +1486,31 @@ pub fn add_pty_filters(settings: &mut insta::Settings) {
     // macOS PTYs emit ^D (literal caret-D) followed by backspaces (0x08)
     // when EOF is signaled. Linux PTYs don't. Strip these for consistency.
     settings.add_filter(r"\^D\x08+", "");
+
+    // An interactive shell puts each child it forks into its own process
+    // group, and reports a failed `setpgid` on its own stderr:
+    //
+    //     bash: child setpgid (42242 to 42242): Operation not permitted
+    //
+    // Whether that call loses its race with the child's own `setpgid`/exec is
+    // up to host scheduling, so the line appears in a handful of runs and in
+    // none of the others (observed once on macOS CI, actions/runs/35065804093).
+    // It is the shell describing its own job-control bookkeeping, not anything
+    // `wt` wrote, and the bash arm of the wrapper harness folds stderr into
+    // stdout (`exec 2>&1`) so that leaked job-control *notifications* are
+    // visible to tests — those stay visible, since `assert_no_job_control_messages`
+    // matches the `[1] 12345` / `[1]+ Done` shape this filter does not touch.
+    //
+    // The shell writes the line whenever the race resolves, so it need not
+    // start a line: it has also landed straight after the capture's trailing
+    // `\x1b[0m`, with no newline between (macOS CI, actions/runs/35132033122).
+    // The pattern therefore starts at a line start or right after an SGR
+    // escape, and keeps the escape. A bare unanchored `\w+` would instead eat
+    // the tail of whatever word preceded the shell's name.
+    settings.add_filter(
+        r"(?m)(^|\x1b\[[0-9;]*m)\w+: child setpgid \(\d+ to \d+\): [^\n]*\n?",
+        "$1",
+    );
 }
 
 /// Add filters for binary paths (target/debug/wt) in PTY output.
@@ -1348,15 +1534,58 @@ pub fn add_pty_binary_path_filters(settings: &mut insta::Settings) {
     );
 }
 
+/// Shell-visible exit status, including a CLI terminated by its native signal.
+pub fn shell_exit_code(status: &std::process::ExitStatus) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status
+            .code()
+            .or_else(|| status.signal().map(|signal| 128 + signal))
+    }
+    #[cfg(not(unix))]
+    status.code()
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
+
+/// PTY capture carrying a shell's failed-`setpgid` diagnostic alongside the
+/// job-control notifications the wrapper tests assert on — once at a line
+/// start, and once appended to the capture's trailing SGR reset.
+#[cfg(test)]
+const SETPGID_NOISE_SAMPLE: &str = "bash: child setpgid (42242 to 42242): Operation not permitted
+[1] 42243
+Switched to worktree for feature-api
+[1]+ Done                    wt hook post-start
+\x1b[0mbash: child setpgid (64019 to 64019): Operation not permitted
+";
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use insta::assert_snapshot;
     use rstest::rstest;
+
+    /// A shell's own failed-`setpgid` diagnostic is host scheduling noise that
+    /// lands in the middle of a PTY snapshot, while the job-control
+    /// *notifications* the wrapper tests watch for must survive the filters.
+    #[test]
+    fn pty_filters_drop_the_setpgid_diagnostic_but_keep_job_control_notices() {
+        let mut settings = insta::Settings::clone_current();
+        add_pty_filters(&mut settings);
+        // Runs after the PTY filters, so it shows the reset they must keep.
+        settings.add_filter(r"\x1b\[0m", "[RESET]");
+        settings.bind(|| {
+            assert_snapshot!(SETPGID_NOISE_SAMPLE, @r"
+            [1] 42243
+            Switched to worktree for feature-api
+            [1]+ Done                    wt hook post-start
+            [RESET]
+            ");
+        });
+    }
 
     /// The uplifted `target/debug/wt` is removed and recreated by any
     /// concurrent `cargo build`, so the suite spawns a pinned hardlink
@@ -1435,7 +1664,7 @@ mod tests {
         // and would pass unchanged if `tests` or `benches` stopped yielding
         // `.rs` files — the absence claim silently narrowing to one third of
         // what it names. See "Guards that scan source text" in
-        // `tests/CLAUDE.md`.
+        // `tests/AGENTS.md`.
         for dir in ["src", "tests", "benches"] {
             let seen = scan_for_needle(&root.join(dir), &needle, root, &mut offenders);
             assert!(

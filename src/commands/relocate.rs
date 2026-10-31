@@ -34,8 +34,9 @@ use worktrunk::styling::{
 };
 
 use super::backup;
-use super::commit::{CommitGenerator, StageMode};
+use super::commit::{CommitGenerator, CommitOutcome, StageMode};
 use super::worktree::compute_worktree_path;
+use crate::output::{CommandFailure, CommandResult};
 
 // ============================================================================
 // Types representing each stage of the pipeline
@@ -83,7 +84,15 @@ struct TempRelocation {
     original_path: PathBuf,
 }
 
+/// Where the user's shell stands: its cwd and the pending worktree holding it.
+#[derive(Clone, Copy)]
+struct ShellPosition<'a> {
+    cwd: &'a Path,
+    index: usize,
+}
+
 /// A worktree that was successfully relocated.
+#[derive(serde::Serialize)]
 pub struct RelocatedEntry {
     pub branch: String,
     pub from: PathBuf,
@@ -93,6 +102,7 @@ pub struct RelocatedEntry {
 /// A worktree that was skipped during validation or execution. `reason` is a
 /// short stable identifier suitable for JSON / scripting (e.g. `"locked"`,
 /// `"uncommitted"`, `"unmerged"`, `"target_blocked"`).
+#[derive(serde::Serialize)]
 pub struct SkippedEntry {
     pub branch: String,
     pub reason: &'static str,
@@ -163,14 +173,14 @@ pub fn gather_candidates(
     } else {
         let mut selected: Vec<WorktreeInfo> = Vec::new();
         for arg in filter_branches {
-            let path = repo.require_worktree(arg)?;
+            let (path, _) = repo.require_worktree(arg)?;
             let Some(wt) = worktrees.iter().find(|wt| paths_match(&path, &wt.path)) else {
-                // Resolved, but pruned out above: its directory is gone, so
-                // there is nothing to move.
+                // Resolved, but pruned out above: its directory or `.git` is
+                // gone, so there is nothing to move.
                 bail!(
                     "{}",
                     cformat!(
-                        "Cannot relocate worktree @ {} — its directory is gone; run <bold>wt step prune</> to clear the entry",
+                        "Cannot relocate worktree @ {} — it is stale; to clear the entry, run <bold>wt step prune</>",
                         format_path_for_display(&path)
                     )
                 );
@@ -244,6 +254,16 @@ pub fn gather_candidates(
 pub struct ValidationResult {
     pub validated: Vec<ValidatedCandidate>,
     pub skipped: Vec<SkippedEntry>,
+    pub commits: Vec<RelocationCommit>,
+}
+
+/// A confirmed auto-commit, independent of whether its worktree later moves.
+#[derive(serde::Serialize)]
+pub struct RelocationCommit {
+    pub branch: String,
+    pub path: PathBuf,
+    #[serde(flatten)]
+    pub outcome: CommitOutcome,
 }
 
 /// Check each candidate for locked/dirty state and optionally auto-commit.
@@ -252,6 +272,8 @@ pub struct ValidationResult {
 /// the approved project-level append fragment added to each auto-commit
 /// prompt. Resolved once upfront by the caller so per-worktree commits share
 /// the same approved value rather than each running its own approval gate.
+/// Confirmed auto-commits remain in the returned result if a later check or
+/// commit fails; validation does not claim those worktrees have moved.
 pub fn validate_candidates(
     repo: &Repository,
     config: &UserConfig,
@@ -259,115 +281,142 @@ pub fn validate_candidates(
     auto_commit: bool,
     repo_path: &Path,
     project_append: Option<&str>,
-) -> anyhow::Result<ValidationResult> {
+) -> CommandResult<ValidationResult> {
     let mut validated = Vec::new();
     let mut skipped: Vec<SkippedEntry> = Vec::new();
+    let mut commits = Vec::new();
 
-    for candidate in candidates {
-        let branch = candidate.branch();
+    let validation = (|| -> anyhow::Result<()> {
+        for candidate in candidates {
+            let branch = candidate.branch();
 
-        // Check locked - always skip (user must unlock manually)
-        if let Some(reason) = &candidate.wt.locked {
-            let reason_text = if reason.is_empty() {
-                String::new()
-            } else {
-                format!(": {reason}")
-            };
-            eprintln!(
-                "{}",
-                warning_message(cformat!("Skipping <bold>{branch}</> (locked{reason_text})"))
-            );
-            skipped.push(SkippedEntry {
-                branch: branch.to_string(),
-                reason: "locked",
-            });
-            continue;
-        }
-
-        let is_main = paths_match(&candidate.wt.path, repo_path);
-
-        // Check dirty.
-        //
-        // `git worktree move` carries modified-tracked and untracked files
-        // along with the worktree, so for linked worktrees we don't need to
-        // require a clean state. The main worktree is different: it can't be
-        // moved with `git worktree move`, and the fallback path runs
-        // `git switch <default-branch>` which refuses to switch over
-        // uncommitted changes — so we still skip dirty main worktrees unless
-        // `--commit` was passed.
-        let worktree = repo.worktree_at(&candidate.wt.path);
-        if worktree.is_dirty()? && (auto_commit || is_main) {
-            if auto_commit {
-                // An unresolved conflict can't be committed by anyone until
-                // the user resolves it by hand — the same class of blocker as
-                // a locked worktree, so skip this one and carry on with the
-                // rest rather than failing the whole run. Checked before the
-                // progress line so nothing announces a commit that won't
-                // happen. `worktree.stage` below refuses the same state; this
-                // is the policy choice of skip over abort, not the guard.
-                let unmerged = worktree.unmerged_paths()?;
-                if !unmerged.is_empty() {
-                    eprintln!(
-                        "{}",
-                        warning_message(cformat!(
-                            "Skipping <bold>{branch}</> ({})",
-                            format_unresolved_conflicts(unmerged.len())
-                        ))
-                    );
-                    eprintln!("{}", format_with_gutter(&unmerged.join("\n"), None));
-                    skipped.push(SkippedEntry {
-                        branch: branch.to_string(),
-                        reason: "unmerged",
-                    });
-                    continue;
-                }
+            // Check locked - always skip (user must unlock manually)
+            if let Some(reason) = &candidate.wt.locked {
+                let reason_text = if reason.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {reason}")
+                };
                 eprintln!(
                     "{}",
-                    progress_message(cformat!("Committing changes in <bold>{branch}</>..."))
-                );
-                // Stage all changes. `stage` refuses an unmerged index first —
-                // `git add -A` over an unresolved conflict would otherwise
-                // commit the `<<<<<<<` markers.
-                worktree.stage(StageMode::All)?;
-                // Commit using shared pipeline
-                let project_id = repo.project_identifier().ok();
-                let commit_config = config.commit_generation(project_id.as_deref());
-                CommitGenerator::new(&commit_config, project_append).commit_staged_changes(
-                    &worktree,
-                    false, // show_progress - already showing "Committing changes in..."
-                    false, // show_no_squash_note
-                    StageMode::None, // already staged above
-                )?;
-            } else {
-                // is_main without --commit
-                eprintln!(
-                    "{}",
-                    warning_message(cformat!(
-                        "Skipping <bold>{branch}</> (uncommitted changes in main worktree)"
-                    ))
-                );
-                eprintln!(
-                    "{}",
-                    hint_message(cformat!(
-                        "To auto-commit changes before relocating, use <underline>--commit</>"
-                    ))
+                    warning_message(cformat!("Skipping <bold>{branch}</> (locked{reason_text})"))
                 );
                 skipped.push(SkippedEntry {
                     branch: branch.to_string(),
-                    reason: "uncommitted",
+                    reason: "locked",
                 });
                 continue;
             }
+
+            let is_main = paths_match(&candidate.wt.path, repo_path);
+
+            // Check dirty.
+            //
+            // `git worktree move` carries modified-tracked and untracked files
+            // along with the worktree, so for linked worktrees we don't need to
+            // require a clean state. The main worktree is different: it can't be
+            // moved with `git worktree move`, and the fallback path runs
+            // `git switch <default-branch>` which refuses to switch over
+            // uncommitted changes — so we still skip dirty main worktrees unless
+            // `--commit` was passed.
+            let worktree = repo.worktree_at(&candidate.wt.path);
+            if worktree.is_dirty()? && (auto_commit || is_main) {
+                if auto_commit {
+                    // An unresolved conflict can't be committed by anyone until
+                    // the user resolves it by hand — the same class of blocker as
+                    // a locked worktree, so skip this one and carry on with the
+                    // rest rather than failing the whole run. Checked before the
+                    // progress line so nothing announces a commit that won't
+                    // happen. `worktree.stage` below refuses the same state; this
+                    // is the policy choice of skip over abort, not the guard.
+                    let unmerged = worktree.unmerged_paths()?;
+                    if !unmerged.is_empty() {
+                        eprintln!(
+                            "{}",
+                            warning_message(cformat!(
+                                "Skipping <bold>{branch}</> ({})",
+                                format_unresolved_conflicts(unmerged.len())
+                            ))
+                        );
+                        eprintln!("{}", format_with_gutter(&unmerged.join("\n"), None));
+                        skipped.push(SkippedEntry {
+                            branch: branch.to_string(),
+                            reason: "unmerged",
+                        });
+                        continue;
+                    }
+                    eprintln!(
+                        "{}",
+                        progress_message(cformat!("Committing changes in <bold>{branch}</>..."))
+                    );
+                    // Stage all changes. `stage` refuses an unmerged index first —
+                    // `git add -A` over an unresolved conflict would otherwise
+                    // commit the `<<<<<<<` markers.
+                    worktree.stage(StageMode::All)?;
+                    // Commit using shared pipeline
+                    let project_id = repo.project_identifier().ok();
+                    let commit_config = config.commit_generation(project_id.as_ref());
+                    let committed = CommitGenerator::new(&commit_config, project_append)
+                        .commit_staged_changes(
+                            &worktree,
+                            false, // show_progress - already showing "Committing changes in..."
+                            false, // show_no_squash_note
+                            StageMode::All, // resolved staging mode applied above
+                        );
+                    let (outcome, error) = match committed {
+                        Ok(outcome) => (Some(outcome), None),
+                        Err(failure) => (failure.result.map(|result| *result), Some(failure.error)),
+                    };
+                    if let Some(outcome) = outcome {
+                        commits.push(RelocationCommit {
+                            branch: branch.to_string(),
+                            path: candidate.wt.path.clone(),
+                            outcome,
+                        });
+                    }
+                    if let Some(error) = error {
+                        return Err(error);
+                    }
+                } else {
+                    // is_main without --commit
+                    eprintln!(
+                        "{}",
+                        warning_message(cformat!(
+                            "Skipping <bold>{branch}</> (uncommitted changes in main worktree)"
+                        ))
+                    );
+                    eprintln!(
+                        "{}",
+                        hint_message(cformat!(
+                            "To auto-commit changes before relocating, use <underline>--commit</>"
+                        ))
+                    );
+                    skipped.push(SkippedEntry {
+                        branch: branch.to_string(),
+                        reason: "uncommitted",
+                    });
+                    continue;
+                }
+            }
+
+            validated.push(ValidatedCandidate {
+                wt: candidate.wt,
+                expected_path: candidate.expected_path,
+                is_main,
+            });
         }
 
-        validated.push(ValidatedCandidate {
-            wt: candidate.wt,
-            expected_path: candidate.expected_path,
-            is_main,
-        });
+        Ok(())
+    })();
+    let result = ValidationResult {
+        validated,
+        skipped,
+        commits,
+    };
+    match validation {
+        Ok(()) => Ok(result),
+        Err(error) => Err(CommandFailure::with_result(error, result)),
     }
-
-    Ok(ValidationResult { validated, skipped })
 }
 
 // ============================================================================
@@ -444,12 +493,13 @@ impl<'a> RelocationExecutor<'a> {
                 eprintln!("{}", progress_message(cformat!("Backed up {src} → {dest}")));
             } else {
                 let blocked_path = format_path_for_display(expected_path);
-                let msg = cformat!("Skipping <bold>{branch}</> (target blocked: {blocked_path})");
+                let msg =
+                    cformat!("Skipping <bold>{branch}</> (path already exists @ {blocked_path})");
                 eprintln!("{}", warning_message(msg));
                 eprintln!(
                     "{}",
                     hint_message(cformat!(
-                        "To backup blocking paths, use <underline>--clobber</>"
+                        "To back up blocking paths before relocating, use <underline>--clobber</>"
                     ))
                 );
                 blocked.insert(i);
@@ -475,6 +525,11 @@ impl<'a> RelocationExecutor<'a> {
 
     /// Execute all relocations in dependency order.
     pub fn execute(&mut self, default_branch: &str, cwd: Option<&Path>) -> anyhow::Result<()> {
+        let shell = cwd
+            .map(|cwd| self.shell_position(cwd))
+            .transpose()?
+            .flatten();
+
         // Process until all pending are moved or in temp
         loop {
             let mut made_progress = false;
@@ -487,7 +542,7 @@ impl<'a> RelocationExecutor<'a> {
 
                 match self.is_target_empty(i) {
                     Some(true) => {
-                        self.move_worktree(i, default_branch, cwd)?;
+                        self.move_worktree(i, default_branch, shell)?;
                         made_progress = true;
                     }
                     Some(false) => {
@@ -519,7 +574,7 @@ impl<'a> RelocationExecutor<'a> {
                         let branch = self.pending[i].branch();
                         let blocked_path = format_path_for_display(&self.pending[i].expected_path);
                         let msg = cformat!(
-                            "Skipping <bold>{branch}</> (target occupied: {blocked_path})"
+                            "Skipping <bold>{branch}</> (path already exists @ {blocked_path})"
                         );
                         eprintln!("{}", warning_message(msg));
                         self.blocked.insert(i);
@@ -542,7 +597,7 @@ impl<'a> RelocationExecutor<'a> {
         }
 
         // Move temp-relocated worktrees to final destinations
-        self.finalize_temp_relocations()?;
+        self.finalize_temp_relocations(shell)?;
 
         // Clean up temp directory if empty
         if self.temp_dir.exists() {
@@ -550,6 +605,25 @@ impl<'a> RelocationExecutor<'a> {
         }
 
         Ok(())
+    }
+
+    /// Find the pending worktree the user's shell stands in, if any.
+    ///
+    /// The owner is the worktree whose path is the longest prefix of `cwd`, so
+    /// a shell inside a worktree nested under another (the
+    /// `.worktrees/{{ branch }}` layout nests every linked worktree under the
+    /// main one) belongs to the inner worktree, not the outer.
+    fn shell_position<'c>(&self, cwd: &'c Path) -> anyhow::Result<Option<ShellPosition<'c>>> {
+        let owner = self
+            .repo
+            .list_worktrees()?
+            .iter()
+            .map(|wt| wt.path.as_path())
+            .filter(|path| cwd.starts_with(path))
+            .max_by_key(|path| path.components().count());
+        Ok(owner
+            .and_then(|owner| self.pending.iter().position(|c| c.wt.path == owner))
+            .map(|index| ShellPosition { cwd, index }))
     }
 
     /// Check if target path is empty (not occupied by a pending worktree).
@@ -601,7 +675,7 @@ impl<'a> RelocationExecutor<'a> {
         &mut self,
         idx: usize,
         default_branch: &str,
-        cwd: Option<&Path>,
+        shell: Option<ShellPosition<'_>>,
     ) -> anyhow::Result<()> {
         // Extract data we need before any mutable borrows
         let branch = self.pending[idx].branch().to_string();
@@ -626,33 +700,13 @@ impl<'a> RelocationExecutor<'a> {
         let msg = cformat!("Relocated <bold>{branch}</>: {src_display} → {dest_display}");
         eprintln!("{}", success_message(msg));
 
-        // Update shell if user is inside this worktree, preserving their
-        // subdirectory position via the same helper as `switch`/`remove` so
-        // every path-switching command behaves identically.
-        if let Some(cwd_path) = cwd
-            && cwd_path.starts_with(&src_path)
-        {
-            let cd_target = crate::output::handlers::resolve_subdir_in_target(
-                &dest_path,
-                Some(&src_path),
-                cwd_path,
-            );
-            crate::output::change_directory(cd_target)?;
-            if crate::output::retired_shell_wrapper_active() {
-                eprintln!(
-                    "{}",
-                    warning_message("Cannot change directory — shell wrapper is out of date")
-                );
-                crate::output::print_outdated_shell_wrapper_hint_once();
-            }
-        }
-
         self.moved.insert(idx);
         self.relocated_entries.push(RelocatedEntry {
             branch,
-            from: src_path,
-            to: dest_path,
+            from: src_path.clone(),
+            to: dest_path.clone(),
         });
+        follow_shell(shell, idx, &src_path, &dest_path)?;
         Ok(())
     }
 
@@ -710,9 +764,11 @@ impl<'a> RelocationExecutor<'a> {
         // Create temp directory if needed
         std::fs::create_dir_all(&self.temp_dir)?;
 
-        // Sanitize branch name for temp path (feature/foo -> feature-foo)
+        // Prefix with the candidate index because sanitize_for_filename's
+        // short hash can collide for distinct branch names. Multiple cycles
+        // keep their temporary worktrees alive until finalization.
         let safe_branch = worktrunk::path::sanitize_for_filename(branch);
-        let temp_path = self.temp_dir.join(&safe_branch);
+        let temp_path = self.temp_dir.join(format!("{i}-{safe_branch}"));
 
         let msg = cformat!("Moving <bold>{branch}</> to temporary location...");
         eprintln!("{}", progress_message(msg));
@@ -743,7 +799,10 @@ impl<'a> RelocationExecutor<'a> {
     }
 
     /// Move worktrees from temp locations to their final destinations.
-    fn finalize_temp_relocations(&mut self) -> anyhow::Result<()> {
+    fn finalize_temp_relocations(
+        &mut self,
+        shell: Option<ShellPosition<'_>>,
+    ) -> anyhow::Result<()> {
         for temp in std::mem::take(&mut self.temp_relocated) {
             let candidate = &self.pending[temp.index];
             let branch = candidate.branch();
@@ -763,13 +822,45 @@ impl<'a> RelocationExecutor<'a> {
 
             self.relocated_entries.push(RelocatedEntry {
                 branch: branch.to_string(),
-                from: temp.original_path,
+                from: temp.original_path.clone(),
                 to: candidate.expected_path.clone(),
             });
+            follow_shell(
+                shell,
+                temp.index,
+                &temp.original_path,
+                &candidate.expected_path,
+            )?;
         }
 
         Ok(())
     }
+}
+
+/// Send the shell to the worktree's new path if it stood in the worktree that
+/// just moved from `src_path` to `dest_path`, preserving its subdirectory
+/// position via the same helper as `switch`/`remove` so every path-switching
+/// command behaves identically.
+fn follow_shell(
+    shell: Option<ShellPosition<'_>>,
+    index: usize,
+    src_path: &Path,
+    dest_path: &Path,
+) -> anyhow::Result<()> {
+    let Some(shell) = shell.filter(|shell| shell.index == index) else {
+        return Ok(());
+    };
+    let cd_target =
+        crate::output::handlers::resolve_subdir_in_target(dest_path, Some(src_path), shell.cwd);
+    crate::output::change_directory(cd_target)?;
+    if crate::output::retired_shell_wrapper_active() {
+        eprintln!(
+            "{}",
+            warning_message("Cannot change directory — shell wrapper is out of date")
+        );
+        crate::output::print_outdated_shell_wrapper_hint_once();
+    }
+    Ok(())
 }
 
 // ============================================================================

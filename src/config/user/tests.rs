@@ -1,6 +1,6 @@
 use super::*;
-use crate::config::HooksConfig;
 use crate::config::commands::CommandConfig;
+use crate::config::{HooksConfig, ProjectId};
 use crate::git::HookType;
 use crate::testing::TestRepo;
 
@@ -51,10 +51,7 @@ fn test_compute_unknown_tree_empty() {
     let content = r#"
 worktree-path = "../{{ main_worktree }}.{{ branch }}"
 "#;
-    let tree = crate::config::compute_unknown_tree::<UserConfig>(content)
-        .warn_tree()
-        .cloned()
-        .unwrap();
+    let tree = crate::config::compute_unknown_tree::<UserConfig>(content).unwrap();
     assert!(tree.is_empty(), "expected no unknowns, got {tree:?}");
 }
 
@@ -66,10 +63,7 @@ worktree-path = "../{{ main_worktree }}.{{ branch }}"
 unknown-key = "value"
 another-unknown = 42
 "#;
-    let tree = crate::config::compute_unknown_tree::<UserConfig>(content)
-        .warn_tree()
-        .cloned()
-        .unwrap();
+    let tree = crate::config::compute_unknown_tree::<UserConfig>(content).unwrap();
     assert!(tree.keys.contains("unknown-key"));
     assert!(tree.keys.contains("another-unknown"));
 }
@@ -101,10 +95,7 @@ run = "npm install"
 [post-switch]
 rename-tab = "echo 'switched'"
 "#;
-    let tree = crate::config::compute_unknown_tree::<UserConfig>(content)
-        .warn_tree()
-        .cloned()
-        .unwrap();
+    let tree = crate::config::compute_unknown_tree::<UserConfig>(content).unwrap();
     assert!(tree.is_empty());
 }
 
@@ -210,7 +201,7 @@ fn test_worktree_path_for_project_uses_project_specific() {
 
     // Project-specific path should be used
     assert_eq!(
-        config.worktree_path_for_project("github.com/user/repo"),
+        config.worktree_path_for_project(&ProjectId::from("github.com/user/repo")),
         ".worktrees/{{ branch | sanitize }}"
     );
 }
@@ -232,7 +223,7 @@ fn test_worktree_path_for_project_falls_back_to_global() {
 
     // Should fall back to global worktree-path
     assert_eq!(
-        config.worktree_path_for_project("github.com/user/repo"),
+        config.worktree_path_for_project(&ProjectId::from("github.com/user/repo")),
         "../{{ repo }}-{{ branch | sanitize }}"
     );
 }
@@ -243,7 +234,7 @@ fn test_worktree_path_for_project_falls_back_to_default() {
 
     // Unknown project should fall back to default template
     assert_eq!(
-        config.worktree_path_for_project("github.com/unknown/project"),
+        config.worktree_path_for_project(&ProjectId::from("github.com/unknown/project")),
         "{{ repo_path }}/../{{ repo }}.{{ branch | sanitize }}"
     );
 }
@@ -269,7 +260,7 @@ fn test_format_path_with_project_override() {
             "myrepo",
             "feature/branch",
             &test.repo,
-            Some("github.com/user/repo"),
+            Some(&ProjectId::from("github.com/user/repo")),
         )
         .unwrap();
     assert_eq!(path, ".worktrees/feature-branch");
@@ -558,7 +549,11 @@ delete-branch = false
     // Global default is preserved
     assert!(parsed.remove(None).delete_branch());
     // Project override wins
-    assert!(!parsed.remove(Some("github.com/user/repo")).delete_branch());
+    assert!(
+        !parsed
+            .remove(Some(&ProjectId::from("github.com/user/repo")))
+            .delete_branch()
+    );
 }
 
 #[test]
@@ -641,7 +636,7 @@ fn test_set_project_worktree_path() {
         .unwrap();
 
     assert_eq!(
-        config.worktree_path_for_project("github.com/user/repo"),
+        config.worktree_path_for_project(&ProjectId::from("github.com/user/repo")),
         "../{{ branch | sanitize }}"
     );
 
@@ -939,14 +934,14 @@ fn test_effective_commit_generation_with_project_override() {
     );
 
     // With project identifier, should merge project config
-    let effective = config.commit_generation(Some("github.com/user/repo"));
+    let effective = config.commit_generation(Some(&ProjectId::from("github.com/user/repo")));
     assert_eq!(effective.command, Some("project-llm".to_string()));
 
     // Without project or unknown project, should use global
     let effective = config.commit_generation(None);
     assert_eq!(effective.command, Some("global-llm".to_string()));
 
-    let effective = config.commit_generation(Some("github.com/other/repo"));
+    let effective = config.commit_generation(Some(&ProjectId::from("github.com/other/repo")));
     assert_eq!(effective.command, Some("global-llm".to_string()));
 }
 
@@ -979,7 +974,7 @@ fn test_effective_merge_with_partial_override() {
         },
     );
 
-    let effective = config.merge(Some("github.com/user/repo"));
+    let effective = config.merge(Some(&ProjectId::from("github.com/user/repo")));
     assert_eq!(effective.squash, Some(false)); // From project
     assert_eq!(effective.commit, Some(true)); // From global
     assert_eq!(effective.rebase, Some(true)); // From global
@@ -1002,13 +997,13 @@ fn test_effective_list_project_only() {
         },
     );
 
-    let effective = config.list(Some("github.com/user/repo"));
+    let effective = config.list(Some(&ProjectId::from("github.com/user/repo")));
     assert_eq!(effective.full, Some(true));
     assert!(effective.branches.is_none());
 
     // No global, no matching project falls back to default
     assert_eq!(
-        config.list(Some("github.com/other/repo")),
+        config.list(Some(&ProjectId::from("github.com/other/repo"))),
         ListConfig::default()
     );
 }
@@ -1024,7 +1019,7 @@ fn test_effective_commit_global_only() {
         ..Default::default()
     };
 
-    let effective = config.commit(Some("github.com/any/project"));
+    let effective = config.commit(Some(&ProjectId::from("github.com/any/project")));
     assert_eq!(effective.stage, Some(StageMode::Tracked));
 }
 
@@ -1128,11 +1123,14 @@ fn test_switch_picker_config_accessor_methods() {
 
     let config = SwitchPickerConfig::default();
     assert!(config.pager().is_none());
+    assert!(config.preview());
 
     let config = SwitchPickerConfig {
         pager: Some("delta --paging=never".to_string()),
+        preview: Some(false),
     };
     assert_eq!(config.pager(), Some("delta --paging=never"));
+    assert!(!config.preview());
 }
 
 #[test]
@@ -1140,10 +1138,12 @@ fn test_switch_picker_config_parse_toml() {
     let content = r#"
 [switch.picker]
 pager = "delta --paging=never"
+preview = false
 "#;
     let config: UserConfig = toml::from_str(content).unwrap();
     let picker = config.switch.picker.as_ref().unwrap();
     assert_eq!(picker.pager.as_deref(), Some("delta --paging=never"));
+    assert_eq!(picker.preview, Some(false));
 }
 
 #[test]
@@ -1152,13 +1152,16 @@ fn test_switch_picker_merge() {
 
     let base = SwitchPickerConfig {
         pager: Some("delta".to_string()),
+        preview: Some(false),
     };
     let override_config = SwitchPickerConfig {
         pager: None, // Fall back to base
+        preview: Some(true),
     };
 
     let merged = base.merge_with(&override_config);
     assert_eq!(merged.pager.as_deref(), Some("delta"));
+    assert_eq!(merged.preview, Some(true));
 }
 
 #[test]
@@ -1169,11 +1172,15 @@ fn test_switch_config_merge() {
     let base = SwitchConfig {
         picker: Some(SwitchPickerConfig {
             pager: Some("delta".to_string()),
+            ..Default::default()
         }),
         ..Default::default()
     };
     let other = SwitchConfig {
-        picker: Some(SwitchPickerConfig { pager: None }),
+        picker: Some(SwitchPickerConfig {
+            pager: None,
+            ..Default::default()
+        }),
         ..Default::default()
     };
     let merged = base.merge_with(&other);
@@ -1329,6 +1336,7 @@ fn test_switch_picker_project_override() {
         switch: SwitchConfig {
             picker: Some(SwitchPickerConfig {
                 pager: Some("delta".to_string()),
+                ..Default::default()
             }),
             ..Default::default()
         },
@@ -1341,6 +1349,7 @@ fn test_switch_picker_project_override() {
             switch: SwitchConfig {
                 picker: Some(SwitchPickerConfig {
                     pager: Some("bat".to_string()),
+                    ..Default::default()
                 }),
                 ..Default::default()
             },
@@ -1348,7 +1357,7 @@ fn test_switch_picker_project_override() {
         },
     );
 
-    let picker = config.switch_picker(Some("github.com/user/repo"));
+    let picker = config.switch_picker(Some(&ProjectId::from("github.com/user/repo")));
     assert_eq!(picker.pager.as_deref(), Some("bat")); // From project
 }
 
@@ -1365,7 +1374,7 @@ pager = "bat"
     )
     .unwrap();
 
-    let picker = config.switch_picker(Some("github.com/user/repo"));
+    let picker = config.switch_picker(Some(&ProjectId::from("github.com/user/repo")));
     assert_eq!(picker.pager.as_deref(), Some("bat"));
     // [select] is migrated to [switch.picker] at the TOML level before parsing,
     // so it ends up in the switch.picker field, not select
@@ -1403,6 +1412,7 @@ fn test_resolved_config_for_project() {
         switch: SwitchConfig {
             picker: Some(SwitchPickerConfig {
                 pager: Some("less".to_string()),
+                ..Default::default()
             }),
             ..Default::default()
         },
@@ -1513,13 +1523,13 @@ squash = false
     assert_eq!(project.merge.squash, Some(false));
 
     // Effective config for project
-    let effective_cg = config.commit_generation(Some("github.com/user/repo"));
+    let effective_cg = config.commit_generation(Some(&ProjectId::from("github.com/user/repo")));
     assert_eq!(
         effective_cg.command,
         Some("claude -p --model opus".to_string())
     );
 
-    let effective_merge = config.merge(Some("github.com/user/repo"));
+    let effective_merge = config.merge(Some(&ProjectId::from("github.com/user/repo")));
     assert_eq!(effective_merge.squash, Some(false));
 }
 
@@ -1546,12 +1556,14 @@ exclude = [".repo-local/", ".entire/"]
 
     assert_eq!(config.copy_ignored(None).exclude, expected_global);
     assert_eq!(
-        config.copy_ignored(Some(project_id)).exclude,
+        config
+            .copy_ignored(Some(&ProjectId::from(project_id)))
+            .exclude,
         expected_merged.clone()
     );
     assert_eq!(
         config
-            .resolved(Some(project_id))
+            .resolved(Some(&ProjectId::from(project_id)))
             .step
             .copy_ignored()
             .exclude,
@@ -1592,7 +1604,7 @@ command = "claude -p --model opus"
         Some("claude -p --model opus")
     );
 
-    let effective_cg = config.commit_generation(Some("github.com/user/repo"));
+    let effective_cg = config.commit_generation(Some(&ProjectId::from("github.com/user/repo")));
     assert_eq!(
         effective_cg.command,
         Some("claude -p --model opus".to_string())
@@ -1680,197 +1692,6 @@ worktree-path = "/worktrees/{{ branch | sanitize }}"
 }
 
 // =========================================================================
-// save_to() tests
-// =========================================================================
-
-#[test]
-fn test_save_to_new_file_with_commit_generation() {
-    // Test that save_to() creates a new file with commit.generation section
-    // This exercises the "create from scratch" branch when no existing file exists
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-
-    let config = UserConfig {
-        commit: CommitConfig {
-            stage: None,
-            generation: Some(CommitGenerationConfig {
-                command: Some("llm -m haiku".to_string()),
-                ..Default::default()
-            }),
-        },
-        ..Default::default()
-    };
-
-    config.save_to(&config_path).unwrap();
-
-    let saved = std::fs::read_to_string(&config_path).unwrap();
-    assert!(
-        saved.contains("[commit.generation]"),
-        "Should use new format: {saved}"
-    );
-    assert!(
-        saved.contains("command = \"llm -m haiku\""),
-        "Should contain command: {saved}"
-    );
-    // When only generation is set (no stage), [commit] header should be implicit
-    assert!(
-        !saved.contains("[commit]\n"),
-        "Should not have standalone [commit] header when only generation is set: {saved}"
-    );
-}
-
-#[test]
-fn test_save_to_new_file_commit_with_stage_and_generation() {
-    // Test that when both stage and generation are set, [commit] header is explicit
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-
-    let config = UserConfig {
-        commit: CommitConfig {
-            stage: Some(StageMode::Tracked),
-            generation: Some(CommitGenerationConfig {
-                command: Some("llm -m haiku".to_string()),
-                ..Default::default()
-            }),
-        },
-        ..Default::default()
-    };
-
-    config.save_to(&config_path).unwrap();
-
-    let saved = std::fs::read_to_string(&config_path).unwrap();
-    assert!(
-        saved.contains("[commit]\n"),
-        "Should have [commit] header when stage is set: {saved}"
-    );
-    assert!(
-        saved.contains("stage = \"tracked\""),
-        "Should contain stage: {saved}"
-    );
-    assert!(
-        saved.contains("[commit.generation]"),
-        "Should have generation section: {saved}"
-    );
-}
-
-#[test]
-fn test_save_to_new_file_with_skip_shell_integration() {
-    // Test skip-shell-integration-prompt is only written when true
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-
-    let config = UserConfig {
-        skip_shell_integration_prompt: true,
-        ..Default::default()
-    };
-
-    config.save_to(&config_path).unwrap();
-
-    let saved = std::fs::read_to_string(&config_path).unwrap();
-    assert!(
-        saved.contains("skip-shell-integration-prompt = true"),
-        "Should contain flag: {saved}"
-    );
-}
-
-#[test]
-fn test_save_to_new_file_with_worktree_path() {
-    // Test worktree-path is written when set
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-
-    let config = UserConfig {
-        worktree_path: Some("../{{ repo }}.{{ branch }}".to_string()),
-        ..Default::default()
-    };
-
-    config.save_to(&config_path).unwrap();
-
-    let saved = std::fs::read_to_string(&config_path).unwrap();
-    assert!(
-        saved.contains("worktree-path = \"../{{ repo }}.{{ branch }}\""),
-        "Should contain worktree-path: {saved}"
-    );
-}
-
-#[test]
-fn test_save_to_preserves_project_section_configs() {
-    // Exercises sync_serialized_section through the surgical-update save path
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-
-    // Create initial file with a project
-    let initial = r#"
-[projects."github.com/user/repo"]
-worktree-path = ".wt/{{ branch | sanitize }}"
-"#;
-    std::fs::write(&config_path, initial).unwrap();
-
-    // Build config with project section overrides
-    let mut config = UserConfig::default();
-    config.projects.insert(
-        "github.com/user/repo".to_string(),
-        UserProjectOverrides {
-            worktree_path: Some(".wt/{{ branch | sanitize }}".to_string()),
-            merge: MergeConfig {
-                squash: Some(false),
-                ..Default::default()
-            },
-            list: ListConfig {
-                full: Some(true),
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-    );
-
-    config.save_to(&config_path).unwrap();
-
-    let saved = std::fs::read_to_string(&config_path).unwrap();
-    assert!(
-        saved.contains("squash = false"),
-        "Should serialize merge config: {saved}"
-    );
-    assert!(
-        saved.contains("full = true"),
-        "Should serialize list config: {saved}"
-    );
-
-    // Default sections should not appear
-    assert!(
-        !saved.contains("[projects.\"github.com/user/repo\".commit]"),
-        "Default commit section should not appear: {saved}"
-    );
-    assert!(
-        !saved.contains("[projects.\"github.com/user/repo\".switch]"),
-        "Default switch section should not appear: {saved}"
-    );
-}
-
-#[test]
-fn test_save_to_removes_default_project_section() {
-    // Exercises the is_default → remove branch in sync_serialized_section
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        "[projects.\"github.com/u/r\".list]\nfull = true\n",
-    )
-    .unwrap();
-
-    let mut config =
-        UserConfig::load_from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
-    config.projects.get_mut("github.com/u/r").unwrap().list = ListConfig::default();
-    config.save_to(&config_path).unwrap();
-
-    let saved = std::fs::read_to_string(&config_path).unwrap();
-    assert!(
-        !saved.contains("[projects.\"github.com/u/r\".list]"),
-        "Default section should be removed: {saved}"
-    );
-}
-
-// =========================================================================
 // Per-project hooks tests (append semantics)
 // =========================================================================
 
@@ -1896,7 +1717,7 @@ fn test_hooks_merge_append_semantics() {
         },
     );
 
-    let effective = config.hooks(Some("github.com/user/repo"));
+    let effective = config.hooks(Some(&ProjectId::from("github.com/user/repo")));
     let post_create = effective.post_create.unwrap();
     let commands: Vec<_> = post_create.commands().collect();
     assert_eq!(commands.len(), 2);
@@ -1912,7 +1733,7 @@ fn test_hooks_no_project_override_uses_global() {
         ..Default::default()
     };
 
-    let effective = config.hooks(Some("github.com/other/repo"));
+    let effective = config.hooks(Some(&ProjectId::from("github.com/other/repo")));
     let post_create = effective.post_create.unwrap();
     let commands: Vec<_> = post_create.commands().collect();
     assert_eq!(commands.len(), 1);
@@ -1932,7 +1753,7 @@ fn test_hooks_project_only_no_global() {
         },
     );
 
-    let effective = config.hooks(Some("github.com/user/repo"));
+    let effective = config.hooks(Some(&ProjectId::from("github.com/user/repo")));
     let post_create = effective.post_create.unwrap();
     let commands: Vec<_> = post_create.commands().collect();
     assert_eq!(commands.len(), 1);
@@ -1956,7 +1777,7 @@ fn test_hooks_different_hook_types_not_merged() {
         },
     );
 
-    let effective = config.hooks(Some("github.com/user/repo"));
+    let effective = config.hooks(Some(&ProjectId::from("github.com/user/repo")));
 
     // post-start: only global
     let post_create = effective.post_create.unwrap();
@@ -2092,7 +1913,7 @@ setup = "echo setup"
     );
 
     // Verify merge preserves order: global first, then project
-    let effective = config.hooks(Some("github.com/user/repo"));
+    let effective = config.hooks(Some(&ProjectId::from("github.com/user/repo")));
     let commands: Vec<_> = effective.post_create.as_ref().unwrap().commands().collect();
     assert_eq!(commands.len(), 2);
     assert_eq!(commands[0].template, "npm install"); // Global first
@@ -2131,7 +1952,7 @@ test = "npm test"
     );
 
     // Both commands present, global first
-    let effective = config.hooks(Some("github.com/user/repo"));
+    let effective = config.hooks(Some(&ProjectId::from("github.com/user/repo")));
     let commands: Vec<_> = effective.post_create.as_ref().unwrap().commands().collect();
     assert_eq!(commands.len(), 2);
     assert_eq!(commands[0].template, "cargo test");
@@ -2139,13 +1960,13 @@ test = "npm test"
 }
 
 // =========================================================================
-// reload_from error path tests
+// Mutation error path tests
 // =========================================================================
 
-/// Test that reload_from returns a parse error with formatted path
-/// when the config file contains invalid TOML.
+/// A mutation returns a parse error with the formatted path when the config
+/// file contains invalid TOML.
 #[test]
-fn test_reload_from_invalid_toml() {
+fn test_mutation_invalid_toml() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
 
@@ -2155,20 +1976,27 @@ fn test_reload_from_invalid_toml() {
     // Now corrupt it with invalid TOML
     std::fs::write(&config_path, "this is not valid toml [[[").unwrap();
 
-    // Try to reload via a mutation — should fail with parse error
+    // A mutation reads the file first — it should fail with a parse error
     let mut config = UserConfig::default();
     let result = config.set_skip_shell_integration_prompt(&config_path);
 
-    assert!(result.is_err());
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("Failed to parse config file"),
-        "Expected parse error, got: {err}"
+    let error = anyhow::Error::new(result.unwrap_err());
+    let rendered = crate::git::ErrorExt::render_diagnostic(&error).unwrap();
+    let rendered = ansi_str::AnsiStr::ansi_strip(&rendered).replace(
+        &crate::path::format_path_for_display(&config_path),
+        "[CONFIG]",
     );
-    // Verify path is included in error (format_path_for_display would format it)
-    assert!(
-        err.contains("config.toml"),
-        "Expected path in error, got: {err}"
+    insta::assert_snapshot!(rendered, @"
+    ✗ User config @ [CONFIG] failed to parse
+      TOML parse error at line 1, column 6
+        |
+      1 | this is not valid toml [[[
+        |      ^
+      key with no value, expected `=`
+    ");
+    assert_eq!(
+        std::fs::read_to_string(&config_path).unwrap(),
+        "this is not valid toml [[["
     );
 }
 
@@ -2308,7 +2136,7 @@ project-only = "only-project"
 "#;
     let config: UserConfig = toml::from_str(toml_str).unwrap();
 
-    let aliases = config.aliases(Some("test-project"));
+    let aliases = config.aliases(Some(&ProjectId::from("test-project")));
 
     // Non-colliding aliases are present
     assert_eq!(aliases["global-only"].commands().count(), 1);
@@ -2337,11 +2165,11 @@ project-only = "only-project"
     );
 }
 
-/// Test that reload_from handles permission errors
-/// when the config file exists but cannot be read.
+/// A mutation surfaces a permission error when the config file exists but
+/// cannot be read.
 #[cfg(unix)]
 #[test]
-fn test_reload_from_permission_error() {
+fn test_mutation_permission_error() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::tempdir().unwrap();
@@ -2370,7 +2198,7 @@ fn test_reload_from_permission_error() {
         return;
     }
 
-    // Try to reload via a mutation — should fail with read error
+    // A mutation reads the file first — it should fail with a read error
     let mut config = UserConfig::default();
     let result = config.set_skip_shell_integration_prompt(&config_path);
 
@@ -2390,15 +2218,22 @@ fn test_reload_from_permission_error() {
 #[test]
 fn test_load_error_display_file() {
     let toml_err = toml::from_str::<UserConfig>("[list]\nbranches = \"bad\"\n").unwrap_err();
-    let err = LoadError::File {
-        path: std::path::PathBuf::from("/tmp/config.toml"),
-        kind: ConfigFileKind::User,
-        err: Box::new(toml_err),
-    };
+    let err = LoadError::File(crate::config::ConfigParseError::new(
+        ConfigFileKind::User,
+        std::path::Path::new("/tmp/config.toml"),
+        toml_err,
+    ));
     let msg = err.to_string();
     assert!(msg.contains("User config @"), "{msg}");
     assert!(msg.contains("failed to parse"), "{msg}");
-    assert!(msg.contains("line 2"), "{msg}");
+    let error = anyhow::Error::new(ConfigError::Load(err));
+    assert!(matches!(
+        error.downcast_ref::<ConfigError>(),
+        Some(ConfigError::Load(LoadError::File(_)))
+    ));
+    assert!(error.root_cause().is::<toml::de::Error>());
+    let rendered = crate::git::ErrorExt::render_diagnostic(&error).unwrap();
+    assert!(rendered.contains("line 2"), "{rendered}");
 }
 
 #[test]
@@ -2603,16 +2438,14 @@ fn test_cli_layer_outranks_project_worktree_path() {
     let (table, warnings) = apply_overrides(base, &["worktree-path = \"/from-cli\""]);
     assert!(warnings.is_empty());
     assert_eq!(
-        loaded(table).worktree_path_for_project(PROJECT),
+        loaded(table).worktree_path_for_project(&ProjectId::from(PROJECT)),
         "/from-cli"
     );
 }
 
 #[test]
 fn test_env_layer_outranks_project_worktree_path() {
-    // The env half of the same fix, driven through the overlay
-    // `load_with_warnings` builds rather than the process environment.
-    use super::{EnvVar, migrate_env_overlay, resolve_env_overlay, try_parse_value};
+    use super::{EnvVar, try_parse_value};
     let var = EnvVar {
         name: "WORKTRUNK_WORKTREE_PATH".to_string(),
         segments: vec!["worktree-path".to_string()],
@@ -2620,29 +2453,21 @@ fn test_env_layer_outranks_project_worktree_path() {
         raw_value: "/from-env".to_string(),
     };
     let mut table = base_with_project("worktree-path = \"/from-project\"\n");
-    let overlay = migrate_env_overlay(resolve_env_overlay(&table, &[var]));
-    merge_layer(&mut table, overlay);
+    let mut warnings = Vec::new();
+    UserConfig::apply_env_vars(&[var], &mut table, &mut warnings).unwrap();
 
+    assert!(warnings.is_empty());
     assert_eq!(
-        loaded(table).worktree_path_for_project(PROJECT),
+        loaded(table).worktree_path_for_project(&ProjectId::from(PROJECT)),
         "/from-env"
     );
 }
 
 #[test]
 fn test_layer_keeps_an_already_invalid_candidate_untouched() {
-    // The pass discards a candidate that does not deserialize and validate.
-    // Step 3's env probe only deserializes, so an empty `worktree-path` from
-    // the environment reaches here already invalid — and the removals are
-    // dropped rather than handed to `finalize`, which would answer the same
-    // failure by wiping the config to defaults.
-    use super::{EnvVar, migrate_env_overlay, resolve_env_overlay, try_parse_value};
-    let empty_path = |value: &str| EnvVar {
-        name: "WORKTRUNK_WORKTREE_PATH".to_string(),
-        segments: vec!["worktree-path".to_string()],
-        typed_value: try_parse_value(value),
-        raw_value: value.to_string(),
-    };
+    // A layer with an empty global `worktree-path` fails validation. Its
+    // project-precedence removals are dropped as a unit, while the layer still
+    // reaches the caller for validation and attribution.
     let plain_merge = |overlay: &toml::Table| {
         let mut plain = base_with_project("worktree-path = \"/from-project\"\n");
         deep_merge_table(&mut plain, overlay.clone());
@@ -2650,7 +2475,7 @@ fn test_layer_keeps_an_already_invalid_candidate_untouched() {
     };
 
     let mut table = base_with_project("worktree-path = \"/from-project\"\n");
-    let overlay = migrate_env_overlay(resolve_env_overlay(&table, &[empty_path("")]));
+    let overlay: toml::Table = "worktree-path = \"\"\n".parse().unwrap();
     let plain = plain_merge(&overlay);
     merge_layer(&mut table, overlay);
     assert_eq!(
@@ -2662,7 +2487,7 @@ fn test_layer_keeps_an_already_invalid_candidate_untouched() {
     // key, so the assertion above is the discard and not a pass that found
     // nothing to do.
     let mut table = base_with_project("worktree-path = \"/from-project\"\n");
-    let overlay = migrate_env_overlay(resolve_env_overlay(&table, &[empty_path("/from-env")]));
+    let overlay: toml::Table = "worktree-path = \"/from-env\"\n".parse().unwrap();
     let plain = plain_merge(&overlay);
     merge_layer(&mut table, overlay);
     assert_ne!(table, plain);
@@ -2679,7 +2504,7 @@ fn test_file_layer_outranks_lower_layer_project_entry() {
     );
 
     assert_eq!(
-        loaded(table).worktree_path_for_project(PROJECT),
+        loaded(table).worktree_path_for_project(&ProjectId::from(PROJECT)),
         "/from-user-global"
     );
 }
@@ -2699,8 +2524,11 @@ branches = true
     let (table, warnings) = apply_overrides(base, &["list.full = false"]);
     assert!(warnings.is_empty());
     let config = loaded(table);
-    assert_eq!(config.worktree_path_for_project(PROJECT), "/from-project");
-    let list = config.list(Some(PROJECT));
+    assert_eq!(
+        config.worktree_path_for_project(&ProjectId::from(PROJECT)),
+        "/from-project"
+    );
+    let list = config.list(Some(&ProjectId::from(PROJECT)));
     assert_eq!(list.full, Some(false), "the higher layer wins");
     assert_eq!(list.branches, Some(true), "sibling key survives");
 }
@@ -2719,7 +2547,7 @@ fn test_layer_keeps_its_own_project_scoped_override() {
     );
     assert!(warnings.is_empty());
     assert_eq!(
-        loaded(table).worktree_path_for_project(PROJECT),
+        loaded(table).worktree_path_for_project(&ProjectId::from(PROJECT)),
         "/from-cli-project"
     );
 }
@@ -2734,7 +2562,7 @@ fn test_layer_applies_to_pattern_entries() {
     let (table, warnings) = apply_overrides(base, &["worktree-path = \"/from-cli\""]);
     assert!(warnings.is_empty());
     assert_eq!(
-        loaded(table).worktree_path_for_project(PROJECT),
+        loaded(table).worktree_path_for_project(&ProjectId::from(PROJECT)),
         "/from-cli"
     );
 }
@@ -2772,15 +2600,20 @@ exclude = ["project-pattern"]
             .collect::<Vec<_>>()
     };
     assert_eq!(
-        templates(&config.hooks(Some(PROJECT)).pre_merge.unwrap()),
+        templates(
+            &config
+                .hooks(Some(&ProjectId::from(PROJECT)))
+                .pre_merge
+                .unwrap()
+        ),
         ["cli-hook", "project-hook"]
     );
     assert_eq!(
-        templates(&config.aliases(Some(PROJECT))["ship"]),
+        templates(&config.aliases(Some(&ProjectId::from(PROJECT)))["ship"]),
         ["cli-alias", "project-alias"]
     );
     assert_eq!(
-        config.copy_ignored(Some(PROJECT)).exclude,
+        config.copy_ignored(Some(&ProjectId::from(PROJECT))).exclude,
         ["cli-pattern", "project-pattern"]
     );
 }
@@ -2803,7 +2636,10 @@ width = 30
         &["list.custom-columns.Ticket.template = \"from-cli\""],
     );
     assert!(warnings.is_empty());
-    let column = loaded(table).list(Some(PROJECT)).custom_columns["Ticket"].clone();
+    let column = loaded(table)
+        .list(Some(&ProjectId::from(PROJECT)))
+        .custom_columns["Ticket"]
+        .clone();
     assert_eq!(column.template, "from-cli");
     assert_eq!(column.width, None, "the column went as a unit");
 
@@ -2827,7 +2663,10 @@ width = 30
         ],
     );
     assert!(warnings.is_empty());
-    let column = loaded(table).list(Some(PROJECT)).custom_columns["Ticket"].clone();
+    let column = loaded(table)
+        .list(Some(&ProjectId::from(PROJECT)))
+        .custom_columns["Ticket"]
+        .clone();
     assert_eq!(column.template, "from-cli-project");
     assert_eq!(column.width, None, "the column went as a unit here too");
 }
@@ -2839,7 +2678,7 @@ fn test_layer_noop_without_overrides() {
     let (table, warnings) = apply_overrides(base, &[]);
     assert!(warnings.is_empty());
     assert_eq!(
-        loaded(table).worktree_path_for_project(PROJECT),
+        loaded(table).worktree_path_for_project(&ProjectId::from(PROJECT)),
         "/from-project"
     );
 }
@@ -2852,14 +2691,14 @@ fn test_dropped_layer_leaves_projects_intact() {
     let (table, warnings) = apply_overrides(base, &["worktree-path = \"/from-cli\"", "garbage"]);
     assert_eq!(warnings.len(), 1);
     assert_eq!(
-        loaded(table).worktree_path_for_project(PROJECT),
+        loaded(table).worktree_path_for_project(&ProjectId::from(PROJECT)),
         "/from-project"
     );
 }
 
 #[test]
 fn test_env_overlay_migrates_deprecated_key() {
-    use super::{EnvVar, migrate_env_overlay, resolve_env_overlay, try_parse_value};
+    use super::{EnvVar, try_parse_value};
     // `WORKTRUNK__MERGE__NO_FF=true` resolves to the deprecated key
     // `merge.no-ff`. The env overlay runs through the same deprecation migration
     // as config files and `--config-set`, so it takes effect as `merge.ff =
@@ -2870,8 +2709,11 @@ fn test_env_overlay_migrates_deprecated_key() {
         typed_value: try_parse_value("true"),
         raw_value: "true".to_string(),
     };
-    let overlay = migrate_env_overlay(resolve_env_overlay(&toml::Table::new(), &[var]));
-    let config: UserConfig = toml::Value::Table(overlay).try_into().unwrap();
+    let mut table = toml::Table::new();
+    let mut warnings = Vec::new();
+    UserConfig::apply_env_vars(&[var], &mut table, &mut warnings).unwrap();
+    assert!(warnings.is_empty());
+    let config = loaded(table);
     assert_eq!(config.merge.ff, Some(false));
 }
 
@@ -2894,817 +2736,192 @@ fn test_finalize_with_undeserializable_table() {
 }
 
 // =========================================================================
-// save_to() tests — existing-file branch
+// ConfigEdit — writing one value into the file
 // =========================================================================
 
 #[test]
-fn test_save_to_existing_file_writes_project_sections() {
-    // An existing file is updated with a project that has list, commit,
-    // merge, and switch sections populated via diff-based merge.
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
+fn test_config_edit_changes_only_its_value() {
+    // Each case writes one value and leaves the rest of the file as the user
+    // wrote it: comments, values at their defaults, and tables written inline
+    // or as dotted keys. An existing value keeps its trailing comment. A table
+    // the edit creates is implicit, or inline inside an inline table.
+    let cases: &[(&str, &[&str], &str)] = &[
+        (
+            r#"skip-shell-integration-prompt = false  # keep asking
 
-    // Start with a minimal file so save_to takes the "existing file" path
-    std::fs::write(&config_path, "# user config\n").unwrap();
-
-    let mut config = UserConfig::default();
-    config.projects.insert(
-        "github.com/user/repo".to_string(),
-        UserProjectOverrides {
-            worktree_path: Some("../{{ branch | sanitize }}".to_string()),
-            list: ListConfig {
-                full: Some(true),
-                ..Default::default()
-            },
-            commit: CommitConfig {
-                stage: Some(StageMode::Tracked),
-                generation: None,
-            },
-            merge: MergeConfig {
-                squash: Some(false),
-                ..Default::default()
-            },
-            switch: SwitchConfig {
-                cd: Some(false),
-                picker: None,
-            },
-            ..Default::default()
-        },
-    );
-
-    config.save_to(&config_path).unwrap();
-
-    let saved = std::fs::read_to_string(&config_path).unwrap();
-    // Comment should be preserved
-    assert!(saved.contains("# user config"), "comment lost: {saved}");
-    // All four per-project sections should be present
-    assert!(
-        saved.contains("[projects.\"github.com/user/repo\".list]"),
-        "missing list section: {saved}"
-    );
-    assert!(saved.contains("full = true"), "missing list.full: {saved}");
-    assert!(
-        saved.contains("[projects.\"github.com/user/repo\".commit]"),
-        "missing commit section: {saved}"
-    );
-    assert!(
-        saved.contains("stage = \"tracked\""),
-        "missing commit.stage: {saved}"
-    );
-    assert!(
-        saved.contains("[projects.\"github.com/user/repo\".merge]"),
-        "missing merge section: {saved}"
-    );
-    assert!(
-        saved.contains("squash = false"),
-        "missing merge.squash: {saved}"
-    );
-    assert!(
-        saved.contains("[projects.\"github.com/user/repo\".switch]"),
-        "missing switch section: {saved}"
-    );
-    assert!(saved.contains("cd = false"), "missing switch.cd: {saved}");
-
-    // Round-trip: file parses back into an equivalent config
-    let reparsed = UserConfig::load_from_str(&saved).unwrap();
-    let reloaded = reparsed.projects.get("github.com/user/repo").unwrap();
-    assert_eq!(
-        reloaded.worktree_path.as_deref(),
-        Some("../{{ branch | sanitize }}")
-    );
-    assert_eq!(reloaded.list.full, Some(true));
-    assert_eq!(reloaded.commit.stage, Some(StageMode::Tracked));
-    assert_eq!(reloaded.merge.squash, Some(false));
-    assert_eq!(reloaded.switch.cd, Some(false));
-}
-
-#[test]
-fn test_save_to_existing_file_removes_stale_projects_and_sections() {
-    // The diff-based merge removes projects not in the in-memory config
-    // and removes sections whose in-memory value is now None.
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-
-    // Existing file has two projects and a list section on the one we keep.
-    std::fs::write(
-        &config_path,
-        r#"# keep me
-[projects."keep"]
-worktree-path = "keep-path"
-
-[projects."keep".list]
-full = true
-
-[projects."drop"]
-worktree-path = "drop-path"
-"#,
-    )
-    .unwrap();
-
-    let mut config = UserConfig::default();
-    config.projects.insert(
-        "keep".to_string(),
-        UserProjectOverrides {
-            worktree_path: Some("keep-path".to_string()),
-            list: ListConfig::default(), // was non-default on disk, now default — should be removed
-            ..Default::default()
-        },
-    );
-
-    config.save_to(&config_path).unwrap();
-
-    let saved = std::fs::read_to_string(&config_path).unwrap();
-    assert!(saved.contains("# keep me"), "comment lost: {saved}");
-    assert!(
-        saved.contains("[projects.\"keep\"]") || saved.contains("\"keep\""),
-        "keep project lost: {saved}"
-    );
-    assert!(
-        !saved.contains("\"drop\""),
-        "stale project not removed: {saved}"
-    );
-    assert!(
-        !saved.contains("[projects.\"keep\".list]"),
-        "stale list section not removed: {saved}"
-    );
-}
-
-#[test]
-fn test_save_to_existing_file_updates_commit_generation_command() {
-    // The file already has a [commit.generation] table — the diff-based merge
-    // updates the changed command in place while preserving unchanged keys.
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        r#"# keep this comment
-[commit.generation]
-command = "old-llm"
-template = "stays: {{ diff }}"
-"#,
-    )
-    .unwrap();
-
-    let config = UserConfig {
-        commit: CommitConfig {
-            stage: None,
-            generation: Some(CommitGenerationConfig {
-                command: Some("new-llm".to_string()),
-                template: Some("stays: {{ diff }}".to_string()),
-                ..Default::default()
-            }),
-        },
-        ..Default::default()
-    };
-
-    config.save_to(&config_path).unwrap();
-
-    let saved = std::fs::read_to_string(&config_path).unwrap();
-    assert!(
-        saved.contains("# keep this comment"),
-        "comment lost: {saved}"
-    );
-    assert!(
-        saved.contains("command = \"new-llm\""),
-        "command not updated: {saved}"
-    );
-    assert!(
-        !saved.contains("old-llm"),
-        "old command not removed: {saved}"
-    );
-    assert!(
-        saved.contains("template = \"stays: {{ diff }}\""),
-        "template not preserved: {saved}"
-    );
-}
-
-#[test]
-fn test_save_to_existing_file_adds_commit_generation_to_plain_commit_table() {
-    // Existing file has a [commit] table (e.g., with `stage`) but no
-    // [commit.generation] subtable yet. The diff-based merge inserts the
-    // new subtable while preserving existing keys.
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        r#"[commit]
-stage = "all"
-"#,
-    )
-    .unwrap();
-
-    let config = UserConfig {
-        commit: CommitConfig {
-            stage: Some(StageMode::All),
-            generation: Some(CommitGenerationConfig {
-                command: Some("llm".to_string()),
-                ..Default::default()
-            }),
-        },
-        ..Default::default()
-    };
-
-    config.save_to(&config_path).unwrap();
-
-    let saved = std::fs::read_to_string(&config_path).unwrap();
-    assert!(
-        saved.contains("[commit.generation]"),
-        "generation subtable missing: {saved}"
-    );
-    assert!(
-        saved.contains("command = \"llm\""),
-        "command missing: {saved}"
-    );
-    assert!(saved.contains("stage = \"all\""), "stage lost: {saved}");
-}
-
-#[test]
-fn test_save_to_existing_file_replaces_non_table_project_entry() {
-    // When an existing file has a non-table value at projects."<id>",
-    // the diff-based merge replaces it with the correct table structure
-    // from the in-memory config. Only reachable via raw file edits.
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        r#"[projects]
-bogus = "not-a-table"
-
-[projects."real"]
-worktree-path = "old"
-"#,
-    )
-    .unwrap();
-
-    let mut config = UserConfig::default();
-    config
-        .projects
-        .insert("bogus".to_string(), UserProjectOverrides::default());
-    config.projects.insert(
-        "real".to_string(),
-        UserProjectOverrides {
-            worktree_path: Some("new".to_string()),
-            ..Default::default()
-        },
-    );
-
-    config.save_to(&config_path).unwrap();
-
-    let saved = std::fs::read_to_string(&config_path).unwrap();
-    // The "real" project should be updated
-    assert!(
-        saved.contains("worktree-path = \"new\""),
-        "real project not updated: {saved}"
-    );
-    // The bogus string entry is replaced with a proper (empty) table
-    assert!(
-        !saved.contains("bogus = \"not-a-table\""),
-        "malformed entry should be replaced: {saved}"
-    );
-}
-
-#[test]
-fn test_save_to_existing_file_where_commit_is_scalar() {
-    // When the existing file has `commit` as a scalar (user-edited mistake),
-    // the diff-based merge replaces it with the correct table structure.
-    // Only reachable via raw file edits.
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(&config_path, "commit = \"hand-edited-mistake\"\n").unwrap();
-
-    let config = UserConfig {
-        commit: CommitConfig {
-            stage: None,
-            generation: Some(CommitGenerationConfig {
-                command: Some("llm".to_string()),
-                ..Default::default()
-            }),
-        },
-        ..Default::default()
-    };
-
-    config.save_to(&config_path).unwrap();
-
-    let saved = std::fs::read_to_string(&config_path).unwrap();
-    // The scalar is replaced with a proper table
-    assert!(
-        !saved.contains("\"hand-edited-mistake\""),
-        "malformed entry should be replaced: {saved}"
-    );
-    assert!(
-        saved.contains("command = \"llm\""),
-        "commit generation should be written: {saved}"
-    );
-}
-
-#[test]
-fn test_save_to_existing_file_where_commit_generation_is_scalar() {
-    // When `[commit]` is a valid table but `generation` is a scalar
-    // (raw-edit mistake), the diff-based merge replaces the scalar with
-    // the correct table. Only reachable via raw file edits.
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        "[commit]\nstage = \"tracked\"\ngeneration = \"oops\"\n",
-    )
-    .unwrap();
-
-    let config = UserConfig {
-        commit: CommitConfig {
-            stage: Some(StageMode::Tracked),
-            generation: Some(CommitGenerationConfig {
-                command: Some("llm".to_string()),
-                ..Default::default()
-            }),
-        },
-        ..Default::default()
-    };
-
-    config.save_to(&config_path).unwrap();
-
-    let saved = std::fs::read_to_string(&config_path).unwrap();
-    // The scalar generation is replaced with a proper table
-    assert!(
-        !saved.contains("generation = \"oops\""),
-        "malformed generation should be replaced: {saved}"
-    );
-    assert!(
-        saved.contains("command = \"llm\""),
-        "generation command should be written: {saved}"
-    );
-    // The unrelated stage value is preserved
-    assert!(saved.contains("stage = \"tracked\""), "stage lost: {saved}");
-}
-
-#[test]
-fn test_save_to_existing_file_where_projects_is_scalar() {
-    // When the existing file has `projects` as a scalar (raw-edit mistake),
-    // the diff-based merge replaces it with the correct table structure.
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(&config_path, "projects = \"oops\"\n").unwrap();
-
-    let mut config = UserConfig::default();
-    config.projects.insert(
-        "repo".to_string(),
-        UserProjectOverrides {
-            worktree_path: Some("../x".to_string()),
-            ..Default::default()
-        },
-    );
-
-    config.save_to(&config_path).unwrap();
-
-    let saved = std::fs::read_to_string(&config_path).unwrap();
-    // The scalar is replaced with a proper table
-    assert!(
-        !saved.contains("projects = \"oops\""),
-        "malformed projects should be replaced: {saved}"
-    );
-    assert!(
-        saved.contains("worktree-path = \"../x\""),
-        "project worktree-path should be written: {saved}"
-    );
-}
-
-#[test]
-fn test_save_to_existing_file_with_invalid_toml_returns_parse_error() {
-    // Covers the `parse().map_err(...)` closure in save_to's existing-file
-    // branch: the file exists (so we take the "surgical update" path) but
-    // its contents don't parse as TOML.
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(&config_path, "this is not [[[ valid toml").unwrap();
-
-    let config = UserConfig::default();
-    let err = config.save_to(&config_path).unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("Failed to parse config file"),
-        "expected parse error, got: {msg}"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn test_save_to_existing_file_with_unreadable_file_returns_read_error() {
-    // Covers the `read_to_string.map_err(...)` closure in save_to: the file
-    // exists but we can't read it. Matches the pattern of the mutation-side
-    // test_reload_from_permission_error.
-    use std::os::unix::fs::PermissionsExt;
-
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(&config_path, "# valid\n").unwrap();
-
-    let mut perms = std::fs::metadata(&config_path).unwrap().permissions();
-    perms.set_mode(0o000);
-    std::fs::set_permissions(&config_path, perms).unwrap();
-
-    struct RestorePerms<'a>(&'a std::path::Path);
-    impl Drop for RestorePerms<'_> {
-        fn drop(&mut self) {
-            let mut perms = std::fs::metadata(self.0).unwrap().permissions();
-            perms.set_mode(0o644);
-            let _ = std::fs::set_permissions(self.0, perms);
-        }
-    }
-    let _guard = RestorePerms(&config_path);
-
-    if !permissions_restrict_reads(dir.path()) {
-        return;
-    }
-
-    let config = UserConfig::default();
-    let err = config.save_to(&config_path).unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("Failed to read config file"),
-        "expected read error, got: {msg}"
-    );
-}
-
-#[test]
-fn test_save_to_root_path_skips_parent_creation() {
-    // Covers the else branch of `if let Some(parent) = config_path.parent()`
-    // in save_to: when the config path is the filesystem root (`/`), parent()
-    // returns None and we skip create_dir_all. The downstream write will
-    // fail because `/` is a directory, but we should reach that point
-    // without panicking — proving the None branch executes cleanly.
-    let config = UserConfig::default();
-    let err = config.save_to(std::path::Path::new("/")).unwrap_err();
-    let msg = err.to_string();
-    // We expect to fail at the read/write step, not at create_dir_all.
-    // The specific error depends on the platform (read error since "/"
-    // exists, or write error). We just verify it wasn't the create_dir
-    // path (which would mean line 216's else branch wasn't taken).
-    assert!(
-        !msg.contains("Failed to create config directory"),
-        "should skip create_dir when parent is None, got: {msg}"
-    );
-}
-
-#[test]
-fn test_save_to_fails_when_parent_is_a_file() {
-    // Covers the create_dir_all error branch: if config_path's parent
-    // already exists as a regular file, create_dir_all fails and save_to
-    // returns a "Failed to create config directory" error.
-    let dir = tempfile::tempdir().unwrap();
-    let blocker = dir.path().join("blocker");
-    std::fs::write(&blocker, "i am a file").unwrap();
-
-    // config_path's parent is "blocker", which is a file
-    let config_path = blocker.join("config.toml");
-
-    let config = UserConfig::default();
-    let err = config.save_to(&config_path).unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("Failed to create config directory"),
-        "expected create_dir error, got: {msg}"
-    );
-}
-
-#[test]
-fn test_save_to_new_file_expands_nested_project_inline_tables() {
-    // Covers expand_inline_tables recursion: a per-project config with nested
-    // sections forces to_document to emit inline tables that must be expanded
-    // into standard [projects."id".list] etc. subtables for readability.
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-
-    let mut config = UserConfig::default();
-    config.projects.insert(
-        "repo".to_string(),
-        UserProjectOverrides {
-            list: ListConfig {
-                full: Some(true),
-                branches: Some(true),
-                ..Default::default()
-            },
-            switch: SwitchConfig {
-                cd: Some(false),
-                picker: None,
-            },
-            ..Default::default()
-        },
-    );
-
-    config.save_to(&config_path).unwrap();
-
-    let saved = std::fs::read_to_string(&config_path).unwrap();
-    // Should be expanded into standard subtables, not inline tables
-    assert!(
-        saved.contains("[projects.repo.list]"),
-        "list should be expanded to standard subtable: {saved}"
-    );
-    assert!(
-        saved.contains("[projects.repo.switch]"),
-        "switch should be expanded to standard subtable: {saved}"
-    );
-    // Inline syntax should not appear for these sections
-    assert!(
-        !saved.contains("list = {"),
-        "list should not be inline: {saved}"
-    );
-    assert!(
-        !saved.contains("switch = {"),
-        "switch should not be inline: {saved}"
-    );
-    // And it should round-trip cleanly
-    let reparsed = UserConfig::load_from_str(&saved).unwrap();
-    assert_eq!(
-        reparsed.projects.get("repo").unwrap().list.branches,
-        Some(true)
-    );
-}
-
-#[test]
-fn test_save_to_existing_file_preserves_integer_and_array_values() {
-    // Exercises values_equal for Integer (timeout-ms) and Array
-    // (approved-commands) — types beyond String and Boolean.
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        r#"# keep comment
 [list]
-timeout-ms = 5000
-full = true
+columns = []  # pick later
 
-[projects."repo"]
-approved-commands = ["cargo test", "cargo build"]
+# fill in later
+[commit]
+
+[commit.generation]
+command = "old"  # fast model
 "#,
-    )
-    .unwrap();
+            &["commit", "generation"],
+            "command",
+        ),
+        ("", &["commit", "generation"], "command"),
+        (
+            "# why we generate\ncommit = { generation = { command = \"old\" } } # trailing\n",
+            &["commit", "generation"],
+            "command",
+        ),
+        (
+            "projects = { \"a\" = { worktree-path = \"x\" } }\n",
+            &["projects", "github.com/u/r"],
+            "worktree-path",
+        ),
+        (
+            "commit.generation.command = \"old\"\n",
+            &["commit", "generation"],
+            "command",
+        ),
+        (
+            "commit.stage = \"all\"\n",
+            &["commit", "generation"],
+            "command",
+        ),
+    ];
 
-    let config =
-        UserConfig::load_from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
-    config.save_to(&config_path).unwrap();
+    let mut rendered = String::new();
+    for (input, tables, key) in cases {
+        let mut doc: toml_edit::DocumentMut = input.parse().unwrap();
+        super::persistence::ConfigEdit {
+            tables: tables.to_vec(),
+            key,
+            value: "new".into(),
+        }
+        .apply(&mut doc)
+        .unwrap();
+        rendered.push_str(&format!("----- {}.{key}\n{doc}", tables.join(".")));
+    }
+    insta::assert_snapshot!(rendered, @r#"
+    ----- commit.generation.command
+    skip-shell-integration-prompt = false  # keep asking
 
-    let saved = std::fs::read_to_string(&config_path).unwrap();
-    assert!(saved.contains("# keep comment"), "comment lost: {saved}");
-    assert!(
-        saved.contains("timeout-ms = 5000"),
-        "integer value should be preserved: {saved}"
-    );
-    assert!(
-        saved.contains("full = true"),
-        "boolean value should be preserved: {saved}"
-    );
-    assert!(
-        saved.contains("cargo test") && saved.contains("cargo build"),
-        "array values should be preserved: {saved}"
-    );
+    [list]
+    columns = []  # pick later
+
+    # fill in later
+    [commit]
+
+    [commit.generation]
+    command = "new"  # fast model
+    ----- commit.generation.command
+    [commit.generation]
+    command = "new"
+    ----- commit.generation.command
+    # why we generate
+    commit = { generation = { command = "new" } } # trailing
+    ----- projects.github.com/u/r.worktree-path
+    projects = { "a" = { worktree-path = "x" } , "github.com/u/r" = { worktree-path = "new" } }
+    ----- commit.generation.command
+    commit.generation.command = "new"
+    ----- commit.generation.command
+    commit.stage = "all"
+
+    [commit.generation]
+    command = "new"
+    "#);
 }
 
 #[test]
-fn test_save_to_existing_file_replaces_changed_inline_table() {
-    // When an inline table's contents actually changed, the diff-based merge
-    // replaces it (even though this changes formatting from inline to standard).
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(&config_path, "post-start = { build = \"cargo build\" }\n").unwrap();
-
-    // Load, modify the hook, then save
-    let mut config =
-        UserConfig::load_from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
-    config.hooks = toml::from_str("post-start = { build = \"cargo test\" }").unwrap();
-    config.save_to(&config_path).unwrap();
-
-    let saved = std::fs::read_to_string(&config_path).unwrap();
-    assert!(
-        saved.contains("cargo test"),
-        "changed value should be written: {saved}"
-    );
-    assert!(
-        !saved.contains("cargo build"),
-        "old value should be gone: {saved}"
-    );
+fn test_config_edit_fails_when_a_parent_is_not_a_table() {
+    let mut doc: toml_edit::DocumentMut = "commit = \"oops\"\n".parse().unwrap();
+    let err = super::persistence::ConfigEdit {
+        tables: vec!["commit", "generation"],
+        key: "command",
+        value: "llm".into(),
+    }
+    .apply(&mut doc)
+    .unwrap_err();
+    insta::assert_snapshot!(err.to_string(), @"Failed to write config file: `commit` is not a table");
 }
 
 #[test]
-fn test_save_to_existing_file_preserves_unknown_keys() {
-    // Unknown top-level keys (typos, future fields) must survive a save.
-    // The diff-based merge skips unknown keys in its stale-key sweep.
+fn test_edit_takes_the_migrations_when_one_lands_on_its_path() {
+    // A deprecated `[commit-generation]` migrates to `[commit.generation]` only
+    // while that table is absent, so the command can't be written there as the
+    // file stands: the edit takes the load-time migrations with it, and says so.
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
     std::fs::write(
         &config_path,
-        r#"# A user comment
-unknown-key = "keep me"
-skip-shell-integration-prompt = true
-"#,
+        "[commit-generation]\ntemplate = \"MINE\"\n\n[select]\npager = \"delta\"\nheight = 5\n",
     )
     .unwrap();
 
-    let config = UserConfig {
-        skip_shell_integration_prompt: true,
-        ..Default::default()
+    let file = super::persistence::ConfigFile::read(&config_path).unwrap();
+    let mut changed = file.config.clone();
+    changed
+        .commit
+        .generation
+        .get_or_insert_with(Default::default)
+        .command = Some("llm".to_string());
+    let edit = super::persistence::ConfigEdit {
+        tables: vec!["commit", "generation"],
+        key: "command",
+        value: "llm".into(),
     };
 
-    config.save_to(&config_path).unwrap();
-
-    let saved = std::fs::read_to_string(&config_path).unwrap();
-    assert!(
-        saved.contains("unknown-key = \"keep me\""),
-        "unknown key should be preserved: {saved}"
-    );
-    assert!(
-        saved.contains("# A user comment"),
-        "comment should be preserved: {saved}"
-    );
-    assert!(
-        saved.contains("skip-shell-integration-prompt = true"),
-        "known key should be preserved: {saved}"
-    );
-}
-
-#[test]
-fn test_save_to_existing_file_preserves_nested_unknown_keys() {
-    // Unknown keys inside a known table (e.g., a newer-version field under
-    // `[merge]`) must survive a save that touches unrelated settings. Older
-    // wt versions should leave config data they don't recognize alone.
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        r#"[merge]
-squash = false
-future-option = true
-"#,
-    )
-    .unwrap();
-
-    // Mutate an unrelated setting so save_to() writes the file.
-    let config = UserConfig {
-        skip_shell_integration_prompt: true,
-        merge: MergeConfig {
-            squash: Some(false),
-            ..Default::default()
-        },
-        ..Default::default()
+    let super::persistence::Edited::Migrated { content, changes } =
+        file.edited(&edit, &changed).unwrap()
+    else {
+        panic!("the edit should have taken the migrations with it");
     };
-
-    config.save_to(&config_path).unwrap();
-
-    let saved = std::fs::read_to_string(&config_path).unwrap();
-    assert!(
-        saved.contains("future-option = true"),
-        "nested unknown key should be preserved: {saved}"
+    // `[switch.picker]` has no `height`, so the migration drops it. Every
+    // change is reported, which is what the caller's warning prints.
+    insta::assert_snapshot!(
+        ansi_str::AnsiStr::ansi_strip(&crate::config::deprecation::format_applied_lines(&changes)),
+        @r"
+    ▲ Moved [commit-generation] to [commit.generation]
+    ▲ Moved [select] to [switch.picker]
+    ▲ Removed [select] height, which its replacement has no field for
+    "
     );
-    assert!(
-        saved.contains("squash = false"),
-        "known sibling should be preserved: {saved}"
-    );
-    assert!(
-        saved.contains("skip-shell-integration-prompt = true"),
-        "new top-level key should be written: {saved}"
-    );
-}
+    // The migrated file carries every load-path migration, so the unrelated
+    // `[select]` moves too — what the caller's warning tells the user about.
+    insta::assert_snapshot!(content, @r#"
+    [commit.generation]
+    template = "MINE"
+    command = "llm"
 
-#[test]
-fn test_save_to_existing_file_preserves_section_with_only_unknown_fields() {
-    // A section whose known fields are all absent/default (so reserialization
-    // skips the whole section) but that still contains unknown keys must
-    // survive the save — including when a mutation later introduces a known
-    // field to the same section.
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        r#"[merge]
-future-option = true
-"#,
-    )
-    .unwrap();
+    [switch.picker]
+    pager = "delta"
+    "#);
 
-    // Mutation introduces a known field to `[merge]` that wasn't on disk.
-    let config = UserConfig {
-        merge: MergeConfig {
-            squash: Some(false),
-            ..Default::default()
-        },
-        ..Default::default()
+    // An edit no migration lands on leaves the file's own spelling alone.
+    let mut only_flag = file.config.clone();
+    only_flag.skip_shell_integration_prompt = true;
+    let flag_edit = super::persistence::ConfigEdit {
+        tables: vec![],
+        key: "skip-shell-integration-prompt",
+        value: true.into(),
     };
-
-    config.save_to(&config_path).unwrap();
-
-    let saved = std::fs::read_to_string(&config_path).unwrap();
-    assert!(
-        saved.contains("future-option = true"),
-        "unknown key in otherwise-empty section should be preserved: {saved}"
-    );
-    assert!(
-        saved.contains("squash = false"),
-        "new known field should be written: {saved}"
-    );
+    assert!(matches!(
+        file.edited(&flag_edit, &only_flag).unwrap(),
+        super::persistence::Edited::AsWritten(_)
+    ));
 }
 
 #[test]
-fn test_save_to_existing_file_preserves_deeply_nested_unknown_keys() {
-    // Unknown keys inside a doubly-nested table (e.g., `[commit.generation]`)
-    // must also survive — the preserve set needs to traverse to the right level.
+fn test_mutation_fails_on_a_file_that_is_not_a_valid_config_and_leaves_it() {
+    // Valid TOML that doesn't deserialize as a config (a hand edit like
+    // `commit = "oops"`) fails the reload, before anything is written.
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        r#"[commit.generation]
-command = "old-llm"
-future-knob = "from-newer-wt"
-"#,
-    )
-    .unwrap();
+    let content = "commit = \"oops\"\n";
+    std::fs::write(&config_path, content).unwrap();
 
-    let config = UserConfig {
-        commit: CommitConfig {
-            stage: None,
-            generation: Some(CommitGenerationConfig {
-                command: Some("new-llm".to_string()),
-                ..Default::default()
-            }),
-        },
-        ..Default::default()
-    };
-
-    config.save_to(&config_path).unwrap();
-
-    let saved = std::fs::read_to_string(&config_path).unwrap();
+    let err = UserConfig::default()
+        .set_commit_generation_command("llm".to_string(), &config_path)
+        .unwrap_err();
     assert!(
-        saved.contains(r#"future-knob = "from-newer-wt""#),
-        "nested unknown key should be preserved: {saved}"
+        err.to_string().contains("failed to parse"),
+        "expected parse error, got: {err}"
     );
-    assert!(
-        saved.contains(r#"command = "new-llm""#),
-        "known field should be updated: {saved}"
-    );
-    assert!(!saved.contains("old-llm"), "old value not removed: {saved}");
-}
-
-#[test]
-fn test_save_to_existing_file_preserves_unknown_keys_in_project_section() {
-    // Unknown keys inside a project entry (e.g., `[projects."name"]`) are also
-    // at a nested level — the fix must cover entries inside the projects map too.
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        r#"[projects."repo"]
-worktree-path = "../custom"
-future-per-project = "value"
-"#,
-    )
-    .unwrap();
-
-    let mut config = UserConfig::default();
-    config.projects.insert(
-        "repo".to_string(),
-        UserProjectOverrides {
-            worktree_path: Some("../custom".to_string()),
-            ..Default::default()
-        },
-    );
-    // Flip an unrelated flag so save_to() has a reason to write.
-    config.skip_shell_integration_prompt = true;
-
-    config.save_to(&config_path).unwrap();
-
-    let saved = std::fs::read_to_string(&config_path).unwrap();
-    assert!(
-        saved.contains(r#"future-per-project = "value""#),
-        "unknown key inside a project entry should be preserved: {saved}"
-    );
-    assert!(
-        saved.contains(r#"worktree-path = "../custom""#),
-        "known field should be preserved: {saved}"
-    );
-}
-
-#[test]
-fn test_save_to_existing_file_preserves_inline_table_formatting() {
-    // When a user writes a hook as an inline table (e.g., `post-start = { ... }`),
-    // the diff-based merge must not rewrite it to a standard table if the value
-    // is semantically unchanged.
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-    let original = "post-start = { build = \"cargo build\" }\n";
-    std::fs::write(&config_path, original).unwrap();
-
-    // Load the config (which parses hooks via flatten), then save it back
-    let config = UserConfig::load_from_str(original).unwrap();
-    config.save_to(&config_path).unwrap();
-
-    let saved = std::fs::read_to_string(&config_path).unwrap();
-    // The inline table syntax should be preserved (not expanded to [post-start])
-    assert!(
-        saved.contains("post-start = { build = \"cargo build\" }"),
-        "inline table should be preserved: {saved}"
-    );
-    assert!(
-        !saved.contains("[post-start]"),
-        "should not be expanded to standard table: {saved}"
-    );
+    assert_eq!(std::fs::read_to_string(&config_path).unwrap(), content);
 }
 
 // =========================================================================
@@ -3713,8 +2930,8 @@ fn test_save_to_existing_file_preserves_inline_table_formatting() {
 
 #[test]
 fn test_set_project_worktree_path_noop_when_unchanged() {
-    // Covers the `return false` early-exit in set_project_worktree_path's
-    // mutator: when the path already matches, no save happens. We verify
+    // Covers the `None` early exit in set_project_worktree_path's
+    // mutator: when the path already matches, nothing is written. We verify
     // this by checking that the file content is byte-identical across a
     // redundant call.
     let dir = tempfile::tempdir().unwrap();
@@ -3730,9 +2947,9 @@ fn test_set_project_worktree_path_noop_when_unchanged() {
     // Sanity: first call actually wrote the value
     assert!(after_first.contains("../custom"), "{after_first}");
 
-    // Second call with identical value should be a no-op — reload_from
-    // refreshes self from disk, the mutator compares equal and returns
-    // false, so save is skipped.
+    // Second call with identical value should be a no-op — the mutator runs
+    // on the file's config, compares equal and returns `None`, so nothing is
+    // written.
     let mut config2 = UserConfig::default();
     config2
         .set_project_worktree_path("user/repo", "../custom".to_string(), &config_path)
@@ -3747,8 +2964,8 @@ fn test_set_project_worktree_path_noop_when_unchanged() {
 
 #[test]
 fn test_set_commit_generation_command_noop_when_unchanged() {
-    // Covers the `return false` early-exit in set_commit_generation_command's
-    // mutator: when the command already matches, no save happens. We verify
+    // Covers the `None` early exit in set_commit_generation_command's
+    // mutator: when the command already matches, nothing is written. We verify
     // this by checking that the file content is byte-identical across a
     // redundant call.
     let dir = tempfile::tempdir().unwrap();
@@ -3764,9 +2981,9 @@ fn test_set_commit_generation_command_noop_when_unchanged() {
     // Sanity: first call actually wrote the value
     assert!(after_first.contains("llm -m haiku"), "{after_first}");
 
-    // Second call with identical value should be a no-op — reload_from
-    // refreshes self from disk, the mutator compares equal and returns
-    // false, so save is skipped.
+    // Second call with identical value should be a no-op — the mutator runs
+    // on the file's config, compares equal and returns `None`, so nothing is
+    // written.
     let mut config2 = UserConfig::default();
     config2
         .set_commit_generation_command("llm -m haiku".to_string(), &config_path)
@@ -3781,10 +2998,10 @@ fn test_set_commit_generation_command_noop_when_unchanged() {
 
 #[test]
 fn test_set_skip_shell_integration_prompt_noop_on_second_call() {
-    // Covers the `return false` early-exit in set_skip_shell_integration_prompt's
-    // mutator. reload_from refreshes all fields from disk — after the first
-    // save, the flag is true on disk, so a second call sees it already true
-    // and skips the save.
+    // Covers the `None` early exit in set_skip_shell_integration_prompt's
+    // mutator. The mutator runs on the file's config — after the first
+    // write, the flag is true on disk, so a second call sees it already true
+    // and writes nothing.
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
     std::fs::write(&config_path, "# empty\n").unwrap();
@@ -3797,12 +3014,41 @@ fn test_set_skip_shell_integration_prompt_noop_on_second_call() {
     assert!(after_first.contains("skip-shell-integration-prompt = true"));
 
     // Second call with the flag already true in-memory — mutator returns
-    // false, save is skipped, file is byte-identical.
+    // `None`, nothing is written, file is byte-identical.
     config
         .set_skip_shell_integration_prompt(&config_path)
         .unwrap();
     let after_second = std::fs::read_to_string(&config_path).unwrap();
     assert_eq!(after_first, after_second);
+}
+
+#[test]
+fn test_mutation_keeps_in_memory_config_the_file_lacks() {
+    // The in-memory config also carries system config, environment variables,
+    // and `--config-set`. A mutation applies its change to it without
+    // replacing it with the file's config, so the rest of the command still
+    // reads those values.
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(&config_path, "[list]\nfull = true\n").unwrap();
+
+    let mut config = UserConfig {
+        commit: CommitConfig {
+            stage: Some(StageMode::None),
+            generation: None,
+        },
+        ..Default::default()
+    };
+    config
+        .set_skip_commit_generation_prompt(&config_path)
+        .unwrap();
+
+    assert_eq!(config.commit.stage, Some(StageMode::None));
+    assert!(config.skip_commit_generation_prompt);
+    assert_eq!(
+        std::fs::read_to_string(&config_path).unwrap(),
+        "skip-commit-generation-prompt = true\n[list]\nfull = true\n"
+    );
 }
 
 #[test]
@@ -3852,53 +3098,79 @@ fn test_acquire_config_lock_fails_when_parent_is_file() {
 
 #[cfg(unix)]
 #[test]
-fn test_with_locked_mutation_propagates_save_error() {
-    // Covers the `save_to(&path)?` error branch in with_locked_mutation:
-    // after a successful lock + reload, the mutator closure chmods the
-    // config file to 000. The subsequent save_to tries to read the
-    // existing file and fails with a permission
-    // error, which with_locked_mutation propagates back to the caller.
+fn test_with_locked_mutation_propagates_write_error() {
+    // After lock and reload, the mutator makes the config directory read-only,
+    // so writing the edited file — a temp file beside it, renamed over it —
+    // fails, and with_locked_mutation returns that error to the caller.
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
+    let config_dir = dir.path().join("config");
+    std::fs::create_dir(&config_dir).unwrap();
+    let config_path = config_dir.join("config.toml");
     std::fs::write(&config_path, "# valid\n").unwrap();
 
     struct RestorePerms<'a>(&'a std::path::Path);
     impl Drop for RestorePerms<'_> {
         fn drop(&mut self) {
-            if let Ok(meta) = std::fs::metadata(self.0) {
-                let mut perms = meta.permissions();
-                perms.set_mode(0o644);
-                let _ = std::fs::set_permissions(self.0, perms);
-            }
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o755));
         }
     }
-    let _guard = RestorePerms(&config_path);
+    let _guard = RestorePerms(&config_dir);
 
     if !permissions_restrict_reads(dir.path()) {
         return;
     }
 
-    let cfg_path_for_closure = config_path.clone();
+    let dir_for_closure = config_dir.clone();
     let mut config = UserConfig::default();
     let err = config
-        .with_locked_mutation(&config_path, move |_config| {
-            // Mid-mutation: strip read permissions from the config file.
-            // reload_from already ran; save_to will try to read again and fail.
-            let mut perms = std::fs::metadata(&cfg_path_for_closure)
-                .unwrap()
-                .permissions();
-            perms.set_mode(0o000);
-            std::fs::set_permissions(&cfg_path_for_closure, perms).unwrap();
-            true
+        .with_locked_mutation(&config_path, move |config| {
+            std::fs::set_permissions(&dir_for_closure, std::fs::Permissions::from_mode(0o555))
+                .unwrap();
+            config.skip_shell_integration_prompt = true;
+            Some(super::persistence::ConfigEdit {
+                tables: vec![],
+                key: "skip-shell-integration-prompt",
+                value: true.into(),
+            })
         })
         .unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("Failed to read config file"),
-        "expected save-side read error, got: {msg}"
+        msg.contains("Failed to write config file"),
+        "expected write error, got: {msg}"
     );
+    assert_eq!(std::fs::read_to_string(&config_path).unwrap(), "# valid\n");
+}
+
+/// A mutator sets a value and returns the edit that writes it, so the file
+/// loads back as the config the mutation asked for. One whose edit says
+/// something else is refused rather than written — the same test both candidate
+/// documents face, whether or not writing them takes the migrations along.
+#[test]
+fn test_with_locked_mutation_refuses_an_edit_that_does_not_load_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(&config_path, "# valid\n").unwrap();
+
+    let mut config = UserConfig::default();
+    let err = config
+        .with_locked_mutation(&config_path, |_config| {
+            // The edit, without the matching change to the config beside it.
+            Some(super::persistence::ConfigEdit {
+                tables: vec![],
+                key: "skip-shell-integration-prompt",
+                value: true.into(),
+            })
+        })
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("skip-shell-integration-prompt would not load as written"),
+        "the refusal should name the key, got: {msg}"
+    );
+    assert_eq!(std::fs::read_to_string(&config_path).unwrap(), "# valid\n");
 }
 
 #[test]
@@ -3921,19 +3193,25 @@ platform = "gitlab"
         "git.company.example/group/team/repo",
     ] {
         assert_eq!(
-            config.worktree_path_for_project(project),
+            config.worktree_path_for_project(&ProjectId::from(project)),
             ".worktrees/{{ branch | sanitize }}"
         );
-        assert!(config.has_project_worktree_path(project));
-        assert_eq!(config.forge_platform(Some(project)), Some("gitlab"));
+        assert!(config.has_project_worktree_path(&ProjectId::from(project)));
+        assert_eq!(
+            config.forge_platform(Some(&ProjectId::from(project))),
+            Some("gitlab")
+        );
     }
 
     // A repo on another host takes the global settings.
     assert_eq!(
-        config.worktree_path_for_project("github.com/owner/repo"),
+        config.worktree_path_for_project(&ProjectId::from("github.com/owner/repo")),
         "../{{ repo }}.{{ branch | sanitize }}"
     );
-    assert_eq!(config.forge_platform(Some("github.com/owner/repo")), None);
+    assert_eq!(
+        config.forge_platform(Some(&ProjectId::from("github.com/owner/repo"))),
+        None
+    );
 }
 
 #[test]
@@ -3953,15 +3231,15 @@ worktree-path = "exact"
     .unwrap();
 
     assert_eq!(
-        config.worktree_path_for_project("git.company.example/team/repo"),
+        config.worktree_path_for_project(&ProjectId::from("git.company.example/team/repo")),
         "exact"
     );
     assert_eq!(
-        config.worktree_path_for_project("git.company.example/team/other"),
+        config.worktree_path_for_project(&ProjectId::from("git.company.example/team/other")),
         "team"
     );
     assert_eq!(
-        config.worktree_path_for_project("git.company.example/ops/thing"),
+        config.worktree_path_for_project(&ProjectId::from("git.company.example/ops/thing")),
         "host"
     );
 }
@@ -3982,7 +3260,7 @@ branches = false
     )
     .unwrap();
 
-    let list = config.list(Some("git.company.example/owner/repo"));
+    let list = config.list(Some(&ProjectId::from("git.company.example/owner/repo")));
     assert_eq!(list.full, Some(true), "kept from the host-wide entry");
     assert_eq!(list.branches, Some(false), "overridden by the exact entry");
 }
@@ -4002,7 +3280,7 @@ post-switch = "repo-setup"
     )
     .unwrap();
 
-    let hooks = config.hooks(Some("git.company.example/owner/repo"));
+    let hooks = config.hooks(Some(&ProjectId::from("git.company.example/owner/repo")));
     let commands: Vec<&str> = hooks
         .post_switch
         .iter()
@@ -4024,12 +3302,146 @@ hostname = "github.company.example"
     .unwrap();
 
     assert_eq!(
-        config.forge_platform(Some("work/owner/repo")),
+        config.forge_platform(Some(&ProjectId::from("work/owner/repo"))),
         Some("github")
     );
     assert_eq!(
-        config.forge_hostname(Some("work/owner/repo")),
+        config.forge_hostname(Some(&ProjectId::from("work/owner/repo"))),
         Some("github.company.example")
     );
     assert_eq!(config.forge_hostname(None), None);
+}
+
+/// Invalid scalar overrides must not erase unrelated environment values.
+#[test]
+fn test_env_failure_keeps_other_overrides() {
+    let env_var = |name: &str, path: &[&str], value: &str| super::EnvVar {
+        name: name.into(),
+        segments: path.iter().map(|s| s.to_string()).collect(),
+        typed_value: super::try_parse_value(value),
+        raw_value: value.into(),
+    };
+    let vars = [
+        // Deliberately pass the custom-column width before its required
+        // template. Both fields form one valid setting after migration.
+        env_var(
+            "WORKTRUNK__LIST__CUSTOM_COLUMNS__TICKET__WIDTH",
+            &["list", "custom-columns", "ticket", "width"],
+            "20",
+        ),
+        env_var(
+            "WORKTRUNK__LIST__CUSTOM_COLUMNS__TICKET__TEMPLATE",
+            &["list", "custom-columns", "ticket", "template"],
+            "{{ branch }}",
+        ),
+        env_var("WORKTRUNK__LIST__COLUMNS", &["list", "columns"], "oops"),
+        env_var("WORKTRUNK__LIST__FULL", &["list", "full"], "true"),
+        env_var("WORKTRUNK_WORKTREE_PATH", &["worktree-path"], "/tmp/zzz"),
+        // The old select section drops unsupported fields completely. An
+        // empty migrated overlay must not become a spurious validation unit.
+        env_var(
+            "WORKTRUNK__SELECT__OBSOLETE",
+            &["select", "obsolete"],
+            "old",
+        ),
+    ];
+    let mut table = "[list]\nbranches=true\ncolumns=[\"path\"]\n"
+        .parse()
+        .unwrap();
+    let mut warnings = Vec::new();
+    UserConfig::apply_env_vars(&vars, &mut table, &mut warnings).unwrap();
+    assert!(!table.contains_key("select"));
+    let config = loaded(table);
+    assert_eq!(config.list.full, Some(true));
+    assert_eq!(config.worktree_path.as_deref(), Some("/tmp/zzz"));
+    assert_eq!(config.list.branches, Some(true));
+    assert_eq!(config.list.columns, ["path"]);
+    assert_eq!(
+        config.list.custom_columns["ticket"].template,
+        "{{ branch }}"
+    );
+    assert_eq!(config.list.custom_columns["ticket"].width, Some(20));
+    assert_eq!(warnings.len(), 1);
+    let LoadError::Env { vars, .. } = &warnings[0] else {
+        panic!("expected env warning")
+    };
+    assert_eq!(vars, &[("WORKTRUNK__LIST__COLUMNS".into(), "oops".into())]);
+}
+
+#[test]
+fn test_env_override_can_repair_invalid_lower_layer() {
+    let var = super::EnvVar {
+        name: "WORKTRUNK_WORKTREE_PATH".into(),
+        segments: vec!["worktree-path".into()],
+        typed_value: super::try_parse_value("/tmp/worktrees/{{ branch }}"),
+        raw_value: "/tmp/worktrees/{{ branch }}".into(),
+    };
+    let mut table = "worktree-path = \"\"\n".parse().unwrap();
+    let mut warnings = Vec::new();
+
+    UserConfig::apply_env_vars(&[var], &mut table, &mut warnings).unwrap();
+
+    let config = loaded(table);
+    assert_eq!(
+        config.worktree_path.as_deref(),
+        Some("/tmp/worktrees/{{ branch }}")
+    );
+    assert!(config.validate().is_ok());
+    assert!(warnings.is_empty());
+}
+
+#[test]
+fn test_invalid_project_env_override_keeps_global_repair() {
+    let global = super::EnvVar {
+        name: "WORKTRUNK_WORKTREE_PATH".into(),
+        segments: vec!["worktree-path".into()],
+        typed_value: toml::Value::String("/valid".into()),
+        raw_value: "/valid".into(),
+    };
+    let project = super::EnvVar {
+        name: "WORKTRUNK__PROJECTS__GITHUB.COM/OWNER/REPO__WORKTREE_PATH".into(),
+        segments: vec![
+            "projects".into(),
+            "github.com/owner/repo".into(),
+            "worktree-path".into(),
+        ],
+        typed_value: toml::Value::String(String::new()),
+        raw_value: String::new(),
+    };
+    let mut table =
+        "[list]\nbranches = true\n[projects.\"github.com/owner/repo\"]\nworktree-path = \"\"\n"
+            .parse()
+            .unwrap();
+    let mut warnings = Vec::new();
+
+    UserConfig::apply_env_vars(&[global, project], &mut table, &mut warnings).unwrap();
+
+    let config = loaded(table);
+    assert_eq!(config.worktree_path.as_deref(), Some("/valid"));
+    assert_eq!(config.list.branches, Some(true));
+    assert!(config.validate().is_ok());
+    assert!(matches!(warnings.as_slice(), [LoadError::Env { vars, .. }]
+        if vars == &[("WORKTRUNK__PROJECTS__GITHUB.COM/OWNER/REPO__WORKTREE_PATH".into(), String::new())]));
+}
+
+/// A broken internal lower-layer contract must surface a schema error without
+/// blaming an unrelated environment setting or replacing the lower table.
+#[test]
+fn test_env_layer_reports_malformed_lower_table() {
+    let var = super::EnvVar {
+        name: "WORKTRUNK__LIST__FULL".into(),
+        segments: vec!["list".into(), "full".into()],
+        typed_value: toml::Value::Boolean(true),
+        raw_value: "true".into(),
+    };
+    let mut table: toml::Table = "[list]\nbranches = \"invalid\"\n".parse().unwrap();
+    let original = table.clone();
+    let mut warnings = Vec::new();
+
+    let err = UserConfig::apply_env_vars(&[var], &mut table, &mut warnings).unwrap_err();
+
+    assert!(err.contains("branches"), "{err}");
+    assert!(err.contains("boolean"), "{err}");
+    assert_eq!(table, original);
+    assert!(warnings.is_empty());
 }

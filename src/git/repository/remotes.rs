@@ -63,8 +63,9 @@
 use anyhow::Context;
 
 use super::{GitRemoteUrl, GitRepoInfo, Repository};
+use crate::config::ProjectId;
 use crate::git::error::RefType;
-use crate::git::url_path_segments_eq;
+use crate::git::{legacy_project_identifier, url_path_segments_eq};
 
 impl Repository {
     /// Get the primary remote name for this repository.
@@ -103,6 +104,26 @@ impl Repository {
         first_remote.ok_or_else(|| anyhow::anyhow!("No remotes configured"))
     }
 
+    /// Whether `remote`'s fetch refspecs record `branch` under `refs/remotes/`.
+    ///
+    /// A push updates the remote-tracking ref only where these refspecs map
+    /// one, so this decides whether a missing `refs/remotes/<remote>/<branch>`
+    /// means the branch isn't on `remote`. A normal clone maps every branch;
+    /// one made with `--single-branch` or `--depth` maps only the branch it
+    /// cloned. A URL, or a remote with no fetch refspecs, maps nothing.
+    ///
+    /// Resolved from the bulk config map — O(1) once populated.
+    pub fn fetch_tracks_branch(&self, remote: &str, branch: &str) -> bool {
+        let key = super::canonical_config_key(&format!("remote.{remote}.fetch"));
+        let Ok(config) = self.all_config() else {
+            return false;
+        };
+        let guard = config.read().unwrap();
+        guard
+            .get(&key)
+            .is_some_and(|refspecs| refspecs_track_ref(refspecs, &format!("refs/heads/{branch}")))
+    }
+
     /// Get the URL for a remote, if configured.
     ///
     /// Returns the raw value from `.git/config` without applying `url.insteadOf`
@@ -130,7 +151,7 @@ impl Repository {
             .effective_remote_urls
             .entry(remote.to_string())
             .or_insert_with(|| {
-                self.run_command(&["remote", "get-url", remote])
+                self.run_command(&["remote", "get-url", "--", remote])
                     .ok()
                     .map(|url| url.trim().to_string())
                     .filter(|url| !url.is_empty())
@@ -384,22 +405,26 @@ impl Repository {
     /// Uses the git remote URL if available (e.g., "github.com/user/repo"),
     /// otherwise falls back to the full canonical path of the repository.
     ///
-    /// This identifier is used to track which commands have been approved
-    /// for execution in this project.
+    /// This identifier keys approved commands and `[projects."…"]` settings.
+    /// For a remote whose identifier changed after v0.80.0, it also carries
+    /// the old one where it still identifies the same server.
     ///
     /// Result is cached in the repository's shared cache (same for all clones).
-    pub fn project_identifier(&self) -> anyhow::Result<String> {
+    pub fn project_identifier(&self) -> anyhow::Result<ProjectId> {
         self.cache
             .project_identifier
             .get_or_try_init(|| {
                 // Try to get the remote URL first (cached)
                 if let Some(url) = self.primary_remote_url() {
-                    if let Some(parsed) = GitRemoteUrl::parse(url.trim()) {
-                        return Ok(parsed.project_identifier());
-                    }
-                    // Fallback for URLs that don't fit host/owner/repo model
-                    let url = url.strip_suffix(".git").unwrap_or(url.as_str());
-                    return Ok(url.to_string());
+                    let current = match GitRemoteUrl::parse(url.trim()) {
+                        Some(parsed) => parsed.project_identifier(),
+                        // Fallback for URLs that don't fit host/owner/repo model
+                        None => url.strip_suffix(".git").unwrap_or(url.as_str()).to_string(),
+                    };
+                    return Ok(ProjectId::with_legacy(
+                        current,
+                        legacy_project_identifier(&url),
+                    ));
                 }
 
                 // Fall back to full canonical path (use worktree base for consistency across all worktrees)
@@ -411,7 +436,7 @@ impl Repository {
                     .to_str()
                     .context("Repository path is not valid UTF-8")?;
 
-                Ok(path_str.to_string())
+                Ok(ProjectId::from(path_str))
             })
             .cloned()
     }
@@ -425,6 +450,11 @@ impl Repository {
             .ok()
             .flatten()
             .and_then(|config| config.list.url)
+    }
+
+    /// Split a remote-tracking branch at the longest configured remote prefix.
+    pub fn split_remote_branch_name<'a>(&self, ref_name: &'a str) -> Option<(&'a str, &'a str)> {
+        split_remote_branch_name(ref_name, &self.all_remote_urls())
     }
 
     /// Strip the remote prefix from a remote-tracking branch name.
@@ -443,9 +473,87 @@ impl Repository {
     }
 }
 
+/// Whether fetch `refspecs` map `refname` to a remote-tracking ref: some
+/// positive refspec's source matches it and its destination is under
+/// `refs/remotes/`, and no negative (`^`) refspec matches it.
+fn refspecs_track_ref(refspecs: &[String], refname: &str) -> bool {
+    let mut tracked = false;
+    for spec in refspecs {
+        if let Some(excluded) = spec.strip_prefix('^') {
+            if refspec_side_matches(excluded, refname) {
+                return false;
+            }
+            continue;
+        }
+        let spec = spec.strip_prefix('+').unwrap_or(spec);
+        if let Some((src, dst)) = spec.split_once(':')
+            && dst.starts_with("refs/remotes/")
+            && refspec_side_matches(src, refname)
+        {
+            tracked = true;
+        }
+    }
+    tracked
+}
+
+/// Match `refname` against one side of a refspec, where a single `*` matches
+/// any run of characters, `/` included.
+fn refspec_side_matches(pattern: &str, refname: &str) -> bool {
+    match pattern.split_once('*') {
+        Some((prefix, suffix)) => {
+            refname.len() >= prefix.len() + suffix.len()
+                && refname.starts_with(prefix)
+                && refname.ends_with(suffix)
+        }
+        None => pattern == refname,
+    }
+}
+
+/// Remote refs use the longest matching configured prefix; orphaned refs retain
+/// the conventional first-segment split.
+pub(super) fn split_remote_branch_name<'a>(
+    name: &'a str,
+    remotes: &[(String, String)],
+) -> Option<(&'a str, &'a str)> {
+    let boundary = remotes
+        .iter()
+        .filter(|(remote, _)| {
+            name.strip_prefix(remote)
+                .is_some_and(|rest| rest.starts_with('/'))
+        })
+        .map(|(remote, _)| remote.len())
+        .max()
+        .or_else(|| name.find('/'))?;
+    Some((&name[..boundary], &name[boundary + 1..]))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::testing::TestRepo;
+
+    #[test]
+    fn refspecs_track_ref_follows_the_fetch_mapping() {
+        let track = |specs: &[&str], refname: &str| {
+            let specs: Vec<String> = specs.iter().map(|s| s.to_string()).collect();
+            super::refspecs_track_ref(&specs, refname)
+        };
+        let full = "+refs/heads/*:refs/remotes/origin/*";
+        assert!(track(&[full], "refs/heads/feature"));
+        assert!(track(&[full], "refs/heads/nested/feature"));
+        // `--single-branch` / `--depth` clone: only the cloned branch.
+        let single = "+refs/heads/main:refs/remotes/origin/main";
+        assert!(track(&[single], "refs/heads/main"));
+        assert!(!track(&[single], "refs/heads/feature"));
+        // A mapping outside `refs/remotes/` records no remote-tracking ref.
+        assert!(!track(
+            &["+refs/heads/*:refs/heads/*"],
+            "refs/heads/feature"
+        ));
+        // A negative refspec excludes what a positive one would map.
+        assert!(!track(&[full, "^refs/heads/wip/*"], "refs/heads/wip/x"));
+        assert!(track(&[full, "^refs/heads/wip/*"], "refs/heads/feature"));
+        assert!(!track(&[], "refs/heads/feature"));
+    }
 
     #[test]
     fn test_find_remote_for_azure_dev_azure() {

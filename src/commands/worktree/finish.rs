@@ -7,10 +7,11 @@
 //! 1. Capture the feature worktree's path + commit BEFORE removal — afterward
 //!    the worktree directory is gone, but post-merge hooks still need to
 //!    reference it via Active template overrides.
-//! 2. Decide whether to remove the feature worktree. Four conditions block
-//!    removal: `--no-remove`, on-target, primary-worktree, and default-branch.
-//!    Otherwise `ensure_clean` gates removal and `handle_remove_output`
-//!    performs it (sharing the same code path as `wt remove`).
+//! 2. Decide whether to remove the feature worktree. Six conditions block
+//!    removal: `--no-remove`, on-target, primary-worktree, locked, and
+//!    default-branch, and nested worktrees. Otherwise `ensure_clean` gates removal and
+//!    `handle_merge_remove_output` performs it (sharing the staging path with
+//!    `wt remove`).
 //! 3. Register the post-merge hook with the announcer. The caller owns
 //!    `flush()` because it's a command-level lifecycle operation, not part of
 //!    the finish sequence.
@@ -25,6 +26,7 @@ use std::path::Path;
 use worktrunk::HookType;
 use worktrunk::config::UserConfig;
 use worktrunk::git::{BranchDeletionMode, Repository};
+use worktrunk::path::format_path_for_display;
 use worktrunk::styling::{eprintln, info_message};
 
 use super::types::{RemovalPlan, SharedBranchCheckout};
@@ -38,13 +40,14 @@ use crate::commands::repository_ext::{
 };
 use crate::commands::template_vars::TemplateVars;
 use crate::output::{
-    BackgroundFallbackMode, RemovalExecution, handle_remove_output, post_hook_display_path,
+    CommandFailure, CommandResult, handle_merge_remove_output, post_hook_display_path,
     pre_hook_display_path,
 };
 
 /// Inputs to [`finish_after_merge`]. Owned by the caller; this struct just
 /// bundles them so the function signature stays readable.
 pub struct FinishAfterMergeArgs<'a> {
+    pub source_is_current: bool,
     pub current_branch: &'a str,
     pub target_branch: &'a str,
     pub target_worktree_path: Option<&'a Path>,
@@ -64,15 +67,19 @@ pub struct FinishAfterMergeArgs<'a> {
 /// `announcer` is mutated in place; `flush()` stays with the caller because it
 /// covers the whole command's background hooks (post-commit, post-remove,
 /// post-switch, post-merge), not just this step.
+/// Records the removal decision before fallible post-merge hook setup, so a
+/// later error cannot discard a completed removal. `None` means cleanup did
+/// not reach a confirmed outcome.
 pub fn finish_after_merge(
     repo: &Repository,
     config: &UserConfig,
     env: &CommandEnv,
     announcer: &mut HookAnnouncer<'_>,
     args: FinishAfterMergeArgs<'_>,
-) -> anyhow::Result<bool> {
+) -> CommandResult<bool> {
     let FinishAfterMergeArgs {
         current_branch,
+        source_is_current,
         target_branch,
         target_worktree_path,
         remove,
@@ -124,6 +131,27 @@ pub fn finish_after_merge(
     } else if is_primary_worktree(repo)? {
         eprintln!("{}", info_message("Worktree preserved (primary worktree)"));
         false
+    } else if let Some(reason) = repo.current_worktree().lock_reason()? {
+        // `git worktree lock` is "don't remove this", not "don't merge".
+        // Merge already succeeded; skip cleanup the same way `--no-remove`
+        // and primary-worktree do. `stage_worktree_removal` also refuses a
+        // lock, so a path that skips this check still cannot trash the dir.
+        let msg = match reason {
+            Some(r) => format!("Worktree preserved (locked: {r})"),
+            None => "Worktree preserved (locked)".to_string(),
+        };
+        eprintln!("{}", info_message(msg));
+        false
+    } else if let Some(nested) = worktrunk::git::remove::nested_worktree(repo, &env.worktree_path)?
+    {
+        eprintln!(
+            "{}",
+            info_message(format!(
+                "Worktree preserved (contains worktree @ {})",
+                format_path_for_display(&nested)
+            ))
+        );
+        false
     } else {
         // Phase 3: reject removing default branch (merge always uses SafeDelete).
         check_not_default_branch(repo, current_branch, &BranchDeletionMode::SafeDelete)?;
@@ -170,7 +198,7 @@ pub fn finish_after_merge(
         let remove_result = RemovalPlan::Worktree {
             main_path: destination_path.clone(),
             worktree_path: worktree_root,
-            changed_directory: true,
+            changed_directory: source_is_current,
             branch_name: Some(current_branch.to_string()),
             deletion_mode,
             target_branch: display_target,
@@ -182,50 +210,50 @@ pub fn finish_after_merge(
         // The fate is dropped: merge's own reporting (`removed` in the JSON
         // blob, the removal messages) doesn't itemize the branch, and the
         // handler has already narrated any retention.
-        handle_remove_output(
-            &remove_result,
-            RemovalExecution::Background(BackgroundFallbackMode::Detached),
-            plan,
-            false,
-            announcer,
-        )?;
+        handle_merge_remove_output(&remove_result, plan, announcer)
+            .map_err(|failure| failure.map_result(|_| true))?;
         true
     };
 
-    if verify {
-        // Post-merge hooks run in the destination worktree (target). `ctx.repo`
-        // is rooted there only for template *rendering* (the feature worktree
-        // may be gone); the command set is the frozen `plan`, anchored at
-        // `destination_path` at the gate — no re-read of the destination's
-        // (now post-merge) `.config/wt.toml`.
-        let dest_repo = Repository::at(&destination_path)?;
-        let ctx = CommandContext::new(
-            &dest_repo,
-            config,
-            Some(current_branch),
-            &destination_path,
-            yes,
-        );
-        let display_path = if removed {
-            post_hook_display_path(&destination_path)
-        } else {
-            pre_hook_display_path(&destination_path)
-        };
+    let finish = (|| -> anyhow::Result<()> {
+        if verify {
+            // Post-merge hooks run in the destination worktree (target). `ctx.repo`
+            // is rooted there only for template *rendering* (the feature worktree
+            // may be gone); the command set is the frozen `plan`, anchored at
+            // `destination_path` at the gate — no re-read of the destination's
+            // (now post-merge) `.config/wt.toml`.
+            let dest_repo = Repository::at(&destination_path)?;
+            let ctx = CommandContext::new(
+                &dest_repo,
+                config,
+                Some(current_branch),
+                &destination_path,
+                yes,
+            );
+            let display_path = if removed && source_is_current {
+                post_hook_display_path(&destination_path)
+            } else {
+                pre_hook_display_path(&destination_path)
+            };
 
-        let mut vars = feature_vars.with_target(target_branch);
-        if let Some(p) = target_worktree_path {
-            vars = vars.with_target_worktree_path(p);
+            let mut vars = feature_vars.with_target(target_branch);
+            if let Some(p) = target_worktree_path {
+                vars = vars.with_target_worktree_path(p);
+            }
+            register_planned(
+                announcer,
+                plan,
+                &destination_path,
+                &ctx,
+                HookType::PostMerge,
+                &vars.as_extra_vars(),
+                display_path,
+            )?;
         }
-        register_planned(
-            announcer,
-            plan,
-            &destination_path,
-            &ctx,
-            HookType::PostMerge,
-            &vars.as_extra_vars(),
-            display_path,
-        )?;
-    }
 
-    Ok(removed)
+        Ok(())
+    })();
+    finish
+        .map(|()| removed)
+        .map_err(|error| CommandFailure::with_result(error, removed))
 }

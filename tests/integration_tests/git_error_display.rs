@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
 use worktrunk::git::{
-    Diagnostic, FailedCommand, GitError, HookErrorWithHint, HookType, RefType, WorktrunkError,
-    add_hook_skip_hint,
+    Diagnostic, FailedCommand, GitError, HookErrorWithHint, HookType, InProgressOperation, RefType,
+    StaleWorktreeWork, WorktrunkError, add_hook_skip_hint,
 };
 
 use crate::common::{mock_commands::MockConfig, test_tempdir, wt_command};
@@ -42,7 +42,9 @@ fn worktree_errors_render() {
             GitError::WorktreeRemovalFailed {
                 branch: "feature-x".into(),
                 path: PathBuf::from("/tmp/repo.feature-x"),
-                error: "fatal: worktree is dirty\nerror: could not remove worktree".into(),
+                error: anyhow::anyhow!(
+                    "fatal: worktree is dirty\nerror: could not remove worktree"
+                ),
                 remaining_entries: None,
             }
             .render(),
@@ -52,7 +54,9 @@ fn worktree_errors_render() {
             GitError::WorktreeRemovalFailed {
                 branch: "feature-x".into(),
                 path: PathBuf::from("/tmp/repo.feature-x"),
-                error: "error: failed to delete '/tmp/repo.feature-x': Directory not empty".into(),
+                error: anyhow::anyhow!(
+                    "error: failed to delete '/tmp/repo.feature-x': Directory not empty"
+                ),
                 remaining_entries: Some(vec![
                     ".vite/".into(),
                     "node_modules/".into(),
@@ -66,8 +70,9 @@ fn worktree_errors_render() {
             GitError::WorktreeRemovalFailed {
                 branch: "feature-x".into(),
                 path: PathBuf::from("/tmp/repo.feature-x"),
-                error: "error: failed to remove '/tmp/repo.feature-x/target': Permission denied"
-                    .into(),
+                error: anyhow::anyhow!(
+                    "error: failed to remove '/tmp/repo.feature-x/target': Permission denied"
+                ),
                 remaining_entries: Some(vec!["target/".into()]),
             }
             .render(),
@@ -77,7 +82,9 @@ fn worktree_errors_render() {
             GitError::WorktreeRemovalFailed {
                 branch: "feature-x".into(),
                 path: PathBuf::from("/tmp/repo.feature-x"),
-                error: "error: failed to delete '/tmp/repo.feature-x': Directory not empty".into(),
+                error: anyhow::anyhow!(
+                    "error: failed to delete '/tmp/repo.feature-x': Directory not empty"
+                ),
                 remaining_entries: Some((0..15).map(|i| format!("dir-{i:02}/")).collect()),
             }
             .render(),
@@ -89,6 +96,7 @@ fn worktree_errors_render() {
                 base_branch: Some("main".into()),
                 error: "fatal: '/tmp/repo.feature-y' already exists".into(),
                 command: None,
+                leftover_branch: false,
             }
             .render(),
         ),
@@ -104,6 +112,7 @@ fn worktree_errors_render() {
                     command: "git worktree add /tmp/repo.fix -b fix main".into(),
                     exit_info: "exit code 128".into(),
                 }),
+                leftover_branch: false,
             }
             .render(),
         ),
@@ -111,8 +120,47 @@ fn worktree_errors_render() {
             "worktree missing",
             GitError::WorktreeMissing {
                 branch: "stale-branch".into(),
+                repairable_at: None,
             }
             .render(),
+        ),
+        (
+            "worktree missing its .git, directory remaining at a path needing quotes",
+            GitError::WorktreeMissing {
+                branch: "stale-branch".into(),
+                repairable_at: Some(PathBuf::from("/tmp/my repo.stale-branch")),
+            }
+            .render(),
+        ),
+        (
+            "stale worktree holding staged changes",
+            GitError::StaleWorktreeHoldsWork {
+                branch: "stale-branch".into(),
+                path: PathBuf::from("/tmp/repo.stale-branch"),
+                directory_remains: true,
+                work: StaleWorktreeWork::StagedChanges,
+            }
+            .render(),
+        ),
+        (
+            "stale worktree mid-operation, directory gone, at a path needing quotes",
+            [
+                InProgressOperation::Merge,
+                InProgressOperation::Rebase,
+                InProgressOperation::CherryPick,
+                InProgressOperation::Revert,
+                InProgressOperation::Bisect,
+            ]
+            .map(|operation| {
+                GitError::StaleWorktreeHoldsWork {
+                    branch: "stale-branch".into(),
+                    path: PathBuf::from("/tmp/my repo.stale-branch"),
+                    directory_remains: false,
+                    work: StaleWorktreeWork::Operation(operation),
+                }
+                .render()
+            })
+            .join("\n"),
         ),
         (
             "no worktree at a leftover directory",
@@ -196,6 +244,7 @@ fn worktree_errors_render() {
                 branch: "feature".into(),
                 path: PathBuf::from("/tmp/repo.feature"),
                 create: false,
+                from_path_flag: false,
             }
             .render(),
         ),
@@ -368,22 +417,40 @@ fn integration_errors_render() {
 fn command_errors_render() {
     let hook_with_name = WorktrunkError::HookCommandFailed {
         hook_type: HookType::PreMerge,
+        source: worktrunk::config::HookSource::User,
+        template: Some("echo test".into()),
         command_name: Some("test".into()),
-        error: "exit code 1".into(),
-        exit_code: Some(1),
+        error: WorktrunkError::ChildProcessExited {
+            cancellation: None,
+            code: 1,
+            physical_signal: None,
+        }
+        .into(),
     };
     let hook_without_name = WorktrunkError::HookCommandFailed {
         hook_type: HookType::PreCreate,
+        source: worktrunk::config::HookSource::User,
+        template: Some("echo test".into()),
         command_name: None,
-        error: "command not found".into(),
-        exit_code: Some(127),
+        error: WorktrunkError::ChildProcessExited {
+            cancellation: None,
+            code: 127,
+            physical_signal: None,
+        }
+        .into(),
     };
     let hook_with_hint = add_hook_skip_hint(
         WorktrunkError::HookCommandFailed {
             hook_type: HookType::PreMerge,
+            source: worktrunk::config::HookSource::User,
+            template: Some("echo test".into()),
             command_name: Some("test".into()),
-            error: "exit code 1".into(),
-            exit_code: Some(1),
+            error: WorktrunkError::ChildProcessExited {
+                cancellation: None,
+                code: 1,
+                physical_signal: None,
+            }
+            .into(),
         }
         .into(),
     );
@@ -521,4 +588,145 @@ fn shell_init_remains_available_on_older_git() {
         "shell init must emit the Nushell integration:\n{}",
         String::from_utf8_lossy(&output.stdout)
     );
+}
+
+/// Errors before dispatch leave stdout empty and explain the failure on stderr.
+#[test]
+fn json_failure_before_dispatch() {
+    let (_mock_bin, mut cmd) = wt_with_git_version("git version 2.42.4");
+    let output = cmd.args(["list", "--format=json"]).output().unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("2.42.4"));
+}
+
+/// A dispatched command with no result leaves stdout empty on failure.
+#[test]
+fn json_failure_without_repository() {
+    let output = wt_command()
+        .args(["list", "--format=json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(!output.stderr.is_empty());
+}
+
+/// A display-only Git failure must not hide the commit already created.
+#[cfg(unix)]
+#[rstest::rstest]
+#[case::commit("commit", 0)]
+#[case::squash_staged_changes("squash", 0)]
+#[case::squash_commits("squash", 2)]
+fn json_outcome_retains_commit_after_display_failure(
+    #[case] command: &str,
+    #[case] commits_ahead: usize,
+) {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = crate::common::TestRepo::standard();
+    repo.run_git(&["checkout", "-b", "late-reporting"]);
+    for index in 0..commits_ahead {
+        repo.commit_in_worktree(
+            repo.root_path(),
+            "new.txt",
+            &format!("content {index}"),
+            &format!("feat: change {index}"),
+        );
+    }
+    assert_eq!(
+        repo.git_output(&["rev-list", "--count", "main..HEAD"]),
+        commits_ahead.to_string(),
+    );
+    let previous_head = repo.git_output(&["rev-parse", "HEAD"]);
+    if commits_ahead == 0 {
+        fs::write(repo.root_path().join("new.txt"), "new content").unwrap();
+    }
+
+    // Keep the real commit and full-OID lookup; fail only abbreviation for
+    // the success message, after the command has a complete result to retain.
+    let wrapper = test_tempdir();
+    let real_git = which::which("git").unwrap();
+    let script = format!(
+        r#"#!/bin/sh
+if [ "$1 $2" = 'rev-parse --short' ]; then
+  echo 'display abbreviation failed' >&2
+  exit 42
+fi
+exec {} "$@"
+"#,
+        shell_escape::unix::escape(real_git.to_string_lossy()),
+    );
+    let wrapper_git = wrapper.path().join("git");
+    fs::write(&wrapper_git, script).unwrap();
+    fs::set_permissions(&wrapper_git, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut paths = vec![wrapper.path().to_path_buf()];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let output = repo
+        .wt_command()
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env(
+            "WORKTRUNK_COMMIT__GENERATION__COMMAND",
+            "cat >/dev/null && echo 'feat: retained commit'",
+        )
+        .args(["step", command, "--format=json", "--no-hooks"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{output:?}");
+    let head = repo.git_output(&["rev-parse", "HEAD"]);
+    assert_ne!(head, previous_head, "the commit must have completed");
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["commit"], head, "{response}");
+    assert_eq!(response["message"], "feat: retained commit", "{response}");
+    assert_eq!(response["stage_mode"], "all", "{response}");
+    assert_eq!(repo.git_output(&["rev-list", "--count", "main..HEAD"]), "1");
+    if command == "squash" {
+        assert_eq!(response["outcome"], "squashed", "{response}");
+    }
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("display abbreviation failed"),
+        "{response}"
+    );
+}
+
+/// Post-commit template validation can fail after Git has created the commit.
+#[rstest::rstest]
+#[case::commit("commit")]
+#[case::merge("merge")]
+fn json_retains_committed_result_after_invalid_post_commit_hook(#[case] command: &str) {
+    let repo = crate::common::TestRepo::standard();
+    repo.run_git(&["checkout", "-b", "late-reporting"]);
+    let previous_head = repo.git_output(&["rev-parse", "HEAD"]);
+    std::fs::write(repo.root_path().join("new.txt"), "new content").unwrap();
+    repo.write_test_config("[post-commit]\ninvalid = 'echo {{ unclosed'\n");
+
+    let mut cmd = repo.wt_command();
+    if command == "commit" {
+        cmd.arg("step");
+    }
+    cmd.args([command, "--format=json"]);
+    if command == "merge" {
+        cmd.arg("--no-squash");
+    }
+    let output = cmd.output().unwrap();
+
+    assert!(!output.status.success(), "{output:?}");
+    let head = repo.git_output(&["rev-parse", "HEAD"]);
+    assert_ne!(head, previous_head, "the commit must have completed");
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    if command == "commit" {
+        assert_eq!(response["commit"], head, "{response}");
+    } else {
+        assert_eq!(response["committed"], true, "{response}");
+        assert_eq!(response["merged"], false, "{response}");
+        assert_eq!(repo.git_output(&["rev-parse", "main"]), previous_head);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("syntax error"), "{stderr}");
+    assert!(stderr.contains("post-commit"), "{stderr}");
 }

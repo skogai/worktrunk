@@ -2,15 +2,58 @@
 
 use std::path::{Path, PathBuf};
 
+fn git_path_from_bytes(bytes: &[u8]) -> std::io::Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())))
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows accepts Git's forward slashes; preserve its output spelling.
+        std::str::from_utf8(bytes)
+            .map(PathBuf::from)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+}
+
+/// Decode one path from Git output, preserving bytes before its final LF.
+fn git_path_from_output(bytes: &[u8]) -> std::io::Result<PathBuf> {
+    let path = bytes.strip_suffix(b"\n").ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Unterminated Git path output",
+        )
+    })?;
+    git_path_from_bytes(path)
+}
+
+/// Gitfiles and backlinks terminate paths with CR/LF, unlike command output.
+fn git_path_from_file(bytes: &[u8]) -> std::io::Result<PathBuf> {
+    let mut path = bytes;
+    while matches!(path.last(), Some(b'\n' | b'\r')) {
+        path = &path[..path.len() - 1];
+    }
+    if path.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Empty Git path",
+        ));
+    }
+    git_path_from_bytes(path)
+}
+
 // Submodules
 mod ci_platform;
 mod diff;
 mod error;
+pub(crate) use error::error_chain_message;
 pub mod fsmonitor;
 mod parse;
 #[cfg(unix)]
 pub mod reap;
 pub mod recover;
+mod ref_deletion;
 pub mod remote_ref;
 pub mod remove;
 mod repository;
@@ -31,7 +74,7 @@ mod test;
 //
 // Heavy operations protected:
 // - git rev-list --count (accesses commit-graph via mmap)
-// - git diff --shortstat (accesses pack files and indexes via mmap)
+// - git diff-tree --shortstat (accesses pack files and indexes via mmap)
 use crate::path::canonicalize_with_parents;
 use crate::sync::Semaphore;
 use std::sync::LazyLock;
@@ -40,10 +83,28 @@ static HEAVY_OPS_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::ne
 /// The null OID returned by git when no commits exist (e.g., `git rev-parse HEAD` on an unborn branch).
 pub const NULL_OID: &str = "0000000000000000000000000000000000000000";
 
+/// Whether `dir` is itself a git directory — a bare repository, or the `.git`
+/// directory of a non-bare one.
+///
+/// Git's own `is_git_directory()` shape: a `HEAD`, an `objects/`, and a
+/// `refs/`. Read from disk rather than by asking git, because both callers ask
+/// about an arbitrary directory and git's own discovery answers *upward* — it
+/// would report on some enclosing repository instead of saying "not one here".
+///
+/// Deliberately shallow: git additionally validates what `HEAD` contains, and
+/// a false positive costs each caller little — one withholds a claim, the
+/// other still has to find the deleted path in the candidate's own worktree
+/// list before it recovers. [`Repository::at`] is not that check: discovering
+/// upward, it succeeds for a false positive that sits inside a real
+/// repository.
+pub(crate) fn is_bare_repo_dir(dir: &Path) -> bool {
+    dir.join("HEAD").is_file() && dir.join("objects").is_dir() && dir.join("refs").is_dir()
+}
+
 // Re-exports from submodules
 pub use ci_platform::ForgeKind;
 pub(crate) use diff::DiffStats;
-pub use diff::{LineDiff, parse_numstat_line};
+pub use diff::{LineDiff, PlumbingDiff, parse_numstat_line};
 pub use error::{
     // Typed leaf error for buffered command-runner failures (downcast target)
     CommandError,
@@ -69,6 +130,7 @@ pub use error::{
     add_hook_skip_hint,
     // Shared phrasing for an unmerged index ("1 path with unresolved conflicts")
     format_unresolved_conflicts,
+    process_exit_description,
     // Render a single error via Diagnostic if it implements one
     try_render_diagnostic,
 };
@@ -76,19 +138,20 @@ pub use parse::{parse_porcelain_z, parse_untracked_files};
 pub use recover::{current_or_recover, cwd_removed_hint};
 pub use remove::{
     BranchDeletionMode, BranchDeletionOutcome, BranchDeletionResult, RemovalOutput, RemoveOptions,
-    delete_branch_if_safe, execute_branch_deletion, remove_worktree_with_cleanup,
-    stage_worktree_removal, stop_fsmonitor_daemon,
+    delete_branch_if_safe, drain_trash, execute_branch_deletion, remove_worktree_with_cleanup,
+    stage_worktree_removal, staged_trash_entries, stop_fsmonitor_daemon, trash_drain_running,
 };
 pub use repository::sha_cache;
 pub use repository::{
     Branch, BranchDiffSpec, CommitMessageDetail, InProgressOperation, IntegrationTargets,
-    PreparedDiff, RefSnapshot, Repository, ResolvedWorktree, Selector, TempIndex, WorkingTree,
-    duplicated_branches, is_valid_branch_name, normalize_selector, resolve_input_path,
-    select_comparison_base, set_base_path,
+    PreparedDiff, RefSnapshot, Repository, ResolvedWorktree, SafetyBackup, Selector,
+    StaleWorktreeWork, TempIndex, WorkingTree, base_path, duplicated_branches,
+    is_valid_branch_name, normalize_selector, resolve_input_path, select_comparison_base,
+    set_base_path,
 };
 pub use url::parse_owner_repo;
 pub use url::{GitRemoteUrl, GitRepoInfo, GitRepoProvider};
-pub(crate) use url::{canonical_url_path_segment, url_path_segments_eq};
+pub(crate) use url::{canonical_url_path_segment, legacy_project_identifier, url_path_segments_eq};
 pub use version::{git_version, require_minimum_git};
 
 /// Why branch content is considered integrated into the target branch.
@@ -253,7 +316,7 @@ pub fn check_integration(signals: &IntegrationSignals) -> Option<IntegrationReas
 /// For batch operations, use parallel tasks to build [`IntegrationSignals`] directly.
 ///
 /// Resolves both `branch` and `target` to commit SHAs via `snapshot` so the
-/// integration probes are immune to ambient ref→SHA cache staleness — this
+/// integration probes read the ref state the caller captured — this
 /// is the safety contract that lets `wt merge`'s post-update-ref check
 /// observe the new local target SHA instead of the pre-merge value.
 /// Refs not in the snapshot (typically transient HEAD commits during a
@@ -361,6 +424,13 @@ pub struct LocalBranch {
     /// `None` when no upstream is set, or when the configured upstream is gone
     /// (git reports `[gone]` via `%(upstream:track)`).
     pub upstream_short: Option<String>,
+    /// Configured upstream remote, from `%(upstream:remotename)`.
+    /// `None` for local tracking (`.`) or when no remote is configured.
+    pub upstream_remote: Option<String>,
+    /// Where this branch pushes, from `%(push:remotename)`: a remote name, or a
+    /// URL when `branch.<name>.pushRemote` is one (`gh pr checkout` sets that
+    /// for a fork's PR). `None` when no push remote is configured.
+    pub push_remote: Option<String>,
 }
 
 /// A single remote-tracking branch entry from the branch inventory.
@@ -533,7 +603,7 @@ impl HookType {
 /// - From a worktree: `worktree_info.worktree_ref()` and then
 ///   [`WorktreeRef::into_branch_ref()`]
 /// - For a local branch: `BranchRef::local_branch("feature", "abc123")`
-/// - For a remote branch: `BranchRef::remote_branch("origin/feature", "abc123")`
+/// - For a remote branch: `BranchRef::remote_branch("origin", "feature", "abc123")`
 ///
 /// # Working Tree Access
 ///
@@ -558,6 +628,8 @@ pub struct BranchRef {
     /// Path to worktree, if this branch has one.
     /// None for branch-only items (remote branches, local branches without worktrees).
     worktree_path: Option<PathBuf>,
+    /// Byte offset of the remote/branch separator in the short name.
+    remote_name_len: Option<usize>,
 }
 
 /// Canonical snapshot of a registered worktree.
@@ -662,21 +734,25 @@ impl BranchRef {
             full_ref: Some(full_ref),
             commit_sha: commit_sha.to_string(),
             worktree_path: None,
+            remote_name_len: None,
         }
     }
 
     /// Create a BranchRef for a remote-tracking branch.
     ///
-    /// `branch` is the short remote-qualified name (e.g., `"origin/feature"`),
-    /// as produced by `%(refname:lstrip=2)` in `list_remote_branches`. It is
-    /// stored as `refs/remotes/<branch>`.
-    pub fn remote_branch(branch: &str, commit_sha: &str) -> Self {
-        let full_ref = remote_ref(branch);
+    /// `remote_name` and `branch` come from the remote-branch inventory, which
+    /// resolves their boundary against configured remote names. Keeping them
+    /// separate here avoids reparsing ambiguous names such as
+    /// `"team/fork/feature"`.
+    pub fn remote_branch(remote_name: &str, branch: &str, commit_sha: &str) -> Self {
+        let short_name = format!("{remote_name}/{branch}");
+        let full_ref = remote_ref(&short_name);
         Self {
-            id: GitItemId::remote_branch(branch),
+            id: GitItemId::remote_branch(&short_name),
             full_ref: Some(full_ref),
             commit_sha: commit_sha.to_string(),
             worktree_path: None,
+            remote_name_len: Some(remote_name.len()),
         }
     }
 
@@ -733,9 +809,14 @@ impl BranchRef {
 
     /// True if this is a remote-tracking ref (under `refs/remotes/`).
     pub fn is_remote(&self) -> bool {
-        self.full_ref
-            .as_deref()
-            .is_some_and(|r| r.starts_with("refs/remotes/"))
+        self.remote_name_len.is_some()
+    }
+
+    /// Remote and branch components of a remote-tracking ref.
+    pub fn remote_parts(&self) -> Option<(&str, &str)> {
+        let short = self.short_name()?;
+        let boundary = self.remote_name_len?;
+        Some((&short[..boundary], &short[boundary + 1..]))
     }
 }
 
@@ -749,6 +830,7 @@ impl WorktreeRef {
             full_ref: branch.map(local_ref),
             commit_sha: commit_sha.to_string(),
             worktree_path: Some(path),
+            remote_name_len: None,
         })
     }
 
@@ -801,17 +883,19 @@ impl WorktreeInfo {
 
     /// Build the canonical worktree subject for this inventory entry.
     pub fn worktree_ref(&self) -> WorktreeRef {
-        // `branch` is the short form produced by `parse_porcelain_list` (one
+        // `branch` is the short form produced by `parse_porcelain_list_z` (one
         // `refs/heads/` prefix stripped). Re-qualifying it in the worktree
         // constructor preserves even a pathological branch literally named
         // `refs/heads/foo` as `refs/heads/refs/heads/foo`.
         WorktreeRef::new(self.path.clone(), self.branch.as_deref(), &self.head)
     }
 
-    /// Returns true if this worktree is prunable (directory deleted but git still tracks metadata).
+    /// Returns true if git reports this worktree prunable: the `.git` its
+    /// registration names is gone, with the directory or without it.
     ///
-    /// Prunable worktrees cannot be operated on - the directory doesn't exist.
-    /// Most iteration over worktrees should skip prunable ones.
+    /// Prunable worktrees cannot be operated on — git no longer resolves the
+    /// directory, if one remains, as this worktree. Most iteration over
+    /// worktrees should skip prunable ones.
     pub fn is_prunable(&self) -> bool {
         self.prunable.is_some()
     }
@@ -836,17 +920,13 @@ impl WorktreeInfo {
 // Helper functions for worktree parsing
 //
 // These live in mod.rs rather than parse.rs because they bridge multiple concerns:
-// - read_rebase_branch() uses Repository (from repository.rs) to access git internals
-// - finalize_worktree() operates on WorktreeInfo (defined here in mod.rs)
-// - Both are tightly coupled to the WorktreeInfo type definition
+// - finalize_worktrees() uses Repository (from repository.rs) to access git internals
+// - it operates on WorktreeInfo (defined here in mod.rs)
 //
 // Placing them here avoids circular dependencies and keeps them close to WorktreeInfo.
 
-/// Helper function to read rebase branch information
-fn read_rebase_branch(worktree_path: &PathBuf) -> Option<String> {
-    let repo = Repository::current().ok()?;
-    let git_dir = repo.worktree_at(worktree_path).git_dir().ok()?;
-
+/// The branch a rebase in this git dir is rewriting, from `head-name`.
+fn rebase_branch(git_dir: &Path) -> Option<String> {
     // Check both rebase-merge and rebase-apply
     for rebase_dir in ["rebase-merge", "rebase-apply"] {
         let head_name_path = git_dir.join(rebase_dir).join("head-name");
@@ -864,16 +944,43 @@ fn read_rebase_branch(worktree_path: &PathBuf) -> Option<String> {
     None
 }
 
-/// Finalize a worktree after parsing, filling in branch name from rebase state if needed.
-pub(crate) fn finalize_worktree(mut wt: WorktreeInfo) -> WorktreeInfo {
-    // If detached but no branch, check if we're rebasing
-    if wt.detached
-        && wt.branch.is_none()
-        && let Some(branch) = read_rebase_branch(&wt.path)
-    {
-        wt.branch = Some(branch);
+/// Finalize worktrees after parsing: a detached worktree mid-rebase takes the
+/// name of the branch it is rebasing.
+///
+/// `git worktree list` reports a rebasing worktree only as `detached`, so each
+/// detached worktree needs its own `git rev-parse --git-dir` to find its rebase
+/// state. [`WorkingTree::git_dirs`] runs those forks concurrently as child
+/// processes rather than on a thread pool: this runs inside the
+/// `list_worktrees` cache initializer, and a pool thread waiting there would
+/// run other pool jobs, one of which could wait on the same cache.
+///
+/// A stale (prunable) entry's rebase state is read from its registration
+/// instead. With its `.git` gone, a `rev-parse` from its path finds nothing
+/// there and walks up to whatever repository encloses the directory — for a
+/// worktree nested in the main one, the main worktree's git dir — and would
+/// name the entry after a rebase that is not its own.
+pub(crate) fn finalize_worktrees(repo: &Repository, worktrees: &mut [WorktreeInfo]) {
+    let (stale, mut detached): (Vec<&mut WorktreeInfo>, Vec<&mut WorktreeInfo>) = worktrees
+        .iter_mut()
+        .filter(|wt| wt.detached && wt.branch.is_none())
+        .partition(|wt| wt.is_prunable());
+    for wt in stale {
+        if let Ok((registration, _)) = repo.registration_at(&wt.path) {
+            wt.branch = rebase_branch(&registration);
+        }
     }
-    wt
+    if detached.is_empty() {
+        return;
+    }
+    let trees: Vec<WorkingTree<'_>> = detached
+        .iter()
+        .map(|wt| repo.worktree_at(&wt.path))
+        .collect();
+    for (wt, git_dir) in detached.iter_mut().zip(WorkingTree::git_dirs(&trees)) {
+        if let Ok(git_dir) = git_dir {
+            wt.branch = rebase_branch(&git_dir);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1096,10 +1203,11 @@ mod tests {
 
     #[test]
     fn test_branch_ref_remote_branch() {
-        let branch_ref = BranchRef::remote_branch("origin/feature", "abc123");
+        let branch_ref = BranchRef::remote_branch("origin", "feature", "abc123");
 
         assert_eq!(branch_ref.full_ref(), Some("refs/remotes/origin/feature"));
         assert_eq!(branch_ref.short_name(), Some("origin/feature"));
+        assert_eq!(branch_ref.remote_parts(), Some(("origin", "feature")));
         assert_eq!(branch_ref.commit_sha, "abc123");
         assert_eq!(branch_ref.worktree_path, None);
         assert!(branch_ref.worktree_path().is_none());
@@ -1115,7 +1223,7 @@ mod tests {
         // `git rev-parse` picking the wrong ref lives at
         // `test_list_remote_row_not_shadowed_by_same_named_local_branch` in
         // `tests/integration_tests/list.rs`.
-        let remote = BranchRef::remote_branch("origin/foo", "abc");
+        let remote = BranchRef::remote_branch("origin", "foo", "abc");
         let local = BranchRef::local_branch("origin/foo", "def");
 
         assert_eq!(remote.full_ref(), Some("refs/remotes/origin/foo"));
@@ -1152,7 +1260,7 @@ mod tests {
         // A short name is presentation; the full ref is identity.
         assert_ne!(
             BranchRef::local_branch("origin/foo", "abc").id(),
-            BranchRef::remote_branch("origin/foo", "abc").id()
+            BranchRef::remote_branch("origin", "foo", "abc").id()
         );
     }
 

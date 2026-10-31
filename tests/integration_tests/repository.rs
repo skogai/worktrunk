@@ -3,8 +3,10 @@
 use std::fs;
 use std::path::Path;
 
-use worktrunk::git::{InProgressOperation, RefType, Repository};
+use path_slash::PathExt as _;
+use worktrunk::git::{InProgressOperation, PlumbingDiff, RefType, Repository};
 
+use crate::common::source_scan::visit_files;
 use crate::common::{BareRepoTest, TestRepo};
 
 // =============================================================================
@@ -352,8 +354,168 @@ fn test_project_identifier_ssh_protocol_with_port() {
 
     let repository = Repository::at(repo.root_path().to_path_buf()).unwrap();
     let id = repository.project_identifier().unwrap();
-    // Port is stripped — irrelevant to project identity
-    assert_eq!(id, "gitlab.example.com/team/project");
+    // An explicit SSH port names a different server, so it is part of the identity
+    assert_eq!(id, "gitlab.example.com:2222/team/project");
+}
+
+/// The project identifier of a repository whose `origin` is `url`.
+fn project_identifier_for_remote(url: &str) -> worktrunk::config::ProjectId {
+    let mut repo = TestRepo::with_initial_commit();
+    repo.setup_remote("main");
+    repo.git_command()
+        .args(["remote", "set-url", "origin", url])
+        .run()
+        .unwrap();
+    Repository::at(repo.root_path().to_path_buf())
+        .unwrap()
+        .project_identifier()
+        .unwrap()
+}
+
+/// Distinct IPv6 hosts once both truncated to `[2001/owner/repo`, sharing
+/// saved approvals and `[projects]` settings.
+#[test]
+fn test_project_identifier_ipv6_hosts_are_distinct() {
+    let first = project_identifier_for_remote("ssh://git@[2001:db8::1]/owner/repo.git");
+    let second = project_identifier_for_remote("ssh://git@[2001:db8::2]/owner/repo.git");
+    assert_eq!(first, "[2001:db8::1]/owner/repo");
+    assert_eq!(second, "[2001:db8::2]/owner/repo");
+}
+
+/// The identifier selects both saved approvals and `[projects]` settings. The
+/// ordinary SSH and HTTPS forms of one project share one entry. A remote on a
+/// non-default SSH port must not inherit entries for the default port.
+#[test]
+fn test_project_identifier_selects_approvals_and_project_settings() {
+    use worktrunk::config::{Approvals, UserConfig};
+
+    let ported =
+        project_identifier_for_remote("ssh://git@gitlab.example.com:2222/team/project.git");
+    let default_port =
+        project_identifier_for_remote("ssh://git@gitlab.example.com:22/team/project.git");
+    let https = project_identifier_for_remote("https://gitlab.example.com/team/project.git");
+    assert_eq!(ported, "gitlab.example.com:2222/team/project");
+    assert_eq!(ported.legacy(), None);
+    assert_eq!(default_port, "gitlab.example.com/team/project");
+    assert_eq!(default_port.legacy(), None);
+    assert_eq!(https, default_port);
+
+    let approvals: Approvals = toml::from_str(
+        r#"
+[projects."gitlab.example.com/team/project"]
+approved-commands = ["npm install"]
+
+[projects."gitlab.example.com:2222/team/project"]
+approved-commands = ["npm test"]
+"#,
+    )
+    .unwrap();
+    assert!(approvals.is_command_approved(&https, "npm install"));
+    assert!(!approvals.is_command_approved(&https, "npm test"));
+    assert!(!approvals.is_command_approved(&ported, "npm install"));
+    assert!(approvals.is_command_approved(&ported, "npm test"));
+
+    let config: UserConfig = toml::from_str(
+        r#"
+worktree-path = "global"
+
+[projects."gitlab.example.com/team/project"]
+worktree-path = "default-port"
+"#,
+    )
+    .unwrap();
+    assert_eq!(config.worktree_path_for_project(&https), "default-port");
+    assert_eq!(config.worktree_path_for_project(&ported), "global");
+
+    let config: UserConfig = toml::from_str(
+        r#"
+[projects."gitlab.example.com/team/project"]
+worktree-path = "default-port"
+
+[projects."gitlab.example.com:2222/*"]
+worktree-path = "port-2222"
+"#,
+    )
+    .unwrap();
+    assert_eq!(config.worktree_path_for_project(&ported), "port-2222");
+}
+
+/// Approvals and `[projects]` settings saved under the identifier v0.80.0 gave
+/// a remote keep applying after its identifier changed: a non-interactive
+/// `wt switch --create` runs the approved hook, in the worktree path the
+/// legacy entry names.
+#[rstest::rstest]
+#[case::uppercase_host("git@GitHub.com:team/app.git", "GitHub.com/team/app")]
+#[case::git_plus_ssh(
+    "git+ssh://git@github.com/team/app.git",
+    "git+ssh://git@github.com/team/app"
+)]
+fn test_switch_honors_entries_under_legacy_identifier(#[case] url: &str, #[case] legacy: &str) {
+    let mut repo = TestRepo::with_initial_commit();
+    repo.setup_remote("main");
+    repo.git_command()
+        .args(["remote", "set-url", "origin", url])
+        .run()
+        .unwrap();
+    repo.write_project_config(r#"pre-start = "echo ran > hook-ran.txt""#);
+    repo.commit("Add config");
+    repo.write_test_config(&format!(
+        "[projects.'{legacy}']\nworktree-path = \"{{{{ repo_path }}}}/../legacy.{{{{ branch }}}}\"\n"
+    ));
+    repo.write_test_approvals(&format!(
+        "[projects.'{legacy}']\napproved-commands = [\"echo ran > hook-ran.txt\"]\n"
+    ));
+
+    let output = repo
+        .wt_command()
+        .args(["switch", "--create", "feature"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let worktree = repo.root_path().parent().unwrap().join("legacy.feature");
+    assert!(worktree.join("hook-ran.txt").exists());
+}
+
+/// A port-less approval cannot authorize an alias on a different SSH server.
+#[test]
+fn test_project_alias_approval_respects_ssh_port() {
+    let mut repo = TestRepo::with_initial_commit();
+    repo.setup_remote("main");
+    repo.git_command()
+        .args([
+            "remote",
+            "set-url",
+            "origin",
+            "ssh://git@host.example:2222/o/r.git",
+        ])
+        .run()
+        .unwrap();
+    repo.write_project_config(
+        r#"[aliases]
+probe = "echo ran > alias-ran.txt"
+"#,
+    );
+    for (key, allowed) in [
+        ("host.example/o/r", false),
+        ("host.example/*", false),
+        ("host.example:2222/o/r", true),
+    ] {
+        repo.write_test_approvals(&format!(
+            "[projects.'{key}']\napproved-commands = [\"echo ran > alias-ran.txt\"]\n"
+        ));
+        let output = repo.wt_command().arg("probe").output().unwrap();
+        assert_eq!(
+            output.status.success(),
+            allowed,
+            "key: {key}, stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(repo.root_path().join("alias-ran.txt").exists(), allowed);
+    }
 }
 
 #[test]
@@ -589,11 +751,11 @@ fn test_switch_previous_roundtrip() {
     // Populate the cache first to hit the in-memory update branch.
     let _ = r.is_bare();
     assert_eq!(r.switch_previous(), None);
-    r.set_switch_previous(Some("feature-a")).unwrap();
+    r.set_switch_previous("feature-a").unwrap();
     assert_eq!(r.switch_previous(), Some("feature-a".to_string()));
-    // `None` is a no-op — doesn't clear.
-    r.set_switch_previous(None).unwrap();
-    assert_eq!(r.switch_previous(), Some("feature-a".to_string()));
+    assert!(r.clear_switch_previous().unwrap());
+    assert_eq!(r.switch_previous(), None);
+    assert!(!r.clear_switch_previous().unwrap());
 }
 
 /// `primary_remote_url` composes `primary_remote` + `remote_url`,
@@ -1206,6 +1368,88 @@ fn test_sparse_checkout_paths_cached() {
     assert_eq!(first, &["dir1".to_string()]);
 }
 
+/// `submodule.<name>.ignore = all` hides gitlink changes even from plumbing,
+/// so the diffs `wt` reads override it: a branch that only moves a submodule
+/// still has changes.
+#[test]
+fn test_submodule_bump_survives_submodule_ignore() {
+    let repo = TestRepo::new();
+    fs::write(
+        repo.root_path().join(".gitmodules"),
+        "[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n",
+    )
+    .unwrap();
+    repo.run_git(&["add", ".gitmodules"]);
+    repo.run_git(&["commit", "--message", "add .gitmodules"]);
+    let first = repo.git_output(&["rev-parse", "HEAD"]);
+    let gitlink = |sha: &str| format!("160000,{sha},sub");
+    repo.run_git(&["update-index", "--add", "--cacheinfo", &gitlink(&first)]);
+    repo.run_git(&["commit", "--message", "add submodule"]);
+    repo.run_git(&["switch", "--create", "feature"]);
+    let second = repo.git_output(&["rev-parse", "HEAD"]);
+    repo.run_git(&["update-index", "--cacheinfo", &gitlink(&second)]);
+    repo.run_git(&["commit", "--message", "bump submodule"]);
+    repo.run_git(&["switch", "main"]);
+    repo.run_git(&["config", "submodule.sub.ignore", "all"]);
+    let main_sha = repo.git_output(&["rev-parse", "main"]);
+    let feature_sha = repo.git_output(&["rev-parse", "feature"]);
+    let repository = Repository::at(repo.root_path().to_path_buf()).unwrap();
+
+    assert!(
+        repository
+            .has_added_changes_by_sha(&feature_sha, &main_sha)
+            .unwrap()
+    );
+    assert_eq!(
+        repository.changed_files(&main_sha, &feature_sha).unwrap(),
+        [b"sub".to_vec()]
+    );
+    let stats = repository.branch_diff_stats("main", "feature").unwrap();
+    assert_eq!((stats.added, stats.deleted), (1, 1));
+    assert!(
+        repository
+            .prepare_diff(&main_sha, &feature_sha)
+            .capture(["--name-only"])
+            .unwrap()
+            .contains("sub")
+    );
+}
+
+/// `PlumbingDiff::args` is the one place that spells a plumbing diff command,
+/// so no diff under `src/` or `tests/` can skip its submodule override. The
+/// needles come from `PlumbingDiff` too, so this guard spells none of them.
+#[test]
+fn test_plumbing_diffs_are_built_by_plumbing_diff() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let builder = root.join("src").join("git").join("diff.rs");
+    let needles = [PlumbingDiff::Tree, PlumbingDiff::Index, PlumbingDiff::Files]
+        .map(|diff| format!("\"{}\"", diff.args(&[])[0]));
+    let mut offenders = Vec::new();
+    for dir in ["src", "tests"] {
+        let scanned = visit_files(
+            &root.join(dir),
+            "rs",
+            "plumbing-diff scan",
+            &mut |path, contents| {
+                for needle in &needles {
+                    if path != builder && contents.contains(needle.as_str()) {
+                        let relative = path.strip_prefix(root).unwrap().to_slash_lossy();
+                        offenders.push(format!("{relative} spells {needle}"));
+                    }
+                }
+            },
+        );
+        assert!(
+            scanned > 0,
+            "the plumbing-diff scan read no files under {dir}"
+        );
+    }
+    assert!(
+        offenders.is_empty(),
+        "build these with PlumbingDiff::args: {offenders:#?}"
+    );
+}
+
 #[test]
 fn test_branch_diff_stats_scoped_to_sparse_checkout() {
     let repo = TestRepo::new();
@@ -1239,6 +1483,18 @@ fn test_branch_diff_stats_scoped_to_sparse_checkout() {
     // inside/file.txt: "base content\n" → "modified inside\nadded line\n" = 2 added, 1 deleted
     assert_eq!(stats.added, 2, "sparse: only inside/ additions");
     assert_eq!(stats.deleted, 1, "sparse: only inside/ deletions");
+
+    // The sparse paths are root-relative, so discovery from a subdirectory
+    // counts the same changes.
+    let nested_stats = Repository::at(inside.clone())
+        .unwrap()
+        .branch_diff_stats("main", "feature")
+        .unwrap();
+    assert_eq!(
+        (nested_stats.added, nested_stats.deleted),
+        (2, 1),
+        "sparse: discovered from inside/"
+    );
 
     // Disable sparse checkout — full stats include both inside/ and outside/
     repo.run_git(&["sparse-checkout", "disable"]);

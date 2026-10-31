@@ -3,20 +3,27 @@
 //! Live-path concurrency: candidate checks fan out on the rayon pool and
 //! stream results to the main thread, which queues per-candidate jobs
 //! (removals and skip lines) in scan-completion order onto a worker pool
-//! sized like rayon's ([`RemovalJob`]). Checks and hook-free removals hold
-//! the read side of [`RemovalContext::check_lock`] and run concurrently; the
-//! exceptional removals serialize on the write side
-//! ([`removal_needs_write`]). Repository operations coordinate the narrower
+//! sized like rayon's ([`RemovalJob`]). Checks, background removals, and
+//! their pre-remove hooks run concurrently. The output lock excludes other
+//! removals and skip messages only while foreground/current removals own
+//! terminal output ([`removal_needs_write`]).
+//! Repository operations coordinate the narrower
 //! Git worktree-registry reads and teardowns themselves, so status checks,
 //! fsmonitor shutdown, and trash renames still overlap. One FIFO queue carrying
 //! both removals and skip lines means a single worker (`RAYON_NUM_THREADS=1`)
 //! reproduces the serial total order the deterministic-output tests pin. The
 //! first failing removal
 //! flips an abort flag that drains the remaining queue unexecuted; the
+//! command's cancellation latch also stops admission before an interrupted
+//! sibling's cleanup completes. The
 //! current worktree is removed last, after the fan-out, because its removal
-//! cd's the shell to the primary.
+//! cd's the shell to the primary. Completed removals travel with execution
+//! errors through the worker channel, so aborting a scan or removal preserves
+//! confirmed results in the final command response.
 
-use std::collections::HashSet;
+use crate::commands::command_executor::ForegroundStdin;
+
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
@@ -28,7 +35,7 @@ use color_print::cformat;
 use crossbeam_channel as chan;
 use rayon::prelude::*;
 use worktrunk::HookType;
-use worktrunk::config::{Approvals, ProjectConfig, UserConfig};
+use worktrunk::config::{Approvals, ProjectConfig, ProjectId, UserConfig};
 use worktrunk::git::{
     BranchDeletionMode, IntegrationReason, RefSnapshot, Repository, WorktreeInfo,
 };
@@ -38,13 +45,26 @@ use worktrunk::styling::{
 };
 use worktrunk::trace::Span;
 
-use crate::output::print_json;
+use crate::output::{CommandFailure, CommandResult, print_json};
 
 use super::super::hook_plan::{ApprovedHookPlan, HookPlan, HookPlanBuilder};
 use super::super::hooks::HookAnnouncer;
 use super::super::repository_ext::{RemoveTarget, RepositoryCliExt};
 use super::super::worktree::{BranchFate, RemovalPlan};
 use crate::output::{BackgroundFallbackMode, RemovalExecution, handle_remove_output};
+
+/// Stop queued removals and retain cancellation independently of which error
+/// supplies the command's diagnostic. Captures do not publish this themselves.
+fn abort_removals(_error: &anyhow::Error, abort: &AtomicBool) {
+    #[cfg(unix)]
+    {
+        use worktrunk::git::ErrorExt as _;
+        if let Some(signal) = _error.interrupt_signal() {
+            worktrunk::signal_forwarder::cancel_foreground(signal);
+        }
+    }
+    abort.store(true, Ordering::Relaxed);
+}
 
 /// A candidate worktree or branch selected for removal.
 #[derive(Clone)]
@@ -144,7 +164,7 @@ impl CandidateKind {
 
 /// Where a candidate originated, used to drive integration checks and dry-run labels.
 enum CheckSource {
-    /// Worktree with directory gone (prunable)
+    /// Stale worktree entry: git calls it prunable once its `.git` is gone
     Prunable { wt_idx: usize },
     /// Linked worktree
     Linked { wt_idx: usize },
@@ -233,38 +253,16 @@ struct RemovalContext<'a> {
     repo: &'a Repository,
     foreground: bool,
     hook_plan: &'a ApprovedHookPlan,
-    /// Coordinates the parallel workers (scan checks and removals, both on
-    /// the read side) against the few removals that need exclusivity (write
-    /// side — see [`removal_needs_write`]).
-    ///
-    /// The lock exists for the Windows `.git/config` race: git rewrites
-    /// config via lockfile + atomic rename, and a concurrent reader's plain
-    /// `fopen` fails on the rename (#2801). Historically every removal held
-    /// the write side because branch deletion was `git branch -D`, which
-    /// rewrites `.git/config` (it drops the `[branch "<name>"]` section —
-    /// even when none exists). The removal chain has since moved to the CAS
-    /// `git update-ref -d`, and neither it nor `git worktree remove` (both the
-    /// scoped metadata prune and the rename-failure fallback) touches
-    /// `.git/config`, so hook-free removals never rewrite it and can run
-    /// concurrently. Verified empirically: with `.git/config` made immutable,
-    /// only `git branch -D` reports `could not write config file`.
-    /// (`git branch -D` remains reachable only via `delete_branch_if_safe`'s
-    /// force arm, which prune never uses, and its snapshot-miss arm,
-    /// unreachable here because the chain captures the snapshot immediately
-    /// before consulting it.)
-    check_lock: &'a RwLock<()>,
+    /// Keeps background removal output and skip messages out of a foreground
+    /// spinner's terminal window. Shared guards do not serialize background
+    /// removals or their hooks. Repository mutation coordination belongs to
+    /// the registry accessors and the safe-ref deletion coordinator.
+    output_lock: &'a RwLock<()>,
 }
 
-/// Which removals must hold the write side of [`RemovalContext::check_lock`]
+/// Which removals must hold the write side of [`RemovalContext::output_lock`]
 /// instead of joining the parallel (read-side) fan-out:
 ///
-/// - **Hook-bearing worktree removals** — the `pre-remove` body runs
-///   foreground here, and hook bodies are arbitrary commands (`git branch
-///   -D`, `git config`, anything), so it keeps the exclusion every removal
-///   had before removals parallelized; the write side also keeps the hook
-///   stream and announce lines from interleaving with other candidates'
-///   output. (`post-remove`/`post-switch` pipelines spawn detached and
-///   always ran outside the lock.)
 /// - **`--foreground` worktree removals** — the foreground path runs a TTY
 ///   trash-cleanup spinner, and concurrent spinners would fight over the
 ///   cursor.
@@ -276,30 +274,24 @@ struct RemovalContext<'a> {
 /// a hook body nor a spinner, whatever selected it. `StaleDetached` never
 /// reaches here — [`try_remove`] prunes its entry and returns.
 ///
-/// Everything else fans out on the read side. The Git worktree-registry calls
-/// inside those removals take their own repository-scoped lock; see
-/// [`prune_worktree_entry`](Repository::prune_worktree_entry).
+/// Everything else fans out on the read side, including pre-remove hooks.
+/// The Git worktree-registry calls inside those removals take their own
+/// repository-scoped lock; see [`prune_worktree_entry`](Repository::prune_worktree_entry).
+/// Safe branch deletions serialize ref mutation independently of terminal output.
 fn removal_needs_write(kind: CandidateKind, plan: &RemovalPlan, ctx: &RemovalContext<'_>) -> bool {
     if matches!(kind, CandidateKind::Current) {
         return true;
     }
     match plan {
-        // The worktree whose `pre-remove` body and trash-cleanup spinner this
-        // removal runs.
-        RemovalPlan::Worktree { worktree_path, .. } => {
-            ctx.foreground
-                || ctx
-                    .hook_plan
-                    .has_hooks_for(worktree_path, &[HookType::PreRemove, HookType::PostRemove])
-        }
+        // The foreground worktree cleanup owns the terminal spinner.
+        RemovalPlan::Worktree { .. } => ctx.foreground,
         RemovalPlan::BranchOnly { .. } => false,
     }
 }
 
-/// Try to remove a candidate immediately. Returns `Ok(Some(fate))` if removed
-/// — the executed outcome the summary counts and `--format=json` names —
-/// `Ok(None)` if the removal turned out to be a no-op, `Err` on execution
-/// error.
+/// Try to remove a candidate immediately. A confirmed removal returns its fate,
+/// including through a late hook failure; a successful no-op returns `None`.
+/// The caller carries completion and execution error together.
 ///
 /// `plan` is the scan-time `prepare_worktree_removal` result from
 /// [`check_one`]; only `StaleDetached` candidates arrive without one (their
@@ -312,18 +304,37 @@ fn try_remove(
     candidate: &Candidate,
     plan: Option<RemovalPlan>,
     ctx: &RemovalContext<'_>,
-) -> anyhow::Result<Option<BranchFate>> {
+) -> CommandResult<Option<BranchFate>> {
     let _span = Span::new(format!("prune-remove:{}", candidate.label));
 
+    // Cancellation may arrive while this admitted job waits for terminal output.
+    // Check after acquiring it, before either stale-entry or planned mutation.
+    let needs_write = plan
+        .as_ref()
+        .is_some_and(|plan| removal_needs_write(candidate.kind, plan, ctx));
+    // These guards protect (), so poison cannot corrupt shared data.
+    let (_read, _write) = if needs_write {
+        (
+            None,
+            Some(ctx.output_lock.write().unwrap_or_else(|e| e.into_inner())),
+        )
+    } else {
+        (
+            Some(ctx.output_lock.read().unwrap_or_else(|e| e.into_inner())),
+            None,
+        )
+    };
+    #[cfg(unix)]
+    if let Some(signal) = worktrunk::signal_forwarder::operation_interrupt_signal() {
+        return Err(worktrunk::git::WorktrunkError::Interrupted { signal, hint: None }.into());
+    }
+
     if matches!(candidate.kind, CandidateKind::StaleDetached) {
-        // Output side: no exclusive output here (no spinner, no hook stream),
-        // so join the parallel read side of `check_lock`.
-        let _read = ctx.check_lock.read().unwrap_or_else(|e| e.into_inner());
         // Name the stale entry rather than sweeping the repository, so a
         // sibling whose directory is merely absent right now (unmounted
         // volume, half-finished `mv`) keeps its registration. `gather_check_items`
-        // never selects a locked worktree, so the scoped removal can't hit
-        // git's lock refusal.
+        // never selects a locked worktree, so the prune refuses one only when
+        // the lock was taken after the scan.
         let path = candidate
             .path
             .as_deref()
@@ -334,23 +345,6 @@ fn try_remove(
     }
 
     let plan = plan.context("candidate arrived without a removal plan")?;
-    // Read side for the parallel default, write side for the exclusive cases
-    // (see `removal_needs_write`). The guards protect `()` — there is no
-    // shared state to corrupt, so a poisoned lock is meaningless here.
-    // Recover the guard rather than `.expect()`-ing: a panic elsewhere should
-    // surface as itself, not as a cascade of secondary poison panics on every
-    // later removal/reader.
-    let (_read, _write) = if removal_needs_write(candidate.kind, &plan, ctx) {
-        (
-            None,
-            Some(ctx.check_lock.write().unwrap_or_else(|e| e.into_inner())),
-        )
-    } else {
-        (
-            Some(ctx.check_lock.read().unwrap_or_else(|e| e.into_inner())),
-            None,
-        )
-    };
     let mut announcer = HookAnnouncer::new(ctx.repo, true);
     // `SynchronousForNonCurrent`: a rename-failure fallback completes inline,
     // so the candidate counts as removed only once the worktree and branch
@@ -360,35 +354,49 @@ fn try_remove(
     } else {
         RemovalExecution::Background(BackgroundFallbackMode::SynchronousForNonCurrent)
     };
-    let fate = handle_remove_output(&plan, execution, ctx.hook_plan, true, &mut announcer)?;
-    announcer.flush()?;
-    let branch_deleted = fate.deleted();
-    // A branch-only candidate that kept its branch removed nothing at all —
-    // unless the removal pruned a stale worktree entry, a removal worth
-    // counting. Excluding the no-op keeps the summary and JSON honest when a
-    // concurrent writer advanced an orphan branch between scan and delete
-    // (the per-item retention warning has already told the user).
-    if !branch_deleted
-        && let RemovalPlan::BranchOnly {
-            prune_entry: None, ..
-        } = plan
-    {
-        return Ok(None);
-    }
-    Ok(Some(fate))
+    let stdin = if needs_write {
+        ForegroundStdin::Inherit
+    } else {
+        ForegroundStdin::Closed
+    };
+    // A branch-only candidate whose ref was not deleted removed nothing,
+    // unless it also pruned a stale worktree entry. Apply that same rule to
+    // successful outcomes and confirmed partial outcomes carried by errors.
+    let completed_fate = |fate: BranchFate| {
+        if !fate.deleted()
+            && matches!(
+                plan,
+                RemovalPlan::BranchOnly {
+                    prune_entry: None,
+                    ..
+                }
+            )
+        {
+            None
+        } else {
+            Some(fate)
+        }
+    };
+    let fate = handle_remove_output(&plan, execution, stdin, ctx.hook_plan, true, &mut announcer)
+        .map_err(|failure| failure.map_result(completed_fate))?;
+    let completed = completed_fate(fate);
+    announcer
+        .flush()
+        .map_err(|error| CommandFailure::with_result(error, completed))?;
+    Ok(completed)
 }
 
 /// One candidate skipped because its project hooks aren't yet approved.
 /// Carries enough context for the end-of-run hint to print a per-candidate
-/// `wt -C <path> remove` line and annotate candidates whose own
-/// `.config/wt.toml` differs from the invoking worktree's (so the user knows
-/// `wt config approvals add` from current can't approve their hooks).
+/// `wt -C <path> remove` line and annotate candidates whose resolved project
+/// config differs from the invoking worktree's (so the user knows `wt config
+/// approvals add` from current can't approve their hooks).
 struct SkippedApproval {
     /// `Some` for candidates whose plan removes a worktree (the only
     /// `(approval required)` source — branch-only plans and stale-detached
     /// entries run no hooks).
     path: Option<PathBuf>,
-    /// True when the candidate's `.config/wt.toml` doesn't match the
+    /// True when the candidate's resolved project config doesn't match the
     /// invoking worktree's bytes — `wt config approvals add` from current
     /// approves only invoking's templates, so this candidate needs the
     /// per-worktree `wt -C <path> remove` form to surface its own hooks.
@@ -421,8 +429,6 @@ struct CheckOutcome {
 }
 
 /// One check item's full parallel work: integration + removability + age.
-/// Held under the check-lock read guard at the call site so it never overlaps
-/// a write-side removal (see [`removal_needs_write`]).
 #[allow(clippy::too_many_arguments)]
 fn check_one(
     item: &CheckItem,
@@ -432,6 +438,7 @@ fn check_one(
     worktrees: &[WorktreeInfo],
     current_path: &Path,
     min_age_duration: Duration,
+    ref_write_times: &RefWriteTimes,
     now_secs: u64,
 ) -> anyhow::Result<CheckOutcome> {
     let _span = Span::new(format!("prune-check:{}", item.integration_ref));
@@ -448,11 +455,17 @@ fn check_one(
         });
     }
     // A detached stale entry can't be planned — `prepare_worktree_removal`'s
-    // missing-directory fallback needs a branch to fall back to — and needs
-    // no plan: `try_remove` prunes the entry directly.
-    let detached_stale = matches!(&item.source,
-        CheckSource::Prunable { wt_idx } if worktrees[*wt_idx].branch.is_none());
-    let plan = if detached_stale {
+    // stale-entry fallback needs a branch to fall back to — and needs no plan:
+    // `try_remove` prunes the entry directly. It still gets that fallback's
+    // check: an entry whose registration holds staged changes or an operation
+    // partway through stays, and so does one the check fails on.
+    let stale_detached = match &item.source {
+        CheckSource::Prunable { wt_idx } if worktrees[*wt_idx].branch.is_none() => {
+            Some(&worktrees[*wt_idx])
+        }
+        _ => None,
+    };
+    let plan = if stale_detached.is_some() {
         None
     } else {
         match &item.source {
@@ -474,7 +487,7 @@ fn check_one(
                     // checkout, which for a duplicated branch is a different
                     // worktree — and for a stale entry is the live one. A
                     // `WorktreePath` target degrades to branch-only deletion
-                    // when the directory is gone, so a stale entry plans its
+                    // when the entry is prunable, so a stale entry plans its
                     // prune.
                     RemoveTarget::WorktreePath(wt.path.clone()),
                     BranchDeletionMode::SafeDelete,
@@ -487,12 +500,20 @@ fn check_one(
             }
         }
     };
-    let removable = detached_stale || plan.is_some();
+    let removable = match stale_detached {
+        Some(wt) => matches!(repo.stale_worktree_work(&wt.path), Ok(None)),
+        None => plan.is_some(),
+    };
     let deletes_branch = plan.as_ref().is_some_and(RemovalPlan::deletes_branch);
     let age = if min_age_duration > Duration::ZERO {
         match &item.source {
             CheckSource::Linked { wt_idx } => worktree_age(repo, &worktrees[*wt_idx], now_secs)?,
-            CheckSource::Orphan => orphan_branch_age(repo, &item.integration_ref, now_secs),
+            CheckSource::Orphan => Some(orphan_branch_age(
+                repo,
+                &item.integration_ref,
+                ref_write_times,
+                now_secs,
+            )?),
             CheckSource::Prunable { .. } => None,
         }
     } else {
@@ -688,21 +709,135 @@ fn worktree_age(
     )))
 }
 
-/// Resolve the age of an orphan branch via its reflog creation timestamp.
+/// Resolve the age of an orphan branch from when its oldest reflog entry was
+/// written.
 ///
-/// Returns `None` if the reflog is missing or unparsable — callers treat
-/// "unknown age" as "old enough", matching the previous inline behavior.
-fn orphan_branch_age(repo: &Repository, branch: &str, now_secs: u64) -> Option<Duration> {
+/// That is the entry's own timestamp, not the committer date of the commit it
+/// points at: `git branch <name> main` on a days-old tip creates a new branch,
+/// and aging it by the commit would prune it before the guard saw it as young.
+/// `--date=unix` renders each entry's selector as `<name>@{<epoch>}`, and git
+/// forbids `@{` inside a ref name, so the last `@{` opens the timestamp.
+///
+/// A branch with no reflog entries is aged by [`RefWriteTimes`] instead.
+/// `core.logAllRefUpdates` defaults to whether the repository is bare as seen
+/// from where git runs, so in a bare repository only a ref written from inside
+/// a linked worktree gets a reflog: `git clone --bare`, a `git fetch` into
+/// `refs/heads/*`, and `wt switch --create` run from the bare directory all
+/// leave none. Expiry (`git gc`) can also empty a reflog.
+fn orphan_branch_age(
+    repo: &Repository,
+    branch: &str,
+    ref_write_times: &RefWriteTimes,
+    now_secs: u64,
+) -> anyhow::Result<Duration> {
     let ref_name = format!("refs/heads/{branch}");
-    let stdout = repo
-        .run_command(&["reflog", "show", "--format=%ct", &ref_name])
-        .ok()?;
-    let created_epoch = stdout
-        .trim()
-        .lines()
-        .last()
-        .and_then(|s| s.parse::<u64>().ok())?;
-    Some(Duration::from_secs(now_secs.saturating_sub(created_epoch)))
+    let stdout = repo.run_command(&[
+        "reflog",
+        "show",
+        "--no-show-signature",
+        "--date=unix",
+        "--format=%gd",
+        &ref_name,
+        "--",
+    ])?;
+    let created_epoch = match stdout.trim().lines().last() {
+        Some(selector) => selector
+            .rsplit_once("@{")
+            .and_then(|(_, epoch)| epoch.strip_suffix('}'))
+            .and_then(|epoch| epoch.parse::<u64>().ok())
+            .with_context(|| format!("parsing reflog selector {selector:?}"))?,
+        None => ref_write_times.epoch(branch)?,
+    };
+    Ok(Duration::from_secs(now_secs.saturating_sub(created_epoch)))
+}
+
+/// When git last wrote the storage holding each orphan branch's ref, read
+/// once before the scan fans out.
+///
+/// Git replaces ref storage by renaming a new file into place, so a file's
+/// mtime is its last write, and the branch it holds existed by then. An age
+/// measured from it is never older than the branch, so the guard errs toward
+/// keeping it. Which file holds the ref depends on the backend:
+///
+/// - **files** (the default): a loose `refs/heads/<branch>` shadows
+///   `packed-refs`. Creating or updating a ref writes it loose, including from
+///   `git fetch`, while `git clone` writes `packed-refs`. `git pack-refs` (run
+///   by `git gc`) and deleting any packed ref rewrite `packed-refs` whole,
+///   which makes every packed branch young again and delays its pruning by up
+///   to `--min-age`.
+/// - **reftable**: tables hold many refs, and every ref update rewrites
+///   `reftable/tables.list`, so a branch counts as no older than the
+///   repository's last ref update.
+///
+/// Prune's own removals are among those rewrites, and they run while the scan
+/// is still checking later candidates, so the times are captured before any
+/// removal starts. The loose refs are read before the shared file: a
+/// concurrent `git pack-refs` that packs a loose ref in between leaves that
+/// branch dated by the rewritten `packed-refs`, never by an older one.
+struct RefWriteTimes {
+    /// Loose `refs/heads/<branch>` mtimes, for the orphan branches that have one.
+    loose: HashMap<String, u64>,
+    /// The `packed-refs` or `reftable/tables.list` mtime, if the file exists.
+    shared: Option<u64>,
+}
+
+impl RefWriteTimes {
+    fn capture(repo: &Repository, check_items: &[CheckItem]) -> anyhow::Result<Self> {
+        let reftable = repo.config_value("extensions.refStorage")?.as_deref() == Some("reftable");
+        let orphans = check_items
+            .iter()
+            .filter(|item| matches!(item.source, CheckSource::Orphan))
+            .map(|item| item.integration_ref.as_str());
+        Self::read(repo.git_common_dir(), reftable, orphans)
+    }
+
+    /// Read the times for `branches` from a git common directory whose refs
+    /// use the reftable backend if `reftable`, else the files backend.
+    fn read<'a>(
+        common_dir: &Path,
+        reftable: bool,
+        branches: impl IntoIterator<Item = &'a str>,
+    ) -> anyhow::Result<Self> {
+        let mut loose = HashMap::new();
+        if !reftable {
+            for branch in branches {
+                if let Some(epoch) = mtime_epoch(&common_dir.join("refs/heads").join(branch))? {
+                    loose.insert(branch.to_string(), epoch);
+                }
+            }
+        }
+        let shared = if reftable {
+            common_dir.join("reftable").join("tables.list")
+        } else {
+            common_dir.join("packed-refs")
+        };
+        Ok(Self {
+            loose,
+            shared: mtime_epoch(&shared)?,
+        })
+    }
+
+    /// The Unix epoch of the last write to `branch`'s ref storage.
+    fn epoch(&self, branch: &str) -> anyhow::Result<u64> {
+        self.loose
+            .get(branch)
+            .copied()
+            .or(self.shared)
+            .with_context(|| format!("finding the ref storage for branch {branch}"))
+    }
+}
+
+/// A file's mtime as a Unix epoch, or `None` if the file doesn't exist.
+fn mtime_epoch(path: &Path) -> anyhow::Result<Option<u64>> {
+    match fs::metadata(path).and_then(|metadata| metadata.modified()) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        modified => {
+            let modified = modified.with_context(|| format!("reading {}", path.display()))?;
+            Ok(Some(
+                modified.duration_since(std::time::UNIX_EPOCH)?.as_secs(),
+            ))
+        }
+    }
 }
 
 /// Render dry-run output (text or JSON) and the `Skipped (younger than ...)`
@@ -731,8 +866,7 @@ fn render_dry_run(
                 })
             })
             .collect();
-        print_json(&items)?;
-        return Ok(());
+        return print_json(&items);
     }
 
     // The human preview mirrors the `--format=json` plan above (the worktrees
@@ -785,7 +919,7 @@ fn render_dry_run(
     Ok(())
 }
 
-/// Build the pessimistic hook plan up front — every worktree entry in
+/// Build the pessimistic hook plan up front — every linked worktree in
 /// `check_items` × `pre-remove`/`post-remove`, plus the primary × `post-switch`
 /// when the current worktree appears in `check_items`. The actual scan may
 /// narrow this set; the pessimistic shape is what lets `try_remove` stream
@@ -793,15 +927,9 @@ fn render_dry_run(
 /// resolve against (every hook is selected from the invoking worktree's
 /// `.config/wt.toml`, whatever its anchor).
 ///
-/// `Orphan` items name no worktree, so they contribute nothing. `Prunable` ones
-/// do, even though the stale entry they usually describe plans a pure branch
-/// deletion that runs no hooks: git calls an entry prunable when the `.git` file
-/// its metadata points at is gone, which leaves the worktree *directory* still
-/// there whenever only that file went (an interrupted `rm -rf`, a copy that
-/// skipped dotfiles), and the scan then plans a full worktree removal whose
-/// hooks anchor at that path and must resolve (`ApprovedHookPlan::lookup`
-/// matches the anchor exactly, by design). For the ordinary stale entry the
-/// plan resolves to `BranchOnly` and the registration goes unused.
+/// Only `Linked` items can plan a worktree removal, the one plan that runs
+/// hooks. `Orphan` items name no worktree, and a `Prunable` entry plans a pure
+/// branch deletion, or nothing at all when it is detached.
 fn build_pessimistic_plan(
     repo: &Repository,
     check_items: &[CheckItem],
@@ -809,13 +937,12 @@ fn build_pessimistic_plan(
     current_root: &Path,
     project_config: Option<&ProjectConfig>,
     user_config: &UserConfig,
-    project_id: Option<&str>,
+    project_id: Option<&ProjectId>,
 ) -> anyhow::Result<HookPlan> {
     let mut builder = HookPlanBuilder::new(project_config, user_config, project_id);
     let mut has_current = false;
     for item in check_items {
-        let (CheckSource::Linked { wt_idx } | CheckSource::Prunable { wt_idx }) = &item.source
-        else {
+        let CheckSource::Linked { wt_idx } = &item.source else {
             continue;
         };
         let wt = &worktrees[*wt_idx];
@@ -840,7 +967,7 @@ fn unapproved_for_hook(
     hook_type: HookType,
     project_config: Option<&ProjectConfig>,
     user_config: &UserConfig,
-    project_id: Option<&str>,
+    project_id: Option<&ProjectId>,
     approvals: &Approvals,
 ) -> Vec<String> {
     let Ok(home) = repo.home_path() else {
@@ -901,13 +1028,16 @@ pub fn step_prune(
         let _span = Span::new("prune-gather");
         gather_check_items(&repo, worktrees, default_branch.as_deref())?
     };
+    // Read before any removal, since prune's own deletions rewrite the files
+    // these times come from.
+    let ref_write_times =
+        RefWriteTimes::capture(&repo, &check_items).context("reading ref write times")?;
 
     let mut skipped_young: Vec<String> = Vec::new();
 
     // Streaming dry-run path: scans run in parallel, results are collected and
     // sorted for deterministic output. No removals, no approval — just print.
     if dry_run {
-        let check_lock = RwLock::new(());
         let scan_span = Span::new("prune-scan");
         let dry_run_info: Vec<(Candidate, DryRunInfo)> = std::thread::scope(|s| {
             let (tx, rx) = chan::unbounded::<(usize, anyhow::Result<CheckOutcome>)>();
@@ -920,25 +1050,23 @@ pub fn step_prune(
             let check_items_ref = &check_items;
             let integration_target_ref = integration_target.as_str();
             let current_path_ref = current_root.as_path();
-            let check_lock_ref = &check_lock;
+            let ref_write_times_ref = &ref_write_times;
             s.spawn(move || {
                 check_items_ref
                     .par_iter()
                     .enumerate()
                     .for_each(|(idx, item)| {
-                        let outcome = {
-                            let _read = check_lock_ref.read().unwrap_or_else(|e| e.into_inner());
-                            check_one(
-                                item,
-                                repo_ref,
-                                snapshot_ref,
-                                integration_target_ref,
-                                worktrees,
-                                current_path_ref,
-                                min_age_duration,
-                                now_secs,
-                            )
-                        };
+                        let outcome = check_one(
+                            item,
+                            repo_ref,
+                            snapshot_ref,
+                            integration_target_ref,
+                            worktrees,
+                            current_path_ref,
+                            min_age_duration,
+                            ref_write_times_ref,
+                            now_secs,
+                        );
                         let _ = tx.send((idx, outcome));
                     });
             });
@@ -996,7 +1124,7 @@ pub fn step_prune(
     //     (`wt config approvals add`) or remove individually
     //     (`wt -C <wt> remove`). Unapproved hooks never run silently.
     let project_id_owned = repo.project_identifier().ok();
-    let project_id = project_id_owned.as_deref();
+    let project_id = project_id_owned.as_ref();
     let project_config = repo.load_project_config()?;
     let approvals = if yes {
         Approvals::default()
@@ -1055,7 +1183,7 @@ pub fn step_prune(
     };
     // The invoking worktree's project-config bytes — load once so the per-
     // candidate "(different hooks on branch)" annotation in the skip hint
-    // can compare each candidate's own `.config/wt.toml` against this
+    // can compare each candidate's resolved project config against this
     // baseline. Byte-equal is approximate (whitespace differences flag too)
     // but the result drives a hint, not behavior.
     let invoking_project_bytes = repo
@@ -1065,12 +1193,12 @@ pub fn step_prune(
         .and_then(|p| std::fs::read(p).ok());
     let mut skipped_approval: Vec<SkippedApproval> = Vec::new();
 
-    let check_lock = RwLock::new(());
+    let output_lock = RwLock::new(());
     let removal_ctx = RemovalContext {
         repo: &repo,
         foreground,
         hook_plan: &hook_plan,
-        check_lock: &check_lock,
+        output_lock: &output_lock,
     };
     // Flipped by the first failing removal: the rest of the queue drains
     // without executing (matching the serial loop's abort-on-first-error),
@@ -1080,202 +1208,201 @@ pub fn step_prune(
     // Streaming live path: scans run in parallel and the main thread queues a
     // job for each result as it arrives — a "Skipped ..." line or a removal.
     // Removals execute concurrently on the worker pool (read side of
-    // `check_lock`; the exceptional candidates take the write side — see
+    // `output_lock`; the exceptional candidates take the write side — see
     // `removal_needs_write`). The current worktree is the one exception to
     // the fan-out: its removal cd's to the primary, so defer it until last.
     let scan_span = Span::new("prune-scan");
-    let (removed, deferred_current) = std::thread::scope(
-        |s| -> anyhow::Result<(Vec<Candidate>, Option<DeferredCurrent>)> {
-            let (tx, rx) = chan::unbounded::<(usize, anyhow::Result<CheckOutcome>)>();
-            // Pre-shadow with references so `move` on s.spawn moves only `tx`
-            // (so it's dropped when the spawn ends and `rx` can terminate),
-            // while the heavy state stays borrowed and remains usable by the
-            // main thread.
-            let repo_ref = &repo;
-            let snapshot_ref = &snapshot;
-            let check_items_ref = &check_items;
-            let integration_target_ref = integration_target.as_str();
-            let current_path_ref = current_root.as_path();
-            let check_lock_ref = &check_lock;
-            s.spawn(move || {
-                check_items_ref
-                    .par_iter()
-                    .enumerate()
-                    .for_each(|(idx, item)| {
-                        let outcome = {
-                            let _read = check_lock_ref.read().unwrap_or_else(|e| e.into_inner());
-                            check_one(
-                                item,
-                                repo_ref,
-                                snapshot_ref,
-                                integration_target_ref,
-                                worktrees,
-                                current_path_ref,
-                                min_age_duration,
-                                now_secs,
-                            )
-                        };
-                        let _ = tx.send((idx, outcome));
-                    });
-            });
+    let (removed, deferred_current, mut first_err) = std::thread::scope(|s| {
+        let (tx, rx) = chan::unbounded::<(usize, anyhow::Result<CheckOutcome>)>();
+        // Pre-shadow with references so `move` on s.spawn moves only `tx`
+        // (so it's dropped when the spawn ends and `rx` can terminate),
+        // while the heavy state stays borrowed and remains usable by the
+        // main thread.
+        let repo_ref = &repo;
+        let snapshot_ref = &snapshot;
+        let check_items_ref = &check_items;
+        let integration_target_ref = integration_target.as_str();
+        let current_path_ref = current_root.as_path();
+        let ref_write_times_ref = &ref_write_times;
+        s.spawn(move || {
+            check_items_ref
+                .par_iter()
+                .enumerate()
+                .for_each(|(idx, item)| {
+                    let outcome = check_one(
+                        item,
+                        repo_ref,
+                        snapshot_ref,
+                        integration_target_ref,
+                        worktrees,
+                        current_path_ref,
+                        min_age_duration,
+                        ref_write_times_ref,
+                        now_secs,
+                    );
+                    let _ = tx.send((idx, outcome));
+                });
+        });
 
-            // Removal workers, sized like the scan's rayon pool so
-            // `RAYON_NUM_THREADS=1` serializes removals too (deterministic
-            // output for tests). Results flow back on `done_rx`; the channel
-            // closes once every worker has drained the job queue and exited,
-            // so draining it below also waits out all in-flight printing.
-            let (job_tx, job_rx) = chan::unbounded::<RemovalJob>();
-            let (done_tx, done_rx) =
-                chan::unbounded::<(Candidate, anyhow::Result<Option<BranchFate>>)>();
-            let abort_ref = &abort;
-            let removal_ctx_ref = &removal_ctx;
-            // Empty check_items → zero workers, correctly: no jobs can queue.
-            let workers = rayon::current_num_threads().min(check_items.len());
-            for _ in 0..workers {
-                let job_rx = job_rx.clone();
-                let done_tx = done_tx.clone();
-                s.spawn(move || {
-                    for job in job_rx {
-                        match job {
-                            RemovalJob::Remove { candidate, plan } => {
-                                // Skip (not print, not remove) once a sibling
-                                // failed; queued skip lines below still print
-                                // — they were discovered before the failure.
-                                if abort_ref.load(Ordering::Relaxed) {
-                                    continue;
-                                }
-                                let result = try_remove(&candidate, *plan, removal_ctx_ref)
-                                    .with_context(|| candidate.removal_context());
-                                if result.is_err() {
-                                    abort_ref.store(true, Ordering::Relaxed);
-                                }
-                                if done_tx.send((candidate, result)).is_err() {
-                                    return;
-                                }
+        // Removal workers, sized like the scan's rayon pool so
+        // `RAYON_NUM_THREADS=1` serializes removals too (deterministic
+        // output for tests). Results flow back on `done_rx`; the channel
+        // closes once every worker has drained the job queue and exited,
+        // so draining it below also waits out all in-flight printing.
+        let (job_tx, job_rx) = chan::unbounded::<RemovalJob>();
+        let (done_tx, done_rx) =
+            chan::unbounded::<(Candidate, CommandResult<Option<BranchFate>>)>();
+        let abort_ref = &abort;
+        let removal_ctx_ref = &removal_ctx;
+        // Empty check_items → zero workers, correctly: no jobs can queue.
+        let workers = rayon::current_num_threads().min(check_items.len());
+        for _ in 0..workers {
+            let job_rx = job_rx.clone();
+            let done_tx = done_tx.clone();
+            s.spawn(move || {
+                for job in job_rx {
+                    match job {
+                        RemovalJob::Remove { candidate, plan } => {
+                            // Skip (not print, not remove) once a sibling
+                            // failed; queued skip lines below still print
+                            // — they were discovered before the failure.
+                            if abort_ref.load(Ordering::Relaxed) {
+                                continue;
                             }
-                            RemovalJob::PrintSkip(line) => {
-                                // Hold the read side so a skip line can't
-                                // land inside a write-side removal's
-                                // exclusive output window (spinner, hook
-                                // stream).
-                                let _read = removal_ctx_ref
-                                    .check_lock
-                                    .read()
-                                    .unwrap_or_else(|e| e.into_inner());
-                                eprintln!("{line}");
+                            let result = try_remove(&candidate, *plan, removal_ctx_ref).map_err(
+                                |mut failure| {
+                                    failure.error =
+                                        failure.error.context(candidate.removal_context());
+                                    abort_removals(&failure.error, abort_ref);
+                                    failure
+                                },
+                            );
+                            if done_tx.send((candidate, result)).is_err() {
+                                return;
                             }
                         }
+                        RemovalJob::PrintSkip(line) => {
+                            // Hold the read side so a skip line can't
+                            // land inside a write-side removal's
+                            // exclusive output window (spinner).
+                            let _read = removal_ctx_ref
+                                .output_lock
+                                .read()
+                                .unwrap_or_else(|e| e.into_inner());
+                            eprintln!("{line}");
+                        }
                     }
+                }
+            });
+        }
+        drop(job_rx);
+        drop(done_tx);
+
+        let mut deferred_current: Option<DeferredCurrent> = None;
+        let mut first_err: Option<anyhow::Error> = None;
+        for (idx, outcome) in &rx {
+            // A failed check stops new removals, but drain both channels
+            // so the response retains every removal already completed.
+            let outcome = match outcome.context("checking branch integration") {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    abort_removals(&error, abort_ref);
+                    first_err.get_or_insert(error);
+                    continue;
+                }
+            };
+            let Some(_reason) = outcome.reason else {
+                continue;
+            };
+            if !outcome.removable {
+                continue;
+            }
+            let item = &check_items[idx];
+            let (label, branch, path, kind, _suffix) =
+                candidate_fields(item, &repo, worktrees, &current_root);
+            if let Some(age) = outcome.age
+                && age < min_age_duration
+            {
+                let line = info_message(cformat!(
+                    "Skipped <bold>{label}</> (younger than {min_age})"
+                ))
+                .to_string();
+                let _ = job_tx.send(RemovalJob::PrintSkip(line));
+                skipped_young.push(label);
+                continue;
+            }
+            // Keyed on the plan, not the candidate's shape: only a
+            // worktree removal runs `pre-remove`/`post-remove`. Branch-
+            // only plans and detached stale entries run no hooks.
+            let needs_approval = match &outcome.plan {
+                Some(RemovalPlan::Worktree { .. }) => {
+                    !pre_remove_unapproved.is_empty()
+                        || !post_remove_unapproved.is_empty()
+                        || (matches!(kind, CandidateKind::Current)
+                            && !post_switch_unapproved.is_empty())
+                }
+                Some(RemovalPlan::BranchOnly { .. }) | None => false,
+            };
+            if needs_approval {
+                let line = info_message(cformat!("Skipped <bold>{label}</> (approval required)"))
+                    .to_string();
+                let _ = job_tx.send(RemovalJob::PrintSkip(line));
+                let differs = path.as_deref().is_some_and(|wt_path| {
+                    let candidate_bytes = Repository::at(wt_path)
+                        .and_then(|candidate_repo| candidate_repo.project_config_path())
+                        .ok()
+                        .flatten()
+                        .and_then(|p| std::fs::read(p).ok());
+                    candidate_bytes != invoking_project_bytes
+                });
+                skipped_approval.push(SkippedApproval { path, differs });
+                continue;
+            }
+            let candidate = Candidate {
+                check_idx: idx,
+                label,
+                branch,
+                path,
+                kind,
+                deletes_branch: outcome.deletes_branch,
+                fate: None,
+            };
+            if matches!(candidate.kind, CandidateKind::Current) {
+                deferred_current = Some((candidate, outcome.plan));
+            } else {
+                let _ = job_tx.send(RemovalJob::Remove {
+                    candidate,
+                    plan: Box::new(outcome.plan),
                 });
             }
-            drop(job_rx);
-            drop(done_tx);
+        }
+        drop(job_tx);
 
-            let mut deferred_current: Option<DeferredCurrent> = None;
-            for (idx, outcome) in &rx {
-                // A check error fails the whole run — flip `abort` so the
-                // workers drain their queue without executing more removals
-                // (whose results this early return would silently drop).
-                let outcome = outcome
-                    .context("checking branch integration")
-                    .inspect_err(|_| abort_ref.store(true, Ordering::Relaxed))?;
-                let Some(_reason) = outcome.reason else {
-                    continue;
-                };
-                if !outcome.removable {
-                    continue;
-                }
-                let item = &check_items[idx];
-                let (label, branch, path, kind, _suffix) =
-                    candidate_fields(item, &repo, worktrees, &current_root);
-                if let Some(age) = outcome.age
-                    && age < min_age_duration
-                {
-                    let line = info_message(cformat!(
-                        "Skipped <bold>{label}</> (younger than {min_age})"
-                    ))
-                    .to_string();
-                    let _ = job_tx.send(RemovalJob::PrintSkip(line));
-                    skipped_young.push(label);
-                    continue;
-                }
-                // Keyed on the plan, not the candidate's shape: only a
-                // worktree removal runs `pre-remove`/`post-remove`, and a
-                // stale entry whose directory turned out to still exist plans
-                // one like any other (see `build_pessimistic_plan`). Branch-
-                // only plans and detached stale entries run no hooks.
-                let needs_approval = match &outcome.plan {
-                    Some(RemovalPlan::Worktree { .. }) => {
-                        !pre_remove_unapproved.is_empty()
-                            || !post_remove_unapproved.is_empty()
-                            || (matches!(kind, CandidateKind::Current)
-                                && !post_switch_unapproved.is_empty())
-                    }
-                    Some(RemovalPlan::BranchOnly { .. }) | None => false,
-                };
-                if needs_approval {
-                    let line =
-                        info_message(cformat!("Skipped <bold>{label}</> (approval required)"))
-                            .to_string();
-                    let _ = job_tx.send(RemovalJob::PrintSkip(line));
-                    let differs = path.as_deref().is_some_and(|wt_path| {
-                        let candidate_bytes =
-                            std::fs::read(wt_path.join(".config").join("wt.toml")).ok();
-                        candidate_bytes != invoking_project_bytes
-                    });
-                    skipped_approval.push(SkippedApproval { path, differs });
-                    continue;
-                }
-                let candidate = Candidate {
-                    check_idx: idx,
-                    label,
-                    branch,
-                    path,
-                    kind,
-                    deletes_branch: outcome.deletes_branch,
-                    fate: None,
-                };
-                if matches!(candidate.kind, CandidateKind::Current) {
-                    deferred_current = Some((candidate, outcome.plan));
-                } else {
-                    let _ = job_tx.send(RemovalJob::Remove {
-                        candidate,
-                        plan: Box::new(outcome.plan),
-                    });
-                }
-            }
-            drop(job_tx);
-
-            let mut removed: Vec<Candidate> = Vec::new();
-            let mut first_err: Option<anyhow::Error> = None;
-            for (mut candidate, result) in &done_rx {
-                match result {
-                    // Record the executed outcome, not the scan's prediction —
-                    // what the summary and `--format=json` report.
-                    Ok(Some(fate)) => {
-                        candidate.record_fate(fate);
-                        removed.push(candidate);
-                    }
-                    Ok(None) => {}
-                    Err(err) if first_err.is_none() => first_err = Some(err),
-                    // Concurrent failures (e.g. one Ctrl-C killing every
-                    // in-flight child) all carry the same story; report the
-                    // first and keep the rest out of the terminal.
-                    Err(err) => {
+        let mut removed: Vec<Candidate> = Vec::new();
+        for (mut candidate, result) in &done_rx {
+            let completed = match result {
+                Ok(completed) => completed,
+                Err(failure) => {
+                    if first_err.is_none() {
+                        first_err = Some(failure.error);
+                    } else {
                         tracing::debug!(
-                            error = %err,
-                            "additional removal failure for {}: {err:#}",
-                            candidate.label
+                            error = %failure.error,
+                            "additional removal failure for {}: {:#}",
+                            candidate.label,
+                            failure.error,
                         );
                     }
+                    failure.result.and_then(|result| *result)
                 }
+            };
+            if let Some(fate) = completed {
+                candidate.record_fate(fate);
+                removed.push(candidate);
             }
-            if let Some(err) = first_err {
-                return Err(err);
-            }
-            Ok((removed, deferred_current))
-        },
-    )?;
+        }
+        (removed, deferred_current, first_err)
+    });
     drop(scan_span);
 
     let mut removed = removed;
@@ -1284,12 +1411,20 @@ pub fn step_prune(
     // current worktree stays last.
     removed.sort_by_key(|c| c.check_idx);
     // Remove deferred current worktree last (cd-to-primary happens here)
-    if let Some((mut current, plan)) = deferred_current
-        && let Some(fate) =
-            try_remove(&current, plan, &removal_ctx).with_context(|| current.removal_context())?
+    if first_err.is_none()
+        && let Some((mut current, plan)) = deferred_current
     {
-        current.record_fate(fate);
-        removed.push(current);
+        let completed = match try_remove(&current, plan, &removal_ctx) {
+            Ok(completed) => completed,
+            Err(failure) => {
+                first_err = Some(failure.error.context(current.removal_context()));
+                failure.result.and_then(|result| *result)
+            }
+        };
+        if let Some(fate) = completed {
+            current.record_fate(fate);
+            removed.push(current);
+        }
     }
 
     if format == crate::cli::SwitchFormat::Json {
@@ -1305,15 +1440,20 @@ pub fn step_prune(
             })
             .collect();
         print_json(&items)?;
-    } else if removed.is_empty() {
-        if skipped_young.is_empty() && skipped_approval.is_empty() {
-            eprintln!("{}", info_message("No merged worktrees to remove"));
-        }
     } else {
-        eprintln!(
-            "{}",
-            success_message(format!("Pruned {}", prune_summary(&removed)))
-        );
+        if let Some(error) = first_err {
+            return Err(error);
+        }
+        if removed.is_empty() {
+            if skipped_young.is_empty() && skipped_approval.is_empty() {
+                eprintln!("{}", info_message("No merged worktrees to remove"));
+            }
+        } else {
+            eprintln!(
+                "{}",
+                success_message(format!("Pruned {}", prune_summary(&removed)))
+            );
+        }
     }
 
     if !skipped_approval.is_empty() {
@@ -1328,7 +1468,10 @@ pub fn step_prune(
         }
     }
 
-    Ok(())
+    match first_err {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// One headline+gutter pair for the `(approval required)` end-of-run hint.
@@ -1340,7 +1483,7 @@ struct ApprovalHintBlock {
 /// Build the headline+gutter pairs for `(approval required)` skips: a
 /// `wt config approvals add` block listing the unapproved templates from the
 /// invoking worktree's config, and a per-worktree `wt -C <path> remove` block
-/// for the skipped candidates. Candidates whose own `.config/wt.toml` differs
+/// for the skipped candidates. Candidates whose resolved project config differs
 /// from the invoking worktree get a `(different hooks on branch)` annotation —
 /// `wt config approvals add` from current approves only current's templates,
 /// so the per-worktree form is the only path for them.
@@ -1408,6 +1551,41 @@ mod tests {
             deletes_branch: !matches!(kind, CandidateKind::StaleDetached),
             fate: None,
         }
+    }
+
+    #[test]
+    fn ref_write_times_follow_the_ref_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |relative: &str, epoch: u64| {
+            let path = dir.path().join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::File::create(&path)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(epoch))
+                .unwrap();
+        };
+        write("packed-refs", 100);
+        write("refs/heads/loose", 200);
+        write("refs/heads/nested/loose", 300);
+        write("reftable/tables.list", 400);
+
+        // A loose ref shadows `packed-refs`, which dates every other branch.
+        let files =
+            RefWriteTimes::read(dir.path(), false, ["loose", "nested/loose", "packed"]).unwrap();
+        let epochs = ["loose", "nested/loose", "packed"].map(|branch| files.epoch(branch).unwrap());
+        assert_eq!(epochs, [200, 300, 100]);
+
+        // Reftable keeps no per-ref files, so a stray loose file is not read.
+        let reftable = RefWriteTimes::read(dir.path(), true, ["loose"]).unwrap();
+        assert_eq!(reftable.epoch("loose").unwrap(), 400);
+
+        // With neither a loose ref nor shared storage, nothing dates the branch.
+        let empty = tempfile::tempdir().unwrap();
+        let none = RefWriteTimes::read(empty.path(), false, ["gone"]).unwrap();
+        assert_eq!(
+            none.epoch("gone").unwrap_err().to_string(),
+            "finding the ref storage for branch gone"
+        );
     }
 
     #[test]

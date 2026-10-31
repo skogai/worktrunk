@@ -7,10 +7,10 @@
 //!
 //! # Design Notes
 //!
-//! The `step` subcommand grouping is not fully satisfying. Current state:
-//!
-//! - `commit`, `squash`, `rebase`, `push` — merge workflow steps (single-worktree)
-//! - `for-each` — utility to run commands across all worktrees (multi-worktree)
+//! The `step` subcommand grouping is not fully satisfying. It holds the merge
+//! workflow's single-worktree steps (`commit`, `squash`, `rebase`, `push`)
+//! alongside unrelated utilities, including `for-each`, the one that runs a
+//! command across all worktrees.
 //!
 //! These don't naturally belong together. Options considered:
 //!
@@ -28,7 +28,6 @@ use std::io::Write as _;
 use std::process::Stdio;
 
 use anyhow::Context;
-use color_print::cformat;
 use worktrunk::config::{UserConfig, VarScope};
 use worktrunk::git::{ErrorExt, Repository, WorktreeInfo, WorktrunkError};
 use worktrunk::shell_exec::{Cmd, ShellEscapeMode};
@@ -44,14 +43,15 @@ use crate::output::print_json;
 /// Run a command in each worktree sequentially.
 ///
 /// Executes the given argv directly in every worktree, streaming output in
-/// real-time. Continues on errors and reports a summary at the end.
+/// real-time. Preparation and child failures belong to each worktree; later
+/// worktrees still run. Interruptions stop the loop and retain visited results.
 ///
 /// All template variables from hooks are available; values are substituted
-/// into argv elements without shell escaping. Context JSON is piped to stdin.
+/// into argv elements without shell escaping. Context JSON is provided on stdin.
 pub fn step_for_each(args: Vec<String>, format: crate::cli::SwitchFormat) -> anyhow::Result<()> {
     let json_mode = format == crate::cli::SwitchFormat::Json;
     let repo = Repository::current()?;
-    // Filter out prunable worktrees (directory deleted) - can't run commands there
+    // Filter out prunable worktrees (directory or its `.git` gone) - can't run commands there
     let worktrees: Vec<&WorktreeInfo> = repo
         .list_worktrees()?
         .iter()
@@ -74,25 +74,25 @@ pub fn step_for_each(args: Vec<String>, format: crate::cli::SwitchFormat) -> any
             progress_message(format!("Running in {display_name}..."))
         );
 
-        // Build full hook context for this worktree
-        // Pass wt.branch directly (not the display string) so a detached
-        // worktree maps to None and leaves `{{ branch }}` unset
-        let ctx = CommandContext::new(&repo, &config, wt.branch.as_deref(), &wt.path, false);
-        let context_map = build_hook_context(&ctx, &[], VarScope::All)?;
+        let result = (|| {
+            // Pass the branch, not its display name: a detached worktree
+            // leaves `{{ branch }}` unset.
+            let ctx = CommandContext::new(&repo, &config, wt.branch.as_deref(), &wt.path, false);
+            let context_map = build_hook_context(&ctx, &[], VarScope::All)?;
 
-        // Expand each argv element through the template engine without
-        // shell-escaping — values are interpolated directly into the argv
-        // element a program receives, not through `sh -c`.
-        let expanded: Vec<String> = args
-            .iter()
-            .map(|arg| {
-                context_map.expand(arg, ShellEscapeMode::Literal, &repo, "for-each argument")
-            })
-            .collect::<Result<_, _>>()?;
+            // Expand argv literally: the program receives each element
+            // directly, without shell parsing.
+            let expanded: Vec<String> = args
+                .iter()
+                .map(|arg| {
+                    context_map.expand(arg, ShellEscapeMode::Literal, &repo, "for-each argument")
+                })
+                .collect::<Result<_, _>>()?;
 
-        let context_json = context_map.to_json();
+            run_argv(&wt.path, expanded, &context_map.to_json())
+        })();
 
-        match run_argv(&wt.path, expanded, &context_json) {
+        match result {
             Ok(()) => {
                 if json_mode {
                     json_results.push(serde_json::json!({
@@ -109,27 +109,23 @@ pub fn step_for_each(args: Vec<String>, format: crate::cli::SwitchFormat) -> any
                 // hints from typed diagnostics) and a plain string for
                 // JSON (consumers shouldn't see ANSI codes or symbols).
                 let (exit_info, exit_code, stderr_detail, json_detail) =
-                    if let Some(WorktrunkError::ChildProcessExited { code, message, .. }) =
+                    if let Some(WorktrunkError::ChildProcessExited { code, .. }) =
                         err.downcast_ref::<WorktrunkError>()
                     {
                         (
-                            format!(" (exit code {code})"),
+                            format!(" ({err})"),
                             serde_json::json!(code),
                             None,
-                            message.clone(),
-                        )
-                    } else {
-                        let styled = err.render_diagnostic().unwrap_or_else(|| err.to_string());
-                        (
-                            " (spawn failed)".to_string(),
-                            serde_json::json!(null),
-                            Some(styled),
                             err.to_string(),
                         )
+                    } else {
+                        let detail = err.display_message();
+                        let styled = err.render_diagnostic().unwrap_or_else(|| detail.clone());
+                        (String::new(), serde_json::json!(null), Some(styled), detail)
                     };
                 eprintln!(
                     "{}",
-                    error_message(cformat!("Failed in <bold>{display_name}</>{exit_info}"))
+                    error_message(format!("Failed in {display_name}{exit_info}"))
                 );
                 if let Some(detail) = &stderr_detail {
                     eprintln!("{}", format_with_gutter(detail, None));
@@ -202,7 +198,7 @@ pub fn step_for_each(args: Vec<String>, format: crate::cli::SwitchFormat) -> any
 }
 
 /// Run argv directly (no shell) with streaming output, signal forwarding,
-/// stdout→stderr redirect, and JSON context piped on stdin.
+/// stdout→stderr redirect, and JSON context on stdin.
 ///
 /// Mirrors the bookkeeping in `output::execute_shell_command` (flush, ANSI
 /// reset, signal forwarding) but builds the command via `Cmd::new` so the

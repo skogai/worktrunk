@@ -1,33 +1,6 @@
 //! Hook filter types for command filtering by source and name.
-//!
-//! These types are shared between `hooks.rs` (command preparation/execution)
-//! and `command_approval.rs` (approval flow). Re-exported from `hooks.rs`
-//! for backward compatibility.
 
-/// Whether a hook or alias body came from user config or project config.
-///
-/// Drives approval and source-qualified filtering.
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    serde::Serialize,
-    serde::Deserialize,
-    strum::Display,
-    strum::EnumString,
-)]
-#[serde(rename_all = "kebab-case")]
-#[strum(serialize_all = "kebab-case")]
-pub enum HookSource {
-    /// User config (~/.config/worktrunk/config.toml). No approval required.
-    User,
-    /// Project config (.config/wt.toml). Approval is handled at the gate.
-    Project,
-}
+use worktrunk::config::{CommandConfig, HookSource};
 
 /// A parsed name filter, optionally scoped to a specific source.
 ///
@@ -71,4 +44,33 @@ impl<'a> ParsedFilter<'a> {
         self.matches_source(source)
             && (self.name.is_empty() || name.is_some_and(|n| n == self.name))
     }
+}
+
+/// Select commands before template parsing, preparation, or execution.
+/// Shared by manual-hook argument routing and pipeline preparation.
+pub(crate) fn selected_hook_configs(
+    user_config: Option<&CommandConfig>,
+    project_config: Option<&CommandConfig>,
+    name_filters: &[String],
+) -> Vec<(HookSource, CommandConfig)> {
+    let filters: Vec<_> = name_filters
+        .iter()
+        .map(|name| ParsedFilter::parse(name))
+        .collect();
+    [
+        (HookSource::User, user_config),
+        (HookSource::Project, project_config),
+    ]
+    .into_iter()
+    .filter_map(|(source, config)| {
+        let config = config?.filtered(|command| {
+            filters.is_empty()
+                || filters
+                    .iter()
+                    .any(|filter| filter.matches_command(source, command.name.as_deref()))
+        });
+        let has_commands = config.commands().next().is_some();
+        has_commands.then_some((source, config))
+    })
+    .collect()
 }

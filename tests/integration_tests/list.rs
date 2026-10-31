@@ -229,7 +229,7 @@ fn force_duplicate_worktree(repo: &TestRepo, branch: &str) -> std::path::PathBuf
     dup_path
 }
 
-/// A branch checked out in two worktrees flags both rows with `⚑`, the same
+/// A branch checked out in two worktrees flags both rows with `⚐`, the same
 /// irregular-mapping flag an off-template path earns, and the Path column
 /// earns its place: the branch name no longer identifies the row. Before
 /// this, only the off-template duplicate was flagged, and the worktree `wt`
@@ -315,6 +315,36 @@ fn test_list_long_commit_message(mut repo: TestRepo) {
     repo.commit("Short message");
 
     assert_cmd_snapshot!(list_snapshots::command(&repo, repo.root_path()));
+}
+
+#[rstest]
+fn test_list_escapes_commit_controls(repo: TestRepo) {
+    let subject = "hello\x1b]52;c;YQ==\x07 café";
+    repo.commit(subject);
+    let output = repo
+        .wt_command()
+        .args(["list", "--format=table"])
+        .env("CLICOLOR_FORCE", "1")
+        .env("COLUMNS", "200")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains(r"hello\u{1b}]52;c;YQ==\u{7} café"),
+        "{stdout:?}"
+    );
+    assert!(!stdout.contains("\x1b]52;"), "{stdout:?}");
+    assert!(stdout.contains("\x1b["), "test must exercise styled output");
+
+    let output = repo
+        .wt_command()
+        .args(["list", "--format=json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["items"][0]["head"]["subject"], subject);
 }
 
 #[rstest]
@@ -782,6 +812,44 @@ fn test_list_with_remotes_and_full(#[from(repo_with_remote)] repo: TestRepo) {
 }
 
 #[rstest]
+fn test_list_json_preserves_slash_named_remote(#[from(repo_with_remote)] repo: TestRepo) {
+    repo.create_branch("remote-only");
+    repo.push_branch("remote-only");
+    repo.run_git(&["branch", "-D", "remote-only"]);
+    repo.run_git(&["remote", "rename", "origin", "team/fork"]);
+
+    // Both prefixes are configured; use the complete remote name.
+    repo.run_git(&["config", "remote.team.url", "https://example.com/team.git"]);
+    repo.run_git(&[
+        "symbolic-ref",
+        "refs/remotes/team/fork/HEAD",
+        "refs/remotes/team/fork/main",
+    ]);
+
+    let output = repo
+        .wt_command()
+        .args(["list", "--remotes", "--format=json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "wt list should succeed");
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let items = json["items"].as_array().expect("schema 2 items");
+    let remote = items
+        .iter()
+        .find(|item| item.get("remote").is_some())
+        .expect("remote-only row");
+    assert_eq!(remote["branch"], "remote-only");
+    assert_eq!(remote["remote"], "team/fork");
+
+    let main = items
+        .iter()
+        .find(|item| item["branch"] == "main")
+        .expect("main row");
+    assert_eq!(main["upstream"]["remote"], "team/fork");
+}
+
+#[rstest]
 fn test_list_with_orphaned_remote_ref(#[from(repo_with_remote)] repo: TestRepo) {
     // Create a remote-tracking ref for a non-existent remote.
     // This simulates a ref that remains after a remote is deleted.
@@ -918,6 +986,47 @@ fn test_list_ordering_rules(mut repo: TestRepo) {
 
     // Run from feature-current worktree to test "current worktree" logic
     assert_cmd_snapshot!(list_snapshots::command(&repo, &current_path));
+}
+
+#[rstest]
+#[case("origin")]
+#[case(".")]
+fn test_list_upstream_remote_comes_from_tracking_config(
+    #[from(repo_with_remote)] repo: TestRepo,
+    #[case] remote: &str,
+) {
+    // The same short ref can mean remote origin + branch fork/main or
+    // remote origin/fork + branch main. Git's tracking config decides.
+    repo.run_git(&["config", "remote.origin/fork.url", "unused"]);
+    repo.run_git(&["config", "branch.main.remote", remote]);
+    repo.run_git(&["config", "branch.main.merge", "refs/heads/fork/main"]);
+    repo.run_git(&["update-ref", "refs/remotes/origin/fork/main", "HEAD"]);
+    repo.create_branch("fork/main");
+
+    let output = repo
+        .wt_command()
+        .args(["list", "--format=json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let main = json["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["branch"] == "main")
+        .unwrap();
+    if remote == "." {
+        // Local tracking has no remote upstream object.
+        assert!(main.get("upstream").is_none());
+    } else {
+        assert_eq!(main["upstream"]["remote"], "origin");
+        assert_eq!(main["upstream"]["branch"], "fork/main");
+    }
 }
 
 #[rstest]
@@ -1176,6 +1285,85 @@ fn test_list_json_with_user_marker(mut repo: TestRepo) {
         cmd.arg("--format=json");
         cmd
     });
+}
+
+/// Extract the populated Status cell from the all-gates fixture below.
+/// Its ASCII marker leaves the column padding as runs of two or more spaces.
+fn status_cell(table: &str, branch: &str) -> String {
+    let fields = table
+        .lines()
+        .map(|line| {
+            line.split("  ")
+                .map(str::trim)
+                .filter(|field| !field.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .find(|fields| fields.first().is_some_and(|f| f.ends_with(branch)))
+        .unwrap_or_else(|| panic!("no row for {branch:?}:\n{table}"));
+    fields[1].chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// Both JSON schemas follow the rendered Status column's gate order.
+/// The fixture populates every gate: an off-template worktree path, commits
+/// missing from main and upstream, an uncommitted edit, and an ASCII marker.
+#[rstest]
+fn test_list_json_symbols_follow_status_column(#[from(repo_with_remote)] mut repo: TestRepo) {
+    use ansi_str::AnsiStr;
+
+    let off_template = repo
+        .root_path()
+        .parent()
+        .expect("repo has a parent directory")
+        .join("off-template");
+    let feature = repo.add_worktree_at_path("feature", &off_template);
+    repo.commit_in_worktree(&feature, "feature.txt", "one\n", "Add feature file");
+    repo.run_git_in(&feature, &["push", "-u", "origin", "feature"]);
+    repo.commit_in_worktree(&feature, "second.txt", "two\n", "Add second file");
+    std::fs::write(feature.join("feature.txt"), "edited\n").unwrap();
+    repo.set_marker("feature", "*");
+
+    let run = |args: &[&str]| {
+        let output = repo
+            .wt_command()
+            .args(args)
+            .current_dir(repo.root_path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "wt {args:?} should succeed");
+        output.stdout
+    };
+
+    repo.write_test_config("[list]\njson-schema = 2\n");
+    let table = String::from_utf8_lossy(&run(&["list"]))
+        .ansi_strip()
+        .into_owned();
+    let rendered = status_cell(&table, "feature");
+    assert_eq!(rendered, "!⚐↑⇡*", "every gate populated:\n{table}");
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&run(&["list", "--format=json"])).unwrap();
+    let schema_2 = envelope["items"]
+        .as_array()
+        .expect("items array")
+        .iter()
+        .find(|item| item["branch"] == "feature")
+        .expect("feature row")["display"]["symbols"]
+        .as_str()
+        .expect("symbols")
+        .to_string();
+    assert_eq!(schema_2, rendered, "schema 2 follows the rendered order");
+
+    repo.write_test_config("[list]\njson-schema = 1\n");
+    let items: Vec<serde_json::Value> =
+        serde_json::from_slice(&run(&["list", "--format=json"])).unwrap();
+    let schema_1 = items
+        .iter()
+        .find(|item| item["branch"] == "feature")
+        .expect("feature row")["symbols"]
+        .as_str()
+        .expect("symbols")
+        .to_string();
+    assert_eq!(schema_1, rendered, "schema 1 follows the rendered order");
 }
 
 /// Schema 2 reports the branch marker as its own `marker` field, and folds
@@ -2432,6 +2620,7 @@ fn mock_summary_cache(
     summary: &str,
 ) {
     use sha2::{Digest, Sha256};
+    use worktrunk::git::PlumbingDiff;
 
     // Compute combined diff (matching compute_combined_diff in summary.rs)
     let mut diff = String::new();
@@ -2445,8 +2634,15 @@ fn mock_summary_cache(
     let head = String::from_utf8_lossy(&head_output.stdout)
         .trim()
         .to_string();
-    let merge_base = format!("main...{}", head);
-    if let Ok(output) = repo.git_command().args(["diff", &merge_base]).run() {
+    let merge_base = repo.git_output(&["merge-base", "main", &head]);
+    let patch_args = ["--find-renames", "--textconv", "--patch"];
+    if let Ok(output) = repo
+        .git_command()
+        .args(PlumbingDiff::Tree.args(&["-r"]))
+        .args(patch_args)
+        .args([merge_base.as_str(), head.as_str()])
+        .run()
+    {
         let branch_diff = String::from_utf8_lossy(&output.stdout);
         diff.push_str(&branch_diff);
     }
@@ -2456,7 +2652,10 @@ fn mock_summary_cache(
         let wt_str = wt_path.display().to_string();
         if let Ok(output) = repo
             .git_command()
-            .args(["-C", &wt_str, "diff", "HEAD"])
+            .args(["-C", &wt_str])
+            .args(PlumbingDiff::Index.args(&[]))
+            .args(patch_args)
+            .arg("HEAD")
             .run()
         {
             let wt_diff = String::from_utf8_lossy(&output.stdout);
@@ -2676,7 +2875,7 @@ fn test_readme_example_list(mut repo: TestRepo) {
 /// Generate README example: `wt list --full` output
 ///
 /// Shows additional columns: main…± (line diffs), CI status, and LLM summaries.
-/// Uses the documentation width (98 cols) so the sample fits the site content column.
+/// Uses the documentation width (99 cols) so the sample fits the site content column.
 /// Output: tests/snapshots/integration__integration_tests__list__readme_example_list_full.snap
 #[rstest]
 fn test_readme_example_list_full(mut repo: TestRepo) {
@@ -2691,7 +2890,7 @@ fn test_readme_example_list_full(mut repo: TestRepo) {
 /// Generate README example: `wt list --branches --full` output
 ///
 /// Shows branches without worktrees (⎇ symbol) alongside worktrees, plus CI status.
-/// Uses the documentation width (98 cols) so the sample fits the site content column.
+/// Uses the documentation width (99 cols) so the sample fits the site content column.
 /// Output: tests/snapshots/integration__integration_tests__list__readme_example_list_branches.snap
 #[rstest]
 fn test_readme_example_list_branches(mut repo: TestRepo) {
@@ -3628,8 +3827,9 @@ fn test_list_does_not_persist_observation_objects(mut repo: TestRepo) {
 }
 
 /// A broken system temporary-directory setting must not prevent either list
-/// entry point from rendering. Probe objects fall back to a temporary directory
-/// in Git's metadata and still disappear when the command exits.
+/// entry point from rendering, nor fail a task. Probe objects fall back to a
+/// temporary directory in Git's metadata and still disappear when the command
+/// exits. The untracked file makes the working-tree diff pass paths on stdin.
 #[cfg(unix)]
 #[rstest]
 fn test_list_survives_unavailable_system_temp_directory(mut repo: TestRepo) {
@@ -3638,6 +3838,7 @@ fn test_list_survives_unavailable_system_temp_directory(mut repo: TestRepo) {
     let feature_path = repo.add_worktree("feature");
     repo.commit("Main diverges");
     std::fs::write(feature_path.join("file.txt"), "feature\n").unwrap();
+    std::fs::write(feature_path.join("untracked.txt"), "untracked\n").unwrap();
 
     let before = repo.git_output(&["count-objects", "-v"]);
     let missing_temp = repo.root_path().join("missing-temp");
@@ -3654,7 +3855,7 @@ fn test_list_survives_unavailable_system_temp_directory(mut repo: TestRepo) {
             .output()
             .unwrap();
         assert!(
-            output.status.success(),
+            output.status.success() && output.stderr.is_empty(),
             "{} should fall back from an unavailable TMPDIR; stderr:\n{}",
             args.join(" "),
             String::from_utf8_lossy(&output.stderr)

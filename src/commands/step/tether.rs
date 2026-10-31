@@ -27,6 +27,7 @@
 //! outlive it — Windows neither reparents to a single init nor offers a pgid.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -65,23 +66,33 @@ pub(crate) fn step_tether(command: &[String], working_dir: Option<&Path>) -> Res
     // shell's directory.
     worktrunk::shell_exec::scrub_directive_env_vars(&mut cmd);
     set_new_process_group(&mut cmd);
+    // The supervised command is in a different process group, so terminal
+    // Ctrl-C reaches this supervisor alone. Hold a foreground signal lease
+    // while it runs; the reaper observes cancellation and sweeps its group.
+    #[cfg(unix)]
+    let signals = worktrunk::signal_forwarder::ForegroundSignals::install(
+        worktrunk::shell_exec::TerminalInterrupt::Cancels,
+    )?;
     let mut trace = CommandTrace::new(None, &command.join(" "));
-    let mut child = match cmd.spawn() {
+    #[cfg(unix)]
+    let spawned = signals.spawn(&mut cmd);
+    #[cfg(windows)]
+    let spawned = worktrunk::shell_exec::spawn_shared_child(&mut cmd).map_err(anyhow::Error::from);
+    let child = match spawned {
         Ok(child) => child,
         Err(e) => {
-            trace.fail(&e);
+            trace.fail(e.as_ref());
             return Err(e).with_context(|| format!("spawn tethered command: {}", command[0]));
         }
     };
+    let child = Arc::new(child);
     let id = child.id();
 
-    // Reaper: polls until the worktree is gone, then kills the tree so the
-    // supervised child exits and `wait` returns. Only spawned when there is a
-    // worktree to watch; otherwise teardown relies solely on the command's
-    // own exit.
-    if let Some(dir) = worktree {
+    // Reaper: polls for worktree removal or command interruption, then kills
+    // the tree so the supervised child exits and `wait` returns.
+    if worktree.is_some() || cfg!(unix) {
         std::thread::spawn(move || {
-            while !worktree_gone(&dir) {
+            while !worktree.as_deref().is_some_and(worktree_gone) && !interrupted() {
                 std::thread::sleep(POLL_INTERVAL);
             }
             kill_process_tree(id);
@@ -89,7 +100,11 @@ pub(crate) fn step_tether(command: &[String], working_dir: Option<&Path>) -> Res
     }
 
     // Block until the child exits — killed by the reaper, or on its own.
-    match child.wait() {
+    #[cfg(unix)]
+    let waited = signals.wait(&child).map(|outcome| outcome.status);
+    #[cfg(windows)]
+    let waited = child.wait();
+    match waited {
         Ok(status) => trace.complete(status.success()),
         Err(e) => trace.fail(&e),
     }
@@ -102,6 +117,16 @@ pub(crate) fn step_tether(command: &[String], working_dir: Option<&Path>) -> Res
     // A reaper still sleeping between polls (the command self-exited) dies
     // with this process when it returns.
     Ok(())
+}
+
+#[cfg(unix)]
+fn interrupted() -> bool {
+    worktrunk::signal_forwarder::operation_interrupt_signal().is_some()
+}
+
+#[cfg(windows)]
+fn interrupted() -> bool {
+    false
 }
 
 /// The worktree path no longer resolves. Only `NotFound` counts as gone; a
@@ -122,8 +147,8 @@ fn set_new_process_group(cmd: &mut std::process::Command) {
 
     // POSIX `setpgid(0, 0)`: the child's pid is the new group's id, so
     // `child.id()` is the pgid. Children that do not re-`setpgid` (node,
-    // Vite, the esbuild sidecar) stay in the group. Same invariant the
-    // foreground runner relies on (`shell_exec.rs`).
+    // Vite, the esbuild sidecar) stay in the group. Timeout-bounded captures
+    // use the same ownership (`shell_exec.rs`).
     cmd.process_group(0);
 }
 
@@ -144,7 +169,7 @@ fn kill_process_tree(pid: u32) {
     // `process_group(0)` made the child its own group leader, so the pid is
     // the pgid. The bounded TERM → KILL escalation reaches every member,
     // including a child that reparented to PID 1 after the leader exited.
-    worktrunk::shell_exec::forward_signal_with_escalation(pid as i32, signal_hook::consts::SIGTERM);
+    worktrunk::shell_exec::terminate_process_group(pid as i32);
 }
 
 #[cfg(windows)]
@@ -152,11 +177,12 @@ fn kill_process_tree(pid: u32) {
     // No killable process group on Windows; `taskkill /T` terminates the
     // process and its child tree, `/F` forces. Best-effort: the pid may
     // already be gone (self-exit) or have left detached children.
-    let _ = std::process::Command::new("taskkill")
+    let mut command = std::process::Command::new("taskkill");
+    command
         .args(["/T", "/F", "/PID", &pid.to_string()])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+        .stderr(std::process::Stdio::null());
+    let _ = worktrunk::shell_exec::spawn(&mut command).and_then(|mut child| child.wait());
 }
 
 #[cfg(test)]

@@ -68,7 +68,7 @@ pub struct CommitGenerationConfig {
     pub template: Option<String>,
 
     /// Inline template for squash commit message prompt
-    /// Available variables: {{ commits }}, {{ target_branch }}, {{ branch }}, {{ repo }}
+    /// Available variables: {{ commit_details }}, {{ target_branch }}, {{ branch }}, {{ repo }}
     #[serde(default, rename = "squash-template")]
     pub squash_template: Option<String>,
 
@@ -88,10 +88,12 @@ pub struct CommitGenerationConfig {
 impl CommitGenerationConfig {
     /// Returns true if an LLM command is configured
     pub fn is_configured(&self) -> bool {
-        self.command
-            .as_ref()
-            .map(|s| !s.trim().is_empty())
-            .unwrap_or(false)
+        self.command().is_some()
+    }
+
+    /// The configured LLM command, excluding empty or whitespace-only values.
+    pub fn command(&self) -> Option<&str> {
+        self.command.as_deref().filter(|s| !s.trim().is_empty())
     }
 }
 
@@ -158,7 +160,7 @@ pub struct ListConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remotes: Option<bool>,
 
-    /// Enable LLM-generated branch summaries (picker tab 5 + list Summary column).
+    /// Enable LLM-generated branch summaries (picker tab 6 + list Summary column).
     /// Requires `[commit.generation] command` to be configured.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<bool>,
@@ -415,6 +417,13 @@ pub struct SwitchPickerConfig {
     /// Example: `pager = "delta --paging=never"`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pager: Option<String>,
+
+    /// Show the preview panel when the picker opens (default: true)
+    ///
+    /// With `preview = false` the picker opens list-only; `Alt-p` still
+    /// toggles the preview.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<bool>,
 }
 
 impl SwitchPickerConfig {
@@ -422,12 +431,18 @@ impl SwitchPickerConfig {
     pub fn pager(&self) -> Option<&str> {
         self.pager.as_deref()
     }
+
+    /// Show the preview panel when the picker opens (default: true)
+    pub fn preview(&self) -> bool {
+        self.preview.unwrap_or(true)
+    }
 }
 
 impl Merge for SwitchPickerConfig {
     fn merge_with(&self, other: &Self) -> Self {
         Self {
             pager: other.pager.clone().or_else(|| self.pager.clone()),
+            preview: other.preview.or(self.preview),
         }
     }
 }

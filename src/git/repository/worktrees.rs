@@ -1,6 +1,7 @@
 //! Worktree management operations for Repository.
 
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
@@ -8,15 +9,38 @@ use anyhow::Context as _;
 use color_print::cformat;
 use dunce::canonicalize;
 
+use super::working_tree::{
+    operation_in_progress_at, path_to_logging_context, registration_worktree_path,
+};
 use super::{
-    GitError, Repository, ResolvedWorktree, Selector, WorktreeInfo, is_valid_branch_name,
-    normalize_selector, resolve_input_path,
+    GitError, InProgressOperation, Repository, ResolvedWorktree, Selector, WorktreeInfo,
+    is_valid_branch_name, normalize_selector, resolve_input_path,
 };
-use crate::git::WorktreeId;
+use crate::git::{CommandError, PlumbingDiff, WorktreeId, finalize_worktrees, is_bare_repo_dir};
 use crate::path::{format_path_for_display, paths_match};
-use crate::styling::{
-    eprintln, format_with_gutter, hint_message, suggest_command, warning_message,
-};
+use crate::shell_exec::Cmd;
+use crate::styling::{eprintln, format_with_gutter, hint_message, warning_message};
+
+/// List top-level entries remaining in a directory after a failed removal.
+///
+/// Returns None if the directory doesn't exist, can't be read, or is empty.
+/// Entries are sorted, with directories suffixed with `/`.
+fn list_remaining_entries(path: &Path) -> Option<Vec<String>> {
+    let mut entries: Vec<String> = std::fs::read_dir(path)
+        .ok()?
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let name = e.file_name().to_string_lossy().into_owned();
+            if e.file_type().ok()?.is_dir() {
+                Some(format!("{name}/"))
+            } else {
+                Some(name)
+            }
+        })
+        .collect();
+    entries.sort();
+    (!entries.is_empty()).then_some(entries)
+}
 
 impl Repository {
     /// List all worktrees for this repository.
@@ -38,24 +62,27 @@ impl Repository {
             .get_or_try_init(|| {
                 let stdout = {
                     let _registry = self.worktree_registry_read();
-                    self.run_command(&["worktree", "list", "--porcelain"])?
+                    self.run_command_bytes(&["worktree", "list", "--porcelain", "-z"])?
                 };
-                let raw_worktrees = WorktreeInfo::parse_porcelain_list(&stdout)?;
+                let raw_worktrees = WorktreeInfo::parse_porcelain_list_z(&stdout)?;
                 let mut worktrees: Vec<_> =
                     raw_worktrees.into_iter().filter(|wt| !wt.bare).collect();
 
-                // Submodule path correction.
+                // Main-worktree path correction.
                 //
                 // Git's `get_main_worktree()` computes the main worktree path by stripping
-                // a trailing `/.git` from the common dir. For submodules, the common dir is
-                // `.git/modules/sub` (no trailing `/.git`), so git leaves it unchanged —
-                // reporting the git data directory as the "main worktree" path. Git does not
-                // consult `core.worktree` in this code path.
+                // a trailing `/.git` from the common dir. Two layouts have no such suffix,
+                // so git leaves the path unchanged and reports the git data directory as
+                // the "main worktree": submodules, whose common dir is `.git/modules/sub`,
+                // and `--separate-git-dir` repositories, whose common dir is wherever the
+                // user put the store. Git consults neither `core.worktree` nor its own
+                // `gitdir` backlink in this code path.
                 //
                 // We detect this by checking whether the first worktree's path equals
                 // git_common_dir (which never holds for normal repos, where git_common_dir
                 // is `.git` inside the worktree). When matched, we correct it using
-                // repo_path(), which reads `core.worktree` from the bulk config map.
+                // repo_path(), which resolves both layouts from the signals git does
+                // record.
                 //
                 // We fix this here rather than at each call site because list_worktrees()
                 // is the single point where worktree paths enter the system — all consumers
@@ -68,6 +95,7 @@ impl Repository {
                     first.path = self.repo_path()?.to_path_buf();
                 }
 
+                finalize_worktrees(self, &mut worktrees);
                 Ok(worktrees)
             })
             .map(Vec::as_slice)
@@ -111,10 +139,7 @@ impl Repository {
             return Ok(None);
         };
         if self.worktree_is_unusable(&path)? {
-            return Err(GitError::WorktreeMissing {
-                branch: branch.to_string(),
-            }
-            .into());
+            return Err(GitError::worktree_missing(branch.to_string(), &path).into());
         }
         Ok(Some(path))
     }
@@ -189,14 +214,35 @@ impl Repository {
             .map(|wt| (wt.path.clone(), wt.branch.clone())))
     }
 
-    /// Unregister the one worktree at `path`, whose directory is already gone.
+    /// Unregister the one stale worktree at `path`, as `git worktree prune`
+    /// would, leaving whatever remains of its directory in place.
     ///
-    /// Git tracks worktrees in `.git/worktrees/<id>/`. When a worktree's
-    /// directory disappears — deleted externally, or renamed into the trash by
+    /// Git tracks worktrees in `.git/worktrees/<id>/` and calls an entry
+    /// prunable once `<path>/.git` is gone. Usually the whole directory went —
+    /// deleted externally, or renamed into the trash by
     /// [`stage_worktree_removal`](crate::git::remove::stage_worktree_removal) —
-    /// that admin dir is stale and has to go. `git worktree remove` skips its
-    /// clean check when the directory is missing and deletes just that entry,
-    /// so it is the scoped spelling of the cleanup.
+    /// but a sweep that deletes idle files and keeps directories, like macOS's
+    /// `$TMPDIR` cleanup, takes only the `.git`. Either way the admin dir is
+    /// stale, and deleting it is all `git worktree prune` does to the entry.
+    ///
+    /// # Why not a git command
+    ///
+    /// No git command unregisters one prunable entry in both shapes.
+    /// `git worktree prune` takes no path (below), and `git worktree remove`
+    /// refuses an entry whose directory remains, `--force` included: its
+    /// validation wants `<path>/.git` unless the whole directory is gone. So
+    /// this reproduces git's prune for the one entry — its test, then its
+    /// deletion.
+    ///
+    /// The test is git's own (`should_prune_worktree`): the entry is not
+    /// locked, and nothing is at the `.git` its `gitdir` file names. It runs
+    /// under the registry lock just before the deletion, because the caller's
+    /// `prunable` came from an earlier listing, and it refuses rather than
+    /// deletes when either half has changed since — a lock taken, or a
+    /// remounted volume that reconnected the worktree. Deleting a live
+    /// worktree's admin dir would strand its checkout. Only a definite absence
+    /// counts as nothing being at `.git`; one that can't be statted for another
+    /// reason keeps the entry, where git's own test would prune it.
     ///
     /// # Why not `git worktree prune`
     ///
@@ -210,48 +256,114 @@ impl Repository {
     /// the per-worktree reflog, `refs/worktree/*` and `refs/bisect/*`, and any
     /// in-progress rebase or merge all go with it. `git worktree repair`
     /// cannot rebuild them — it relinks an admin dir, it does not recreate
-    /// one. Naming the target keeps a removal's blast radius equal to its
-    /// intent.
-    ///
-    /// # Locked worktrees
-    ///
-    /// A repo-wide prune silently skips a locked entry; `git worktree remove`
-    /// fails on one instead. Every call site has already established the target
-    /// is unlocked, by a different route each: `prepare_worktree_removal`
-    /// returns `WorktreeLocked` at the top of its path/current arm and rejects
-    /// a locked worktree before staging one for removal, and prune's
-    /// `gather_check_items` never selects one as a candidate.
+    /// one. A detached entry loses more: its `HEAD` was the only ref holding
+    /// commits made there, which the next `git gc` may then delete. Naming
+    /// the target keeps a removal's blast radius equal to its intent.
     ///
     /// # Concurrent calls
     ///
-    /// This method and [`Repository::remove_worktree`] serialize their `git
-    /// worktree remove` commands with each other for the same repository.
-    /// Naming one entry bounds what a call *deletes*, not what it *reads*.
-    /// `git worktree remove` enumerates *every* sibling under `.git/worktrees/`
-    /// and reads each one's `commondir` while resolving its target, so a
-    /// teardown overlapping another worker's teardown — or a branch delete's
-    /// `list_worktrees` probe — can read an entry mid-deletion and fail
-    /// (`failed to read …/commondir` / `Invalid path …/.git/worktrees/<id>`).
-    /// That is Git's own TOCTOU between the enumerator's `readdir` and its
-    /// `open`. The repository-scoped write lock closes the in-process window;
-    /// [`Repository::list_worktrees`] takes the matching read side.
+    /// This deletion and [`Repository::remove_worktree`]'s `git worktree
+    /// remove` serialize with each other for the same repository. Naming one
+    /// entry bounds what a call *deletes*, not what others *read*: `git
+    /// worktree remove` and `git worktree list` enumerate *every* entry under
+    /// `.git/worktrees/` and read each one's files, so one overlapping this
+    /// deletion can read the entry mid-deletion and fail (`failed to read
+    /// …/commondir` / `Invalid path …/.git/worktrees/<id>`). That is Git's own
+    /// TOCTOU between the enumerator's `readdir` and its `open`. The
+    /// repository-scoped write lock closes the in-process window;
+    /// [`Repository::list_worktrees`] takes the matching read side. A `git
+    /// worktree list` in an *unrelated* process — outside wt's lock — remains
+    /// exposed; wt's serialization only covers its own removals.
     ///
-    /// Git also `rmdir`s the containing `.git/worktrees` once the last entry
-    /// goes, but that only succeeds on an already-empty directory, and every
-    /// per-worktree command in the removal chain (`git status`, the fsmonitor
-    /// stop) runs while that worktree is still registered, so an emptied
-    /// directory has no in-flight reader left to strand. A `git worktree list`
-    /// in an *unrelated* process — outside wt's lock — remains exposed to the
-    /// same `Invalid path` race; wt's serialization only covers its own
-    /// removals.
+    /// Git also `rmdir`s `.git/worktrees` once its last entry goes. This
+    /// leaves the empty directory, which git reads as no linked worktrees.
     pub fn prune_worktree_entry(&self, path: &Path) -> anyhow::Result<()> {
-        // Every caller's path came from `list_worktrees`, which parses git's
-        // porcelain as UTF-8, so this only fires if that edge ever stops
-        // guaranteeing it — a bare `?` rather than a rendered path.
-        let path_str = path.to_str().context("worktree path is not valid UTF-8")?;
+        let display = format_path_for_display(path);
         let _registry = self.worktree_registry_write();
-        self.run_command(&["worktree", "remove", path_str])?;
-        Ok(())
+        let (registration, recorded) = self.registration_at(path)?;
+        if !definitely_absent(&registration.join("locked"))? {
+            anyhow::bail!("Worktree @ {display} is locked");
+        }
+        if !definitely_absent(&recorded.join(".git"))? {
+            anyhow::bail!("Worktree @ {display} is no longer stale; its .git exists");
+        }
+        std::fs::remove_dir_all(&registration).with_context(|| {
+            format!(
+                "Failed to delete {}",
+                format_path_for_display(&registration)
+            )
+        })
+    }
+
+    /// What unregistering the stale worktree at `path` would destroy that
+    /// nothing else holds: staged changes in its index, or a git operation
+    /// partway through. `None` when its registration holds neither.
+    ///
+    /// [`prune_worktree_entry`](Self::prune_worktree_entry) deletes the
+    /// registration, and the index and any rebase, merge, cherry-pick, revert
+    /// or bisect state go with it. While the registration survives, `git
+    /// worktree repair <path>` reconnects the directory — recreated first, if
+    /// it went too — and all of that comes back; afterwards staged files
+    /// survive only as dangling blobs. So the stale-removal paths ask this
+    /// first and keep an entry that holds either, which is where they are
+    /// more careful than `git worktree prune`. Files in a directory that
+    /// remains stay on disk either way, and a registration with no index has
+    /// nothing staged.
+    pub fn stale_worktree_work(&self, path: &Path) -> anyhow::Result<Option<StaleWorktreeWork>> {
+        let (registration, _) = self.registration_at(path)?;
+        if let Some(operation) = operation_in_progress_at(&registration) {
+            return Ok(Some(StaleWorktreeWork::Operation(operation)));
+        }
+        if definitely_absent(&registration.join("index"))? {
+            return Ok(None);
+        }
+        // The registration is a git dir in its own right, so its index is read
+        // against its `HEAD` without the working tree git can no longer find.
+        // Both commands answer with exit 0 or 1; anything else is a failure.
+        let git = |args: &[&str]| -> anyhow::Result<(bool, String)> {
+            let mut all = vec![OsStr::new("--git-dir"), registration.as_os_str()];
+            all.extend(args.iter().map(OsStr::new));
+            let output = self
+                .with_object_store_env(
+                    Cmd::new("git")
+                        .args(all.iter().copied())
+                        .context(path_to_logging_context(path))
+                        .scrub_git_discovery_env(),
+                )
+                .run()?;
+            match output.status.code() {
+                Some(0 | 1) => Ok((
+                    output.status.success(),
+                    String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+                )),
+                _ => Err(CommandError::from_failed_output("git", &all, &output).into()),
+            }
+        };
+        // An unborn `HEAD` compares against the empty tree, so everything in
+        // its index counts as staged.
+        let (born, head) = git(&["rev-parse", "--verify", "--quiet", "HEAD"])?;
+        let base = self.index_base_for(born.then_some(head))?;
+        // `--quiet` exits 1 when the index differs from the base.
+        let (unchanged, _) = git(&PlumbingDiff::Index.args(&["--cached", "--quiet", &base, "--"]))?;
+        Ok((!unchanged).then_some(StaleWorktreeWork::StagedChanges))
+    }
+
+    /// The registration `<common>/worktrees/<id>` whose `gitdir` names the
+    /// worktree at `path`, with the worktree path it records.
+    ///
+    /// Unreadable siblings (an entry another process is deleting) are not
+    /// this one, so they are passed over rather than failing the lookup.
+    pub(crate) fn registration_at(&self, path: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
+        let registrations = self.git_common_dir().join("worktrees");
+        std::fs::read_dir(&registrations)
+            .with_context(|| format!("Failed to read {}", format_path_for_display(&registrations)))?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find_map(|registration| {
+                let recorded = registration_worktree_path(&registration).ok()?;
+                paths_match(&recorded, path).then_some((registration, recorded))
+            })
+            .with_context(|| format!("No worktree registered @ {}", format_path_for_display(path)))
     }
 
     /// Remove a worktree at the specified path.
@@ -284,24 +396,16 @@ impl Repository {
     /// user-requested `force`, the user opted into destructive removal, so no
     /// re-check.)
     pub fn remove_worktree(&self, path: &std::path::Path, force: bool) -> anyhow::Result<()> {
-        let path_str = path.to_str().ok_or_else(|| {
-            anyhow::Error::from(GitError::Other {
-                message: format!(
-                    "Worktree path contains invalid UTF-8: {}",
-                    format_path_for_display(path)
-                ),
-            })
-        })?;
         let use_force = if force {
             true
         } else {
             self.worktree_at(path).has_initialized_submodules()?
         };
-        let mut args = vec!["worktree", "remove"];
+        let mut args = vec![OsStr::new("worktree"), OsStr::new("remove")];
         if use_force {
-            args.push("--force");
+            args.push(OsStr::new("--force"));
         }
-        args.push(path_str);
+        args.push(path.as_os_str());
 
         // The synthesized-force cleanliness check and destructive command are
         // one critical section. If this waited for another registry teardown
@@ -322,7 +426,18 @@ impl Repository {
             tracing::debug!("Using --force for worktree removal due to initialized submodules");
         }
 
-        self.run_command(&args)?;
+        // Capture the display identity before Git may remove its `.git` entry.
+        let branch = self
+            .worktree_at(path)
+            .branch()?
+            .unwrap_or_else(|| crate::git::path_dir_name(path).to_string());
+        self.run_command(&args)
+            .map_err(|error| GitError::WorktreeRemovalFailed {
+                branch,
+                path: path.to_path_buf(),
+                error,
+                remaining_entries: list_remaining_entries(path),
+            })?;
         Ok(())
     }
 
@@ -350,7 +465,7 @@ impl Repository {
                 self.switch_previous().ok_or_else(|| {
                     GitError::Other {
                         message: cformat!(
-                            "No previous branch found in history. Run <underline>wt list</> to see available worktrees."
+                            "No previous branch found in history; to see available worktrees, run <bold>wt list</>"
                         ),
                     }
                     .into()
@@ -359,7 +474,7 @@ impl Repository {
             "^" => self.default_branch().ok_or_else(|| {
                 GitError::Other {
                     message: cformat!(
-                        "Cannot determine default branch. Specify target explicitly or run <underline>wt config state default-branch set <bold>BRANCH</></>"
+                        "Cannot determine default branch; specify the target explicitly, or to configure one, run <bold>wt config state default-branch set BRANCH</>"
                     ),
                 }
                 .into()
@@ -389,17 +504,20 @@ impl Repository {
     /// Every argument that names a worktree routes through here, so they all
     /// accept the same vocabulary: the shortcuts, a branch name, and the path
     /// of the worktree itself. wt addresses worktrees by branch (see the
-    /// "Worktree Model" section of `CLAUDE.md`), so the branch is tried first
+    /// "Worktree Model" section of `AGENTS.md`), so the branch is tried first
     /// and a path only answers what a branch name cannot — a detached worktree,
     /// or one of several checkouts of the same branch.
     ///
     /// Resolution order:
-    /// 1. `@` — the current worktree, matched by path so detached HEAD resolves
-    /// 2. `-` / `^` — the previous / default branch, then as a branch below
-    /// 3. a branch with a worktree
-    /// 4. a path naming a registered worktree — absolute, `~`-relative, or
+    /// 1. `@` — the current worktree, matched by path so detached HEAD
+    ///    resolves; outside any worktree, the branch HEAD names, as below
+    /// 2. `-` — the worktree `wt switch` last left, by the path it recorded
+    ///    (see [`switch_previous_worktree`](Self::switch_previous_worktree))
+    /// 3. `-` / `^` — the previous / default branch, then as a branch below
+    /// 4. a branch with a worktree
+    /// 5. a path naming a registered worktree — absolute, `~`-relative, or
     ///    relative to `-C` (see [`resolve_input_path`])
-    /// 5. otherwise the branch alone, which may or may not exist
+    /// 6. otherwise the branch alone, which may or may not exist
     ///
     /// A path that named no worktree lands in `BranchOnly` or
     /// `NoWorktreeAtPath` — [`resolve_selector`](Self::resolve_selector)
@@ -416,27 +534,39 @@ impl Repository {
     /// [`usable_worktree_for_branch`](Self::usable_worktree_for_branch)'s job,
     /// which the commands that go on to run there call instead.
     pub fn resolve_worktree(&self, name: &str) -> anyhow::Result<ResolvedWorktree> {
-        // `@` is the only selector that resolves by path rather than by name,
-        // which is what lets it answer in a detached worktree — where the
-        // branch expansion `expand_selector` would apply has nothing to return.
+        // `@` and `-` resolve by path rather than by name, which is what lets
+        // them answer for a detached worktree — where the branch expansion
+        // `expand_selector` would apply has nothing to return.
         let name = normalize_selector(name);
         if name == "@" {
-            // If worktree_root fails (e.g., in bare repo directory), give a clear error
-            let path = self
-                .current_worktree()
-                .root()
-                .map_err(|_| GitError::NotInWorktree {
-                    action: Some("resolve @".into()),
-                })?;
-            // Compare canonical identities so alternate path spellings (for
-            // example macOS `/var` and `/private/var`) select one inventory
-            // entry without changing Git's registered path.
+            // `root()` falls back to the cwd itself outside a work tree, so
+            // only a registered worktree at that path counts. Compare
+            // canonical identities so alternate path spellings (for example
+            // macOS `/var` and `/private/var`) select one inventory entry
+            // without changing Git's registered path.
+            let current = self.current_worktree();
+            let path = current.root()?;
             let current_id = WorktreeId::new(&path);
-            let branch = self
+            if let Some(wt) = self
                 .list_worktrees()?
                 .iter()
                 .find(|wt| wt.id() == current_id)
-                .and_then(|wt| wt.branch.clone());
+            {
+                return Ok(ResolvedWorktree::worktree(path, wt.branch.clone()));
+            }
+            // Inside a work tree git no longer has registered at this path (a
+            // worktree moved without `git worktree repair`), `@` still means
+            // this directory, which holds no worktree wt can act on.
+            if current.prewarm_info()?.is_inside {
+                return Ok(ResolvedWorktree::NoWorktreeAtPath { path });
+            }
+            // Outside every work tree — a bare repo's directory, or a `.git`
+            // directory — `@` falls through to the branch HEAD names, as
+            // `expand_selector` reads it.
+        }
+        if name == "-"
+            && let Some((path, branch)) = self.switch_previous_worktree()?
+        {
             return Ok(ResolvedWorktree::worktree(path, branch));
         }
 
@@ -447,10 +577,10 @@ impl Repository {
     /// what the selector could have meant.
     ///
     /// Split from [`resolve_worktree`](Self::resolve_worktree) for the callers
-    /// that do their own expanding before they get here — `wt switch`, whose
-    /// `pr:`/`mr:` dispatch and remote-prefix strip run first and report their
-    /// rewriting through the [`Selector`]. They used to re-implement these
-    /// three steps rather than expand into a shared one.
+    /// whose selector comes from somewhere other than the user's token — `wt
+    /// switch`, for a `pr:`/`mr:` branch or a stripped remote prefix — and
+    /// report that rewriting through the [`Selector`]. They used to
+    /// re-implement these three steps rather than expand into a shared one.
     pub fn resolve_selector(&self, selector: &Selector) -> anyhow::Result<ResolvedWorktree> {
         let token = selector.token();
 
@@ -459,11 +589,9 @@ impl Repository {
         }
 
         // Both remaining steps are about the token as a path, so
-        // `names_a_path` gates them together — a caller that turns it off gets
-        // neither a worktree matched by path nor a verdict about a directory,
-        // which is what `wt switch --create` needs: the argument names a branch
-        // to create, and a directory sitting at that spelling is the clobber
-        // check's business.
+        // `names_a_path` gates them together: a rewritten token gets neither a
+        // worktree matched by path nor a verdict about a directory, since the
+        // user never typed it as a path.
         if !selector.names_a_path() {
             return Ok(ResolvedWorktree::branch_only(token.to_string()));
         }
@@ -485,8 +613,8 @@ impl Repository {
     /// worktree.
     ///
     /// [`resolve_worktree`](Self::resolve_worktree) for the arguments that want
-    /// a branch rather than a worktree — `wt step promote`, and the `--branch`
-    /// of the `wt config state` commands, which key state by branch name. A
+    /// a branch rather than a worktree — the `--branch` of the `wt config
+    /// state` commands, which key state by branch name, defaulting to `@`. A
     /// branch with no worktree is a fine answer to those; a worktree named by
     /// path that has no branch is not.
     pub fn require_selected_branch(&self, name: &str, action: &str) -> anyhow::Result<String> {
@@ -501,6 +629,15 @@ impl Repository {
             ResolvedWorktree::NoWorktreeAtPath { path } => {
                 Err(GitError::WorktreeNotFoundAtPath { path }.into())
             }
+            // Name the detached worktree only when it isn't the one the
+            // command runs in, as `GitError::DetachedHead` asks.
+            ResolvedWorktree::Worktree {
+                path, branch: None, ..
+            } if self.is_current_worktree(&path)? => Err(GitError::DetachedHead {
+                action: Some(action.to_string()),
+                worktree: None,
+            }
+            .into()),
             ResolvedWorktree::Worktree {
                 path, branch: None, ..
             } => Err(GitError::DetachedHead {
@@ -514,19 +651,41 @@ impl Repository {
         }
     }
 
-    /// The path of the worktree a selector names, erroring when it names none.
+    /// Whether `path` is the worktree this repository was discovered in.
+    fn is_current_worktree(&self, path: &Path) -> anyhow::Result<bool> {
+        Ok(WorktreeId::new(self.current_worktree().root()?) == WorktreeId::new(path))
+    }
+
+    /// This repository, rooted at the worktree at `path`.
+    ///
+    /// Keeps `self`, discovered from the cwd and with the caches it has
+    /// already filled, when `path` is the worktree it was discovered in, so a
+    /// command acting on `@` there runs exactly as it would from the cwd.
+    /// Otherwise discovers the repository at `path`.
+    pub fn rooted_at(self, path: &Path) -> anyhow::Result<Self> {
+        if self.is_current_worktree(path)? {
+            Ok(self)
+        } else {
+            Self::at(path)
+        }
+    }
+
+    /// The worktree a selector names — its path, and its branch (`None` when
+    /// detached) — erroring when it names none.
     ///
     /// [`resolve_worktree`](Self::resolve_worktree) for the commands that need a
-    /// worktree to operate in rather than a branch to reason about — `wt step
-    /// diff --branch`, `copy-ignored --from`/`--to`, `promote`. A branch with no
-    /// checkout and a name matching nothing at all are the same answer to them.
+    /// worktree to operate in rather than a branch to reason about. A branch
+    /// with no checkout and a name matching nothing at all are the same answer
+    /// to them. The branch comes back with the path so a caller that needs
+    /// both uses the pair resolution found, rather than looking one up from
+    /// the other: a branch checked out twice maps back to the wrong path.
     /// A selector matching nothing at all is reported as such, rather than as a
     /// branch without a worktree: `wt switch <the selector>` creates a worktree
     /// only when the branch exists, so offering it for a mistyped path would
     /// just fail again.
-    pub fn require_worktree(&self, name: &str) -> anyhow::Result<PathBuf> {
+    pub fn require_worktree(&self, name: &str) -> anyhow::Result<(PathBuf, Option<String>)> {
         match self.resolve_worktree(name)? {
-            ResolvedWorktree::Worktree { path, .. } => Ok(path),
+            ResolvedWorktree::Worktree { path, branch, .. } => Ok((path, branch)),
             ResolvedWorktree::BranchOnly { branch, .. } => Err(self.no_worktree_error(branch)),
             ResolvedWorktree::NoWorktreeAtPath { path } => {
                 Err(GitError::WorktreeNotFoundAtPath { path }.into())
@@ -648,6 +807,30 @@ impl Repository {
     }
 }
 
+/// What a stale worktree's registration holds that unregistering it would
+/// destroy — see [`Repository::stale_worktree_work`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaleWorktreeWork {
+    /// The index differs from `HEAD`.
+    StagedChanges,
+    /// A git operation is partway through.
+    Operation(InProgressOperation),
+}
+
+/// Whether nothing is at `path`: `NotFound`, or `NotADirectory` where a parent
+/// became a file. Any other error is returned, so a caller deciding whether to
+/// delete keeps what it could not check.
+fn definitely_absent(path: &Path) -> anyhow::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(e) => match e.kind() {
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => Ok(true),
+            _ => Err(anyhow::Error::new(e)
+                .context(format!("Failed to check {}", format_path_for_display(path)))),
+        },
+    }
+}
+
 /// Whether `path` is a directory git would find data in — somebody's checkout
 /// or repository, rather than a leftover skeleton.
 ///
@@ -658,10 +841,9 @@ impl Repository {
 /// bare layout the repository sits among the worktrees it serves, one `../`
 /// from any command, and it holds every object.
 ///
-/// The bare test is git's own from `is_git_directory()`: `HEAD`, plus `objects`
-/// and `refs` directories. It is deliberately shallow — this decides whether to
-/// *withhold* a claim, so a false positive costs a vaguer message and a false
-/// negative costs a wrong one.
+/// The bare test is [`is_bare_repo_dir`], and its shallowness is what this
+/// caller wants: the answer decides whether to *withhold* a claim, so a false
+/// positive costs a vaguer message and a false negative costs a wrong one.
 ///
 /// Which is why absence has to be established rather than assumed. `Path::exists`
 /// answers `false` for every error alike, so a `.git` that cannot be statted —
@@ -691,7 +873,7 @@ fn holds_git_data(path: &Path) -> bool {
     }
     // Reached only when that probe succeeded in saying "nothing there", so the
     // directory is readable and the bare shape can be read plainly.
-    path.join("HEAD").exists() && path.join("objects").is_dir() && path.join("refs").is_dir()
+    is_bare_repo_dir(path)
 }
 
 /// Paths of every worktree checked out on `branch`, in git's listing order.
@@ -711,7 +893,7 @@ pub(crate) fn worktree_paths_for_branch(worktrees: &[WorktreeInfo], branch: &str
 ///
 /// The all-at-once counterpart to `worktree_paths_for_branch`, for callers
 /// classifying the whole list rather than resolving one branch — `wt list`
-/// flags each affected row with `⚑` so the ambiguity is visible before a
+/// flags each affected row with `⚐` so the ambiguity is visible before a
 /// command resolves the branch and warns.
 pub fn duplicated_branches(worktrees: &[WorktreeInfo]) -> HashSet<&str> {
     let mut seen = HashSet::new();
@@ -761,7 +943,8 @@ fn warn_duplicate_checkout(branch: &str, paths: &[PathBuf]) {
         // removes exactly the worktree named and retains the branch the others
         // still hold, so it's safe to suggest for a duplicate.
         for extra in &paths[1..] {
-            let cmd = suggest_command("remove", &[&format_path_for_display(extra)], &[]);
+            // Already shell-ready; `suggest_command` would escape it again.
+            let cmd = format!("wt remove {}", format_path_for_display(extra));
             eprintln!(
                 "{}",
                 hint_message(cformat!("To drop a duplicate, run <underline>{cmd}</>"))

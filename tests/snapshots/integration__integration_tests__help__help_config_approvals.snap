@@ -101,7 +101,7 @@ Check whether an unattended run would stop for approval:
 
 Approved commands are saved to [2m~/.config/worktrunk/approvals.toml[0m. Re-approval is required when the command template changes or the project moves.
 
-[2m--yes[0m bypasses the prompt, and what it leaves behind depends on the command it is passed to. On a command that runs project commands it grants consent for that run alone and records nothing, so the next run asks again. On [2mwt config approvals add[0m the record is the whole point, so the approvals are written — which is how an unattended environment pre-approves a project it has just cloned.
+[2m--yes[0m approves project commands for the current run without saving approval. [2mwt config approvals add --yes[0m saves approvals for future runs.
 
 [1m[32mReading approval state[0m
 
@@ -118,6 +118,6 @@ Approved commands are saved to [2m~/.config/worktrunk/approvals.toml[0m. Re-ap
 
 [2mstate[0m is [2mno_commands[0m (the project declares none), [2mapproval_required[0m (at least one is unapproved), or [2mapproved[0m. [2mname[0m is absent for an unnamed command and for the commit-template fragment.
 
-[2mstale[0m is separate rather than a fourth [2mstate[0m, because it co-occurs with all three: these are approvals recorded earlier whose command has since been edited or removed from the project config. They are what [2m--yes[0m would silently re-approve, so an orchestrator preserving the approval model reads them before choosing that flag.
+[2mstale[0m, which can accompany any [2mstate[0m, lists approvals whose command has since been edited or removed from the project config.
 
 ----- stderr -----

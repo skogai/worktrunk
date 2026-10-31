@@ -1,5 +1,11 @@
 //! The `wt remove` command: validate removal targets, approve hooks, and
 //! dispatch each removal to the output handler.
+//!
+//! Target failures are reported independently; later targets still run and
+//! the batch exits unsuccessfully. An interrupt cancels the batch immediately,
+//! retaining completed removals in the JSON report.
+
+use crate::commands::command_executor::ForegroundStdin;
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -7,16 +13,21 @@ use std::path::Path;
 use anyhow::Context;
 use worktrunk::HookType;
 use worktrunk::config::UserConfig;
-use worktrunk::git::{BranchDeletionMode, ErrorExt, GitError, Repository, ResolvedWorktree};
+use worktrunk::git::{
+    BranchDeletionMode, ErrorExt, GitError, Repository, ResolvedWorktree, WorktrunkError,
+};
 use worktrunk::styling::{eprintln, info_message};
 
 use crate::cli::{RemoveArgs, SwitchFormat};
-use crate::output::{BackgroundFallbackMode, RemovalExecution, handle_remove_output, print_json};
+use crate::output::{
+    BackgroundFallbackMode, CommandFailure, CommandResult, RemovalExecution, handle_remove_output,
+    print_json,
+};
 
 use super::hook_plan::{ApprovedHookPlan, HookPlanBuilder};
 use super::hooks::HookAnnouncer;
 use super::repository_ext::RepositoryCliExt;
-use super::worktree::{BranchFate, RemovalPlan};
+use super::worktree::{BranchFate, RemovalPlan, compute_worktree_path};
 use super::{RemoveTarget, flag_pair};
 
 /// The execution mode `--foreground` selects; the background default falls
@@ -58,6 +69,63 @@ impl RemovePlans {
     }
 }
 
+/// The detached worktree sitting where `branch`'s worktree would go, if any —
+/// the one thing a branch-only removal of `branch` can't otherwise mention.
+///
+/// Detaching a worktree's HEAD severs the only link git records between it and
+/// the branch, so `branch` genuinely has no worktree and deleting the ref alone
+/// is the right operation. But the directory is still on disk, and `No worktree
+/// found for branch <name>` reads as though it isn't. Once the link is gone the
+/// `worktree-path` template is all that still connects the two, which is a
+/// weaker association than the rest of the module draws — the template records
+/// where a worktree *would* go, not that this one belongs to that branch, and
+/// [`is_worktree_at_expected_path`] returns false for a detached worktree while
+/// [`worktree_display_name`] renders one as `path (detached)` without
+/// consulting the template at all. That weakness is why this only ever adds a
+/// line: a mention that occasionally points at a coincidence costs nothing,
+/// where a refusal built on the same inference would block work.
+///
+/// Three cases go unmatched, each because naming them would mislead:
+///
+/// - a worktree checked out on some *other* branch — that branch names it, and
+///   it has nothing to do with this removal;
+/// - the main worktree, which `wt remove <path>` refuses with nothing to do
+///   about it, so the hint would be a dead end. What decides this is whether
+///   the hint leads anywhere, not whether the command succeeds: a *locked*
+///   worktree refuses too and is named all the same, because that refusal
+///   carries the `git worktree unlock` that clears the way. A bare repo has no
+///   main worktree, so its default-branch checkout is named like any other;
+/// - a prunable entry, whose directory is already gone — `wt step prune`'s to
+///   sweep, and nothing to point a user at.
+///
+/// A template that won't expand yields no expected path and so no match. The
+/// branch is known to exist by the time this runs: `prepare_worktree_removal`
+/// reports a typo, a deleted branch, or a remote-only name as an error, so a
+/// plan to annotate means the lookup already succeeded.
+///
+/// [`is_worktree_at_expected_path`]: super::worktree::is_worktree_at_expected_path
+/// [`worktree_display_name`]: super::worktree::worktree_display_name
+fn detached_worktree_for<'a>(
+    repo: &Repository,
+    config: &UserConfig,
+    branch: &str,
+    worktrees: &'a [worktrunk::git::WorktreeInfo],
+) -> Option<&'a Path> {
+    let expected = compute_worktree_path(repo, branch, config).ok()?;
+    worktrees
+        .iter()
+        .find(|wt| {
+            wt.branch.is_none()
+                && !wt.is_prunable()
+                && worktrunk::path::paths_match(&wt.path, &expected)
+                // A `git_dir` lookup that fails says nothing either way, so
+                // treat it as linked and name the worktree — an extra line is
+                // the worst a wrong answer here can cost.
+                && repo.worktree_at(&wt.path).is_linked().unwrap_or(true)
+        })
+        .map(|wt| wt.path.as_path())
+}
+
 /// Validate all removal targets, returning categorized plans.
 ///
 /// Resolves each branch name, determines whether it's the current worktree,
@@ -65,6 +133,7 @@ impl RemovePlans {
 /// Errors are collected (not fatal) to support partial success.
 fn validate_remove_targets(
     repo: &Repository,
+    config: &UserConfig,
     branches: Vec<String>,
     keep_branch: bool,
     force_delete: bool,
@@ -162,15 +231,56 @@ fn validate_remove_targets(
             // Bucket the validated result, not the pre-validation resolution:
             // a worktree whose directory disappeared degrades to BranchOnly
             // during preparation and must run with the other branch-only plans.
-            Ok(result) => match &result {
-                RemovalPlan::Worktree {
-                    changed_directory: true,
+            Ok(mut result) => {
+                // A branch whose worktree has since been detached still has no
+                // worktree — detaching severed the link — so the branch-only
+                // removal is right. What it can't see is the directory still
+                // sitting at that branch's templated path, which the output
+                // would otherwise never mention. Annotate here, where the
+                // user's typed branch name and the config are both in hand.
+                if let RemovalPlan::BranchOnly {
+                    branch_name,
+                    detached_worktree,
                     ..
-                } => plans.current = Some(result),
-                RemovalPlan::Worktree { .. } => plans.others.push(result),
-                RemovalPlan::BranchOnly { .. } => plans.branch_only.push(result),
-            },
+                } = &mut result
+                    && let Some(wts) = worktrees
+                {
+                    *detached_worktree = detached_worktree_for(repo, config, branch_name, wts)
+                        .map(Path::to_path_buf);
+                }
+                match &result {
+                    RemovalPlan::Worktree {
+                        changed_directory: true,
+                        ..
+                    } => plans.current = Some(result),
+                    RemovalPlan::Worktree { .. } => plans.others.push(result),
+                    RemovalPlan::BranchOnly { .. } => plans.branch_only.push(result),
+                }
+            }
             Err(e) => plans.record_error(e),
+        }
+    }
+
+    // `wt remove <branch> <its-detached-path>` removes that directory in this
+    // run, so it isn't left behind. Checked after the loop because the path
+    // argument can come before or after the branch.
+    let removed: Vec<&Path> = plans
+        .others
+        .iter()
+        .chain(&plans.current)
+        .filter_map(RemovalPlan::removed_worktree_path)
+        .collect();
+    for plan in &mut plans.branch_only {
+        if let RemovalPlan::BranchOnly {
+            detached_worktree, ..
+        } = plan
+            && detached_worktree.as_deref().is_some_and(|detached| {
+                removed
+                    .iter()
+                    .any(|path| worktrunk::path::paths_match(path, detached))
+            })
+        {
+            *detached_worktree = None;
         }
     }
 
@@ -259,231 +369,189 @@ fn maybe_reap_result(result: &RemovalPlan, reap_enabled: bool) {
 ///      `.git/wt/trash/<name>-<timestamp>/` → prune metadata → delete branch
 ///      → synchronous `remove_dir_all` on the staged directory.
 ///    - **Background** (default): stop fsmonitor → rename + prune +
-///      synchronous branch delete → spawn detached `rm -rf` on the staged
-///      directory. Cross-filesystem or locked worktrees fall back to
+///      synchronous branch delete → spawn a detached drain of the trash
+///      directory (`wt _drain-trash`). Cross-filesystem or locked worktrees fall back to
 ///      `git worktree remove` in the detached process.
 /// 4. **Post-remove hooks** run in the background after dispatch.
-/// 5. **Internal sweep** (fire-and-forget, after primary output): stale
-///    `.git/wt/trash/` entries older than 24 hours are removed by a detached
-///    `rm -rf`, and orphaned `git fsmonitor--daemon` processes (worktree gone)
+/// 5. **Internal sweep** (fire-and-forget, after primary output): entries
+///    left in `.git/wt/trash/` start another detached drain, and orphaned `git fsmonitor--daemon` processes (worktree gone)
 ///    are terminated. Runs last so it never delays the user-visible progress
 ///    or success message. See [`super::process::run_internal_sweep`].
 pub fn handle_remove_command(args: RemoveArgs, yes: bool) -> anyhow::Result<()> {
     let json_mode = args.format == SwitchFormat::Json;
     let verify = args.hooks.resolve();
-    UserConfig::load()
-        .context("Failed to load config")
-        .and_then(|config| {
-            let repo = Repository::current().context("Failed to remove worktree")?;
+    let config = UserConfig::load().context("Failed to load config")?;
+    let repo = Repository::current().context("Failed to remove worktree")?;
 
-            // CLI flags override config; otherwise fall through to [remove] delete-branch
-            // (defaults to true).
-            let project = repo.project_identifier().ok();
-            let cli_override = flag_pair(args.delete_branch, args.no_delete_branch);
-            let delete_branch =
-                cli_override.unwrap_or_else(|| config.remove(project.as_deref()).delete_branch());
+    // CLI flags override config; otherwise fall through to [remove] delete-branch
+    // (defaults to true).
+    let project = repo.project_identifier().ok();
+    let cli_override = flag_pair(args.delete_branch, args.no_delete_branch);
+    let delete_branch =
+        cli_override.unwrap_or_else(|| config.remove(project.as_ref()).delete_branch());
 
-            // Validate conflicting flags
-            if !delete_branch && args.force_delete {
-                return Err(worktrunk::git::GitError::Other {
+    // Validate conflicting flags
+    if !delete_branch && args.force_delete {
+        return Err(worktrunk::git::GitError::Other {
                     message: "Cannot use --force-delete with delete-branch=false (set via --no-delete-branch or [remove] delete-branch = false)".into(),
                 }
                 .into());
+    }
+
+    // `--reap` relies on per-process cwd discovery (`lsof`/`ps`), which
+    // has no cheap Windows equivalent — reject it there rather than
+    // silently no-op.
+    #[cfg(not(unix))]
+    if args.reap {
+        return Err(anyhow::anyhow!("--reap is not supported on Windows"));
+    }
+
+    // Helper: build and approve, once, the frozen hook plan the
+    // removal will run. Every hook (`pre-remove` / `post-remove` per
+    // removed worktree, `post-switch` per post-removal destination) is
+    // selected from the invoking worktree's `.config/wt.toml` — the
+    // worktree `wt remove` ran in. `!verify` (`--no-hooks`) or a
+    // declined prompt yields an empty plan — every executor then runs
+    // no project hooks.
+    let approve_remove = |removed_worktree_paths: &[&Path],
+                          destination_paths: &[&Path],
+                          yes: bool|
+     -> anyhow::Result<ApprovedHookPlan> {
+        if !verify {
+            return Ok(ApprovedHookPlan::empty());
+        }
+        // Non-fatal: a worktree with no project hooks must remove even
+        // when the project identifier can't be resolved (the plan ends
+        // up empty and `approve` never needs it). Matches the pre-plan
+        // behaviour where the empty-batch fast path ran first.
+        let project_id = repo.project_identifier().ok();
+        let pid = project_id.as_ref();
+        let project_config = repo.load_project_config()?;
+        let mut builder = HookPlanBuilder::new(project_config.as_ref(), &config, pid);
+        for &wt_path in removed_worktree_paths {
+            builder.add(wt_path, &[HookType::PreRemove, HookType::PostRemove]);
+        }
+        let mut seen_dests = std::collections::HashSet::new();
+        for &dest in destination_paths {
+            if !seen_dests.insert(dest) {
+                continue;
             }
-
-            // `--reap` relies on per-process cwd discovery (`lsof`/`ps`), which
-            // has no cheap Windows equivalent — reject it there rather than
-            // silently no-op.
-            #[cfg(not(unix))]
-            if args.reap {
-                anyhow::bail!("--reap is not supported on Windows");
-            }
-
-            // Helper: build and approve, once, the frozen hook plan the
-            // removal will run. Every hook (`pre-remove` / `post-remove` per
-            // removed worktree, `post-switch` per post-removal destination) is
-            // selected from the invoking worktree's `.config/wt.toml` — the
-            // worktree `wt remove` ran in. `!verify` (`--no-hooks`) or a
-            // declined prompt yields an empty plan — every executor then runs
-            // no project hooks.
-            let approve_remove = |removed_worktree_paths: &[&Path],
-                                  destination_paths: &[&Path],
-                                  yes: bool|
-             -> anyhow::Result<ApprovedHookPlan> {
-                if !verify {
-                    return Ok(ApprovedHookPlan::empty());
-                }
-                // Non-fatal: a worktree with no project hooks must remove even
-                // when the project identifier can't be resolved (the plan ends
-                // up empty and `approve` never needs it). Matches the pre-plan
-                // behaviour where the empty-batch fast path ran first.
-                let project_id = repo.project_identifier().ok();
-                let pid = project_id.as_deref();
-                let project_config = repo.load_project_config()?;
-                let mut builder = HookPlanBuilder::new(project_config.as_ref(), &config, pid);
-                for &wt_path in removed_worktree_paths {
-                    builder.add(wt_path, &[HookType::PreRemove, HookType::PostRemove]);
-                }
-                let mut seen_dests = std::collections::HashSet::new();
-                for &dest in destination_paths {
-                    if !seen_dests.insert(dest) {
-                        continue;
-                    }
-                    builder.add(dest, &[HookType::PostSwitch]);
-                }
-                match builder.finish().approve(pid, yes)? {
-                    Some(plan) => Ok(plan),
-                    None => {
-                        eprintln!(
-                            "{}",
-                            info_message("Commands declined, continuing removal without hooks")
-                        );
-                        Ok(ApprovedHookPlan::empty())
-                    }
-                }
-            };
-
-            let branches = args.branches;
-
-            if branches.is_empty() {
-                // Single worktree removal: validate FIRST, then approve, then execute
-                let current_path = repo
-                    .current_worktree()
-                    .root()
-                    .context("Failed to remove worktree")?;
-                let result = repo
-                    .prepare_worktree_removal(
-                        RemoveTarget::WorktreePath(current_path.clone()),
-                        BranchDeletionMode::from_flags(!delete_branch, args.force_delete),
-                        args.force,
-                        &current_path,
-                        None,
-                        None,
-                    )
-                    .context("Failed to remove worktree")?;
-
-                // Early exit for benchmarking time-to-first-output
-                if std::env::var_os("WORKTRUNK_FIRST_OUTPUT").is_some() {
-                    return Ok(());
-                }
-
-                // "Approve at the Gate": approval happens AFTER validation passes
-                let plan = approve_remove(
-                    result.removed_worktree_path().as_slice(),
-                    result.destination_path().as_slice(),
-                    yes,
-                )?;
-
-                maybe_reap_result(&result, args.reap);
-
-                let mut announcer = HookAnnouncer::new(&repo, false);
-                let fate = handle_remove_output(
-                    &result,
-                    removal_execution(args.foreground),
-                    &plan,
-                    false,
-                    &mut announcer,
-                )?;
-                announcer.flush()?;
-                if json_mode {
-                    let json = serde_json::json!([result.to_json(fate)]);
-                    print_json(&json)?;
-                }
-                // Fire-and-forget repo-wide internal cleanup (stale trash +
-                // orphaned fsmonitor daemons) — runs after primary output so
-                // it never delays the user-visible progress/success message.
-                super::process::run_internal_sweep(&repo);
-                Ok(())
-            } else {
-                // Multi-worktree removal: validate ALL first, then approve, then execute
-                let plans = validate_remove_targets(
-                    &repo,
-                    branches,
-                    !delete_branch,
-                    args.force_delete,
-                    args.force,
+            builder.add(dest, &[HookType::PostSwitch]);
+        }
+        match builder.finish().approve(pid, yes)? {
+            Some(plan) => Ok(plan),
+            None => {
+                eprintln!(
+                    "{}",
+                    info_message("Commands declined, continuing removal without hooks")
                 );
-
-                if !plans.has_valid_plans() {
-                    anyhow::bail!("");
-                }
-
-                // Early exit for benchmarking time-to-first-output
-                if std::env::var_os("WORKTRUNK_FIRST_OUTPUT").is_some() {
-                    return Ok(());
-                }
-
-                // Approve hooks (only if we have valid plans). Each removed
-                // worktree's `pre-remove` / `post-remove` is approved against
-                // that worktree's config, and its `post-switch` against the
-                // worktree the user lands in — see `approve_remove` above.
-                // (`destination_targets` is mostly the primary worktree
-                // repeated; the helper dedups by template.)
-                let all_plans = || {
-                    plans
-                        .others
-                        .iter()
-                        .chain(&plans.branch_only)
-                        .chain(plans.current.iter())
-                };
-                let removed_targets: Vec<&Path> =
-                    all_plans().filter_map(|r| r.removed_worktree_path()).collect();
-                let destination_targets: Vec<&Path> =
-                    all_plans().filter_map(|r| r.destination_path()).collect();
-                let plan = approve_remove(&removed_targets, &destination_targets, yes)?;
-
-                // Execute all validated plans: others first, branch-only next, current last
-                let show_branch =
-                    plans.others.len() + plans.branch_only.len() + plans.current.iter().len() > 1;
-                let run = |result: &RemovalPlan| -> anyhow::Result<BranchFate> {
-                    maybe_reap_result(result, args.reap);
-                    let mut announcer = HookAnnouncer::new(&repo, show_branch);
-                    let fate = handle_remove_output(
-                        result,
-                        removal_execution(args.foreground),
-                        &plan,
-                        false,
-                        &mut announcer,
-                    )?;
-                    announcer.flush()?;
-                    Ok(fate)
-                };
-                // Fates in execution order, which is also the JSON order below.
-                let mut fates = Vec::new();
-                for result in &plans.others {
-                    fates.push(run(result)?);
-                }
-                for result in &plans.branch_only {
-                    fates.push(run(result)?);
-                }
-                if let Some(ref result) = plans.current {
-                    fates.push(run(result)?);
-                }
-
-                if json_mode {
-                    let json_items: Vec<serde_json::Value> = plans
-                        .others
-                        .iter()
-                        .chain(&plans.branch_only)
-                        .chain(plans.current.as_ref())
-                        .zip(fates)
-                        .map(|(removal, fate)| removal.to_json(fate))
-                        .collect();
-                    print_json(&json_items)?;
-                }
-
-                // Fire-and-forget repo-wide internal cleanup (stale trash +
-                // orphaned fsmonitor daemons) — runs after primary output so
-                // it never delays the user-visible progress/success messages.
-                super::process::run_internal_sweep(&repo);
-
-                if !plans.errors.is_empty() {
-                    anyhow::bail!("");
-                }
-
-                Ok(())
+                Ok(ApprovedHookPlan::empty())
             }
-        })
+        }
+    };
+
+    // No argument means `@`, resolved like any other selector.
+    let branches = if args.branches.is_empty() {
+        vec!["@".to_string()]
+    } else {
+        args.branches
+    };
+
+    // Validate ALL first, then approve, then execute
+    let plans = validate_remove_targets(
+        &repo,
+        &config,
+        branches,
+        !delete_branch,
+        args.force_delete,
+        args.force,
+    );
+
+    let mut failed = !plans.errors.is_empty();
+    if !plans.has_valid_plans() {
+        return Err(WorktrunkError::AlreadyDisplayed { exit_code: 1 }.into());
+    }
+
+    // Early exit for benchmarking time-to-first-output
+    if std::env::var_os("WORKTRUNK_FIRST_OUTPUT").is_some() {
+        return Ok(());
+    }
+
+    // Approve hooks (only if we have valid plans): `pre-remove` /
+    // `post-remove` anchored at each removed worktree and
+    // `post-switch` at each destination, all selected from the
+    // invoking worktree's config — see `approve_remove` above.
+    // (`destination_targets` is mostly the primary worktree
+    // repeated; the helper dedups destinations by path.)
+    let all_plans = || {
+        plans
+            .others
+            .iter()
+            .chain(&plans.branch_only)
+            .chain(plans.current.iter())
+    };
+    let removed_targets: Vec<&Path> = all_plans()
+        .filter_map(|r| r.removed_worktree_path())
+        .collect();
+    let destination_targets: Vec<&Path> =
+        all_plans().filter_map(|r| r.destination_path()).collect();
+    let plan = approve_remove(&removed_targets, &destination_targets, yes)?;
+
+    // Execute all validated plans: others first, branch-only next, current last
+    let show_branch = plans.others.len() + plans.branch_only.len() + plans.current.iter().len() > 1;
+    let run = |result: &RemovalPlan| -> CommandResult<BranchFate> {
+        maybe_reap_result(result, args.reap);
+        let mut announcer = HookAnnouncer::new(&repo, show_branch);
+        let fate = handle_remove_output(
+            result,
+            removal_execution(args.foreground),
+            ForegroundStdin::Inherit,
+            &plan,
+            false,
+            &mut announcer,
+        )?;
+        announcer
+            .flush()
+            .map_err(|error| CommandFailure::with_result(error, fate))?;
+        Ok(fate)
+    };
+    let mut json_items = Vec::new();
+    let mut interrupted = None;
+    for result in all_plans() {
+        let (fate, error) = match run(result) {
+            Ok(fate) => (Some(fate), None),
+            Err(failure) => (failure.result.map(|result| *result), Some(failure.error)),
+        };
+        if json_mode && let Some(fate) = fate {
+            json_items.push(result.to_json(fate));
+        }
+        if let Some(error) = error {
+            if error.interrupt_signal().is_some() {
+                interrupted = Some(error);
+                break;
+            }
+            crate::print_command_error(&error);
+            failed = true;
+        }
+    }
+
+    if json_mode {
+        print_json(&json_items)?;
+    }
+    if let Some(error) = interrupted {
+        return Err(error);
+    }
+
+    // Fire-and-forget repo-wide internal cleanup (stale trash +
+    // orphaned fsmonitor daemons) — runs after primary output so
+    // it never delays the user-visible progress/success messages.
+    super::process::run_internal_sweep(&repo);
+
+    if failed {
+        return Err(WorktrunkError::AlreadyDisplayed { exit_code: 1 }.into());
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -499,6 +567,7 @@ mod tests {
 
         let plans = validate_remove_targets(
             &repo,
+            &UserConfig::default(),
             vec![
                 "feature".to_string(),
                 worktree.to_string_lossy().into_owned(),
@@ -528,6 +597,7 @@ mod tests {
 
         let plans = validate_remove_targets(
             &repo,
+            &UserConfig::default(),
             vec!["missing-worktree".to_string(), "branch-only".to_string()],
             false,
             false,

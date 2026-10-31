@@ -19,9 +19,11 @@
 pub mod approvals;
 mod commands;
 pub(crate) mod deprecation;
+mod error;
 mod expansion;
 mod hooks;
 mod project;
+mod template_analysis;
 #[cfg(test)]
 mod test;
 mod unknown_tree;
@@ -46,6 +48,19 @@ pub trait WorktrunkConfig:
     /// All valid top-level keys for this config type, derived from JsonSchema.
     fn valid_top_level_keys() -> &'static [String];
 
+    /// A top-level key whose entries are themselves schema-typed tables,
+    /// paired with the valid keys for one entry — `projects` in user config,
+    /// nothing in project config.
+    ///
+    /// A section inside such an entry serializes away when it equals its
+    /// default, exactly as a top-level section does, so the skeleton
+    /// `seed_schema_skeleton` builds has to reach one level further down for
+    /// it. Without that, `[projects."<id>".list]` — valid, and accepted on
+    /// load — reads back as an unknown field.
+    fn valid_scoped_keys() -> Option<(&'static str, &'static [String])> {
+        None
+    }
+
     /// Check if a key would be valid in this config type.
     fn is_valid_key(key: &str) -> bool {
         Self::valid_top_level_keys().iter().any(|k| k == key)
@@ -64,6 +79,10 @@ impl WorktrunkConfig for UserConfig {
         static VALID_KEYS: OnceLock<Vec<String>> = OnceLock::new();
         VALID_KEYS.get_or_init(user::valid_user_config_keys)
     }
+
+    fn valid_scoped_keys() -> Option<(&'static str, &'static [String])> {
+        Some(("projects", user_project_override_keys()))
+    }
 }
 
 impl WorktrunkConfig for ProjectConfig {
@@ -80,20 +99,7 @@ impl WorktrunkConfig for ProjectConfig {
     }
 }
 
-/// Configuration error type.
-///
-/// Replaces the `config` crate's `ConfigError` with a simple string wrapper.
-/// Every usage was `ConfigError::Message(String)` — no other variants were used.
-#[derive(Debug)]
-pub struct ConfigError(pub String);
-
-impl std::fmt::Display for ConfigError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for ConfigError {}
+pub use error::{ConfigError, ConfigParseError};
 
 /// Returns true if the given value equals `T::default()`.
 ///
@@ -142,17 +148,44 @@ pub(crate) fn schema_property_names<T: schemars::JsonSchema>() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The top-level fields of a `[projects."<id>"]` table (the
+/// [`UserProjectOverrides`] schema), including the serde aliases
+/// [`schema_top_level_keys`] adds.
+///
+/// Two callers share it: [`is_user_project_override_key`] for the "scope it to
+/// this repo" note, and `UserConfig::valid_scoped_keys` for the round-trip
+/// skeleton in `unknown_tree`.
+fn user_project_override_keys() -> &'static [String] {
+    use std::sync::OnceLock;
+    static KEYS: OnceLock<Vec<String>> = OnceLock::new();
+    KEYS.get_or_init(schema_top_level_keys::<UserProjectOverrides>)
+}
+
 /// Whether `key` is a top-level field of a `[projects."<id>"]` table (the
 /// [`UserProjectOverrides`] schema). Used to gate the "scope it to this repo"
 /// note: a misplaced user-config key only earns that advice when it can
 /// actually be placed under `[projects."<id>"]`. Root-only user settings such
 /// as `skip-shell-integration-prompt` are absent here and get no note.
 pub fn is_user_project_override_key(key: &str) -> bool {
-    use std::sync::OnceLock;
-    static KEYS: OnceLock<Vec<String>> = OnceLock::new();
-    KEYS.get_or_init(schema_top_level_keys::<UserProjectOverrides>)
-        .iter()
-        .any(|k| k == key)
+    user_project_override_keys().iter().any(|k| k == key)
+}
+
+/// Refuse to write a config file that is not valid TOML.
+///
+/// wt can't load such a file: every later command skips user config with a
+/// warning, and the commands that need project config fail, until the user
+/// hand-edits it. `wt config update` runs this over the migration it computed,
+/// before either destination is written. A `UserConfig` mutation faces a
+/// stronger test of its own — that the file it is about to write loads back as
+/// the config the mutation asked for — so it needs no second, weaker one.
+/// Neither starts from invalid TOML, so this fires only when the migration
+/// itself broke the syntax, and the file on disk stays as it was.
+pub fn ensure_config_parses(content: &str) -> Result<(), ConfigError> {
+    content.parse::<toml::Table>().map(|_| ()).map_err(|e| {
+        ConfigError::Message(format!(
+            "Refusing to write a config file wt could not read back: {e}"
+        ))
+    })
 }
 
 // Re-export public types
@@ -166,7 +199,7 @@ pub use deprecation::compute_migrated_content;
 pub use deprecation::copy_approved_commands_to_approvals_file;
 pub use deprecation::format_deprecation_details;
 pub use deprecation::format_deprecation_warnings;
-pub use deprecation::format_migration_diff;
+pub use deprecation::format_migration_diff_block;
 pub use deprecation::migrate_content;
 pub use deprecation::normalize_template_vars;
 pub use deprecation::suppress_warnings;
@@ -178,30 +211,31 @@ pub use deprecation::{
 };
 pub use deprecation::{DeprecationKind, Deprecations};
 pub use expansion::{
-    ACTIVE_VARS, ALIAS_ARGS_KEY, DEPRECATED_TEMPLATE_VARS, EXEC_BASE_VARS, REPO_VARS,
-    TemplateContext, TemplateExpandError, ValidationScope, VarScope, VarsMode,
-    alias_context_filter, base_vars, expand_template, format_alias_variables,
-    format_base_variables, format_hook_variables, redact_credentials, referenced_vars_for_config,
-    referenced_vars_for_templates, sanitize_branch_name, sanitize_db, short_hash,
-    template_environment, template_references_var, validate_list_column_template,
-    validate_template, validate_template_syntax, vars_available_in, vars_map_to_value,
+    ACTIVE_VARS, ALIAS_ARGS_KEY, EXEC_BASE_VARS, REPO_VARS, TemplateContext, TemplateExpandError,
+    ValidationScope, VarScope, VarsMode, alias_context_filter, base_vars, binds_cli_var,
+    expand_template, format_alias_variables, format_base_variables, format_hook_variables,
+    redact_credentials, referenced_vars_for_config, referenced_vars_for_templates,
+    sanitize_branch_name, sanitize_db, short_hash, template_environment, template_references_var,
+    validate_list_column_template, validate_template, validate_template_syntax, vars_available_in,
+    vars_map_to_value,
 };
-pub use hooks::HooksConfig;
+pub use hooks::{HookSource, HooksConfig};
 pub use project::{
     ProjectCiConfig, ProjectCommitConfig, ProjectCommitGenerationConfig, ProjectConfig,
     ProjectForgeConfig, ProjectListConfig, valid_project_config_keys,
 };
 pub use unknown_tree::{
-    UnknownAnalysis, UnknownTree, UnknownWarning, collect_unknown_warnings, compute_unknown_tree,
+    UnknownTree, UnknownWarning, collect_unknown_warnings, compute_unknown_tree,
 };
 pub use user::LoadError;
+pub use user::project_match::ProjectId;
 pub(crate) use user::project_match::matching_keys as matching_project_keys;
 pub use user::{
     CommitConfig, CommitGenerationConfig, CopyIgnoredConfig, ListColumnConfig, ListConfig,
     MergeConfig, RemoveConfig, ResolvedConfig, StageMode, StepConfig, SwitchConfig,
     SwitchPickerConfig, UserConfig, UserProjectOverrides, config_path, config_path_for_display,
-    default_config_path, default_system_config_path, require_config_path, set_config_overrides,
-    set_config_path, system_config_path, valid_user_config_keys,
+    default_config_path, require_config_path, set_config_overrides, set_config_path,
+    system_config_path, valid_user_config_keys,
 };
 
 #[cfg(test)]
@@ -214,6 +248,16 @@ mod tests {
 
     fn test_repo() -> TestRepo {
         TestRepo::new()
+    }
+
+    #[test]
+    fn test_ensure_config_parses_rejects_a_header_holding_the_key_decor() {
+        // The shape an inline-to-table rewrite once wrote: the key's leading
+        // comment rendered inside the brackets.
+        let err =
+            ensure_config_parses("[# why squash is off\nmerge ]\nsquash = true\n").unwrap_err();
+        assert!(err.to_string().contains("could not read back"), "{}", err);
+        ensure_config_parses("# why squash is off\n[merge]\nsquash = true\n").unwrap();
     }
 
     #[test]
@@ -249,7 +293,7 @@ mod tests {
     fn test_format_worktree_path() {
         let test = test_repo();
         let config = UserConfig {
-            worktree_path: Some("{{ main_worktree }}.{{ branch }}".to_string()),
+            worktree_path: Some("{{ repo }}.{{ branch }}".to_string()),
             ..Default::default()
         };
         assert_eq!(
@@ -264,7 +308,7 @@ mod tests {
     fn test_format_worktree_path_custom_template() {
         let test = test_repo();
         let config = UserConfig {
-            worktree_path: Some("{{ main_worktree }}-{{ branch }}".to_string()),
+            worktree_path: Some("{{ repo }}-{{ branch }}".to_string()),
             ..Default::default()
         };
         assert_eq!(
@@ -279,7 +323,7 @@ mod tests {
     fn test_format_worktree_path_only_branch() {
         let test = test_repo();
         let config = UserConfig {
-            worktree_path: Some(".worktrees/{{ main_worktree }}/{{ branch }}".to_string()),
+            worktree_path: Some(".worktrees/{{ repo }}/{{ branch }}".to_string()),
             ..Default::default()
         };
         assert_eq!(
@@ -295,7 +339,7 @@ mod tests {
         let test = test_repo();
         // Use {{ branch | sanitize }} to replace slashes with dashes
         let config = UserConfig {
-            worktree_path: Some("{{ main_worktree }}.{{ branch | sanitize }}".to_string()),
+            worktree_path: Some("{{ repo }}.{{ branch | sanitize }}".to_string()),
             ..Default::default()
         };
         assert_eq!(
@@ -310,9 +354,7 @@ mod tests {
     fn test_format_worktree_path_with_multiple_slashes() {
         let test = test_repo();
         let config = UserConfig {
-            worktree_path: Some(
-                ".worktrees/{{ main_worktree }}/{{ branch | sanitize }}".to_string(),
-            ),
+            worktree_path: Some(".worktrees/{{ repo }}/{{ branch | sanitize }}".to_string()),
             ..Default::default()
         };
         assert_eq!(
@@ -328,9 +370,7 @@ mod tests {
         let test = test_repo();
         // Windows-style path separators should also be sanitized
         let config = UserConfig {
-            worktree_path: Some(
-                ".worktrees/{{ main_worktree }}/{{ branch | sanitize }}".to_string(),
-            ),
+            worktree_path: Some(".worktrees/{{ repo }}/{{ branch | sanitize }}".to_string()),
             ..Default::default()
         };
         assert_eq!(
@@ -346,7 +386,7 @@ mod tests {
         let test = test_repo();
         // {{ branch }} without filter gives raw branch name
         let config = UserConfig {
-            worktree_path: Some("{{ main_worktree }}.{{ branch }}".to_string()),
+            worktree_path: Some("{{ repo }}.{{ branch }}".to_string()),
             ..Default::default()
         };
         assert_eq!(
@@ -520,10 +560,10 @@ task2 = "echo 'Task 2 running' > task2.txt"
 
         let test = test_repo();
         let mut vars = HashMap::new();
-        vars.insert("main_worktree", "myrepo");
+        vars.insert("repo", "myrepo");
         vars.insert("branch", "feature-x");
         let result = expand_template(
-            "../{{ main_worktree }}.{{ branch }}",
+            "../{{ repo }}.{{ branch }}",
             &vars,
             ShellEscapeMode::Posix,
             &test.repo,
@@ -542,10 +582,10 @@ task2 = "echo 'Task 2 running' > task2.txt"
         // Use {{ branch | sanitize }} filter for filesystem-safe paths
         // shell_escape=false to test filter in isolation (shell escaping tested separately)
         let mut vars = HashMap::new();
-        vars.insert("main_worktree", "myrepo");
+        vars.insert("repo", "myrepo");
         vars.insert("branch", "feature/foo");
         let result = expand_template(
-            "{{ main_worktree }}/{{ branch | sanitize }}",
+            "{{ repo }}/{{ branch | sanitize }}",
             &vars,
             ShellEscapeMode::Literal,
             &test.repo,
@@ -555,10 +595,10 @@ task2 = "echo 'Task 2 running' > task2.txt"
         assert_eq!(result, "myrepo/feature-foo");
 
         let mut vars = HashMap::new();
-        vars.insert("main_worktree", "myrepo");
+        vars.insert("repo", "myrepo");
         vars.insert("branch", r"feat\bar");
         let result = expand_template(
-            ".worktrees/{{ main_worktree }}/{{ branch | sanitize }}",
+            ".worktrees/{{ repo }}/{{ branch | sanitize }}",
             &vars,
             ShellEscapeMode::Literal,
             &test.repo,
@@ -573,11 +613,11 @@ task2 = "echo 'Task 2 running' > task2.txt"
         use std::collections::HashMap;
 
         let mut vars = HashMap::new();
-        vars.insert("worktree", "/path/to/worktree");
-        vars.insert("repo_root", "/path/to/repo");
+        vars.insert("worktree_path", "/path/to/worktree");
+        vars.insert("repo_path", "/path/to/repo");
 
         let result = expand_template(
-            "{{ repo_root }}/target -> {{ worktree }}/target",
+            "{{ repo_path }}/target -> {{ worktree_path }}/target",
             &vars,
             ShellEscapeMode::Posix,
             &test_repo().repo,
@@ -603,17 +643,11 @@ task2 = "echo 'Task 2 running' > task2.txt"
     }
 
     fn project_warn_tree(contents: &str) -> UnknownTree {
-        compute_unknown_tree::<ProjectConfig>(contents)
-            .warn_tree()
-            .cloned()
-            .unwrap()
+        compute_unknown_tree::<ProjectConfig>(contents).unwrap()
     }
 
     fn user_warn_tree(contents: &str) -> UnknownTree {
-        compute_unknown_tree::<UserConfig>(contents)
-            .warn_tree()
-            .cloned()
-            .unwrap()
+        compute_unknown_tree::<UserConfig>(contents).unwrap()
     }
 
     #[test]
@@ -659,22 +693,14 @@ task2 = "echo 'Task 2 running' > task2.txt"
     #[test]
     fn test_unknown_tree_invalid_toml() {
         let toml = "this is not valid toml {{{";
-        assert!(
-            compute_unknown_tree::<ProjectConfig>(toml)
-                .warn_tree()
-                .is_none()
-        );
-        assert!(
-            compute_unknown_tree::<UserConfig>(toml)
-                .warn_tree()
-                .is_none()
-        );
+        assert!(compute_unknown_tree::<ProjectConfig>(toml).is_none());
+        assert!(compute_unknown_tree::<UserConfig>(toml).is_none());
     }
 
     #[test]
     fn test_user_hooks_config_parsing() {
         let toml_str = r#"
-worktree-path = "../{{ main_worktree }}.{{ branch }}"
+worktree-path = "../{{ repo }}.{{ branch }}"
 
 [post-start]
 log = "echo '{{ repo }}' >> ~/.log"
@@ -705,7 +731,7 @@ lint = "cargo clippy"
     #[test]
     fn test_user_hooks_config_single_command() {
         let toml_str = r#"
-worktree-path = "../{{ main_worktree }}.{{ branch }}"
+worktree-path = "../{{ repo }}.{{ branch }}"
 post-start = "npm install"
 "#;
         let config: UserConfig = toml::from_str(toml_str).unwrap();

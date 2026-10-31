@@ -106,6 +106,15 @@ pub fn now_us() -> u64 {
 
 /// Numeric thread id, extracted from `ThreadId`'s `Debug` representation.
 /// `ThreadId` debug format is `ThreadId(N)`.
+///
+/// Parsing `Debug` because `std` exposes no stable accessor for the number
+/// (`ThreadId::as_u64` is unstable). The substitute is kept to exactly that
+/// question, it is the only place that parse lives (the stderr thread label
+/// reads it through here), and `thread_ids_are_distinct_and_nonzero` pins it:
+/// a `Debug` format that stopped matching would fall through to the `0` below
+/// on every thread, and `Profile`'s thread count — the `-vv` diagnostic
+/// report's answer to "did this run in parallel?" — would silently read 1 for
+/// every run.
 pub fn thread_id() -> u64 {
     let thread_id = std::thread::current().id();
     let debug_str = format!("{:?}", thread_id);
@@ -335,16 +344,21 @@ impl CommandTrace {
     /// nothing to time. Equivalent to `new` immediately followed by `fail`.
     /// `reads_stdin` records the same stdin shape a successful run would have, so
     /// a precondition-failed stdin command is excluded from dedup like any other.
-    pub fn record_failed(context: Option<&str>, cmd: &str, reads_stdin: bool, err: impl Display) {
+    pub fn record_failed(
+        context: Option<&str>,
+        cmd: &str,
+        reads_stdin: bool,
+        err: &(dyn std::error::Error + 'static),
+    ) {
         let mut trace = Self::new(context, cmd).reads_stdin(reads_stdin);
         trace.fail(err);
     }
 
     /// The command never ran to completion (spawn failure, wait failure).
     /// Emits an `err=…` record with the elapsed duration.
-    pub fn fail(&mut self, err: impl Display) {
+    pub fn fail(&mut self, err: &(dyn std::error::Error + 'static)) {
         let dur_us = self.start.elapsed().as_micros() as u64;
-        command_errored(self, dur_us, err);
+        command_errored(self, dur_us, crate::git::error_chain_message(err));
         self.resolved = true;
     }
 }
@@ -440,6 +454,19 @@ impl Drop for Span {
 mod tests {
     use super::*;
 
+    /// `thread_id` reads a number out of `ThreadId`'s `Debug` string, so a
+    /// change to that format degrades silently to `0` everywhere rather than
+    /// failing. Two threads reporting distinct non-zero ids is what proves the
+    /// parse still lands.
+    #[test]
+    fn thread_ids_are_distinct_and_nonzero() {
+        let current = thread_id();
+        let spawned = std::thread::spawn(thread_id).join().unwrap();
+        assert_ne!(current, 0, "this thread's id parsed as the 0 fallback");
+        assert_ne!(spawned, 0, "spawned thread id parsed as the 0 fallback");
+        assert_ne!(current, spawned, "two threads reported the same id");
+    }
+
     // Resolution (complete/fail) marks the guard so its drop is a no-op. No
     // tracing subscriber is installed, so the records themselves are dropped —
     // the point is that the drop-time tripwire does not fire on a resolved
@@ -452,10 +479,15 @@ mod tests {
         drop(completed);
 
         let mut failed = CommandTrace::new(None, "git nope");
-        failed.fail(std::io::Error::other("boom"));
+        failed.fail(&std::io::Error::other("boom"));
         drop(failed);
 
-        CommandTrace::record_failed(None, "git nope", false, "precondition");
+        CommandTrace::record_failed(
+            None,
+            "git nope",
+            false,
+            &std::io::Error::other("precondition"),
+        );
     }
 
     #[test]

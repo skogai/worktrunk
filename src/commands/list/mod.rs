@@ -58,15 +58,16 @@
 //! - `git status --porcelain` - Working tree state (uses index cache)
 //! - `git rev-list --count <base>..<head>` - Ahead/behind counts (uses commit graph)
 //! - Working tree line diffs:
-//!   - Without untracked files: `git diff --shortstat --find-renames HEAD`
+//!   - Without untracked files: `git diff-index --shortstat --find-renames HEAD`
 //!   - With untracked files: `git ls-files --others`, a temporary index copy plus
-//!     `git add --intent-to-add`, and two `git diff --numstat -z --find-renames HEAD` calls
-//! - `git diff --shortstat <base>...<head>` - Branch line diffs (uses tree objects)
+//!     `git add --intent-to-add`, and two `git diff-index --numstat -z --find-renames HEAD` calls
+//! - `git diff-tree -r --shortstat --find-renames <merge-base> <head>` - Branch line diffs
+//!   (uses tree objects)
 //! - `git rev-parse <ref>` - Ref resolution (uses ref cache)
 //!
-//! `HEAD±` always enables rename detection because pairing a tracked deletion with an
-//! untracked destination makes a move line-neutral. `main…±` compares committed trees
-//! and continues to use the user's configured rename policy.
+//! Both line-diff columns use plumbing with rename detection on, so the user's diff
+//! configuration can't change them. For `HEAD±`, renames also pair a tracked deletion
+//! with an untracked destination, making a move line-neutral.
 //!
 //! Plus one global command:
 //! - `git worktree list --porcelain` - List all worktrees (uses ref cache)
@@ -296,11 +297,7 @@ impl SummaryMetrics {
         }
     }
 
-    pub(super) fn summary_parts(
-        &self,
-        include_branches: bool,
-        hidden_columns: &[String],
-    ) -> Vec<String> {
+    pub(super) fn inventory_parts(&self, include_branches: bool) -> Vec<String> {
         let mut parts = Vec::new();
 
         if include_branches {
@@ -315,6 +312,16 @@ impl SummaryMetrics {
             let plural = if self.worktrees == 1 { "" } else { "s" };
             parts.push(format!("{} worktree{}", self.worktrees, plural));
         }
+
+        parts
+    }
+
+    pub(super) fn summary_parts(
+        &self,
+        include_branches: bool,
+        hidden_columns: &[String],
+    ) -> Vec<String> {
+        let mut parts = self.inventory_parts(include_branches);
 
         if self.dirty_worktrees > 0 {
             parts.push(format!("{} with changes", self.dirty_worktrees));
@@ -405,7 +412,11 @@ mod tests {
         let items = vec![
             ListItem::new_branch("aaaaaaa".to_string(), "feature/login".to_string()),
             ListItem::new_branch("bbbbbbb".to_string(), "main".to_string()),
-            ListItem::new_remote_branch("ccccccc".to_string(), "origin/feature".to_string()),
+            ListItem::new_remote_branch(
+                "ccccccc".to_string(),
+                "origin".to_string(),
+                "feature".to_string(),
+            ),
         ];
         let metrics = SummaryMetrics::from_items(&items);
         assert_eq!(

@@ -8,8 +8,8 @@
 
 use crate::common::{
     SLEEP_FOR_ABSENCE_CHECK, TestRepo, make_snapshot_cmd, make_snapshot_cmd_with_global_flags,
-    repo, resolve_git_common_dir, setup_snapshot_settings, wait_for_file, wait_for_file_content,
-    wait_for_file_count,
+    repo, repo_with_remote, resolve_git_common_dir, setup_snapshot_settings, wait_for_file,
+    wait_for_file_content, wait_for_file_count,
 };
 use insta::assert_snapshot;
 use insta_cmd::assert_cmd_snapshot;
@@ -18,6 +18,82 @@ use rstest::rstest;
 use std::fs;
 use std::thread;
 use std::time::Duration;
+use worktrunk::config::HookSource;
+
+#[rstest]
+#[cfg(unix)]
+fn test_concurrent_hooks_log_labels_and_pass_cd_directive(repo: TestRepo) {
+    // The directive names a directory that exists, or wt withdraws it on exit.
+    let target = repo.home_path().to_string_lossy().to_string();
+    repo.write_project_config(&format!(
+        r#"[pre-start]
+first = "printf %s '{target}' > \"$WORKTRUNK_DIRECTIVE_CD_FILE\""
+second = 'true'
+"#,
+    ));
+    let cd_file = repo.home_path().join("cd-directive");
+    let output = repo
+        .wt_command()
+        .args(["hook", "pre-start", "--yes"])
+        .env("WORKTRUNK_DIRECTIVE_CD_FILE", &cd_file)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(fs::read_to_string(cd_file).unwrap(), target);
+    let log = fs::read_to_string(repo.root_path().join(".git/wt/logs/commands.jsonl")).unwrap();
+    let mut labels: Vec<String> = log
+        .lines()
+        .map(|line| {
+            let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(entry["exit"], 0);
+            entry["label"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    labels.sort();
+    assert_eq!(
+        labels,
+        ["pre-start project:first", "pre-start project:second"]
+    );
+}
+
+/// A Git checkout hook interrupts its owned Git parent during worktree creation.
+/// The creation error's presentation must retain the command's native status.
+#[rstest]
+#[case::interrupt("INT", 130)]
+#[case::terminate("TERM", 143)]
+#[cfg(unix)]
+fn test_worktree_creation_preserves_git_hook_interrupt(
+    repo: TestRepo,
+    #[case] signal: &str,
+    #[case] expected: i32,
+) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let hook = resolve_git_common_dir(repo.root_path()).join("hooks/post-checkout");
+    let marker = repo.root_path().join("git-hook-ran");
+    fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nprintf called > {}\nkill -{signal} \"$PPID\"\n",
+            shell_escape::escape(marker.to_string_lossy()),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["switch", "--create", "interrupted", "--yes"])
+        .output()
+        .unwrap();
+    assert_eq!(fs::read_to_string(marker).unwrap(), "called");
+    assert_eq!(
+        crate::common::shell_exit_code(&output.status),
+        Some(expected),
+        "{output:?}",
+    );
+}
 
 // ============================================================================
 // User Post-Create Hook Tests
@@ -492,7 +568,7 @@ long = "sh -c 'echo start >> hook.log; sleep 30; echo done >> hook.log'"
 /// Implementation mirrors `test_for_each_aborts_on_signal_exit`: the first
 /// hook step self-signals via SIGTERM after touching a marker. SIGINT against
 /// the parent wt would kill the test harness, so we drive the same
-/// `ChildProcessExited { signal: Some(_), .. }` path with an in-child signal.
+/// `ChildProcessExited { physical_signal: Some(_), .. }` path with an in-child signal.
 #[rstest]
 #[cfg(unix)]
 fn test_pre_merge_pipeline_aborts_on_signal_exit(repo: TestRepo) {
@@ -518,7 +594,7 @@ fn test_pre_merge_pipeline_aborts_on_signal_exit(repo: TestRepo) {
 
     // 128 + SIGTERM (15) = 143
     assert_eq!(
-        output.status.code(),
+        crate::common::shell_exit_code(&output.status),
         Some(143),
         "expected exit 143 (SIGTERM); got {:?}\nstderr: {}",
         output.status.code(),
@@ -531,6 +607,32 @@ fn test_pre_merge_pipeline_aborts_on_signal_exit(repo: TestRepo) {
         contents.trim(),
         "first",
         "second hook step ran after the first was killed by signal; got: {contents:?}",
+    );
+}
+
+/// Ctrl-C stops a Warn pipeline even when the step catches it and exits with an
+/// ordinary status: wt received the key itself, so the next step never starts.
+#[rstest]
+#[cfg(unix)]
+fn test_post_start_pipeline_stops_on_caught_ctrl_c(repo: TestRepo) {
+    repo.write_project_config(
+        r#"post-start = [
+    "trap 'exit 130' INT; echo $$ > hook-pid; while :; do sleep 0.1; done",
+    "echo after > after.log",
+]
+"#,
+    );
+    repo.commit("Add post-start pipeline");
+    let mut job = crate::common::SignalJob::spawn(
+        &repo,
+        &["-vv", "hook", "post-start", "--yes", "--foreground"],
+        std::process::Stdio::null(),
+    );
+    job.interrupt_admitted_child(&repo, &repo.root_path().join("hook-pid"));
+    assert_eq!(crate::common::shell_exit_code(&job.wait()), Some(130));
+    assert!(
+        !repo.root_path().join("after.log").exists(),
+        "the step after Ctrl-C must not run"
     );
 }
 
@@ -1281,25 +1383,198 @@ broken = "echo {{ does_not_exist }} > should_not_exist.txt"
         .join("runner.log");
     wait_for_file_content(&runner_log);
     let log_content = fs::read_to_string(&runner_log).unwrap();
-    // Same label the foreground path renders for this command (see the
-    // foreground_pipeline_undefined_var_runs_earlier_steps snapshot).
+    // Template errors identify the hook type, source, and command.
     assert_snapshot!(log_content, @"
-    [31m✗[39m [31mFailed to expand user:broken: undefined value @ line 1[39m
+    [31m✗[39m [31mFailed to expand post-start user:broken: undefined variable does_not_exist @ line 1[39m
     [107m [0m echo {{ does_not_exist }} > should_not_exist.txt
-    [2m↳[22m [2mAvailable variables: [4margs[24m, [4mbase[24m, [4mbase_worktree_path[24m, [4mbranch[24m, [4mcommit[24m, [4mcwd[24m, [4mdefault_branch[24m, [4mhook_name[24m, [4mhook_type[24m, [4mmain_worktree[24m, [4mmain_worktree_path[24m, [4mprimary_worktree_path[24m, [4mremote[24m, [4mremote_url[24m, [4mrepo[24m, [4mrepo_path[24m, [4mrepo_root[24m, [4mshort_commit[24m, [4mtarget[24m, [4mtarget_worktree_path[24m, [4mupstream[24m, [4mworktree[24m, [4mworktree_name[24m, [4mworktree_path[24m[22m
+    [2m↳[22m [2mAvailable variables: [4margs[24m, [4mbase[24m, [4mbase_worktree_path[24m, [4mbranch[24m, [4mcommit[24m, [4mcwd[24m, [4mdefault_branch[24m, [4mhook_name[24m, [4mhook_type[24m, [4mprimary_worktree_path[24m, [4mremote[24m, [4mremote_url[24m, [4mrepo[24m, [4mrepo_path[24m, [4mshort_commit[24m, [4mtarget[24m, [4mtarget_worktree_path[24m, [4mupstream[24m, [4mworktree_name[24m, [4mworktree_path[24m[22m
     ");
 
     // The step never ran.
     assert!(!repo.root_path().join("should_not_exist.txt").exists());
 }
 
-/// Runner-log failure messages label steps the way the foreground does:
-/// named steps by command name, unnamed steps by the expanded command.
+/// A later preparation error must reap already admitted concurrent children and
+/// resolve their traces before the background runner reports its failure.
+#[rstest]
+#[cfg(unix)]
+fn test_background_concurrent_template_failure_reaps_admitted_child(repo: TestRepo) {
+    use nix::fcntl::OFlag;
+    use nix::sys::signal::{Signal, kill, killpg};
+    use nix::sys::stat::Mode;
+    use nix::unistd::{Pid, mkfifo};
+    use std::io::Write;
+    use std::os::unix::{fs::OpenOptionsExt, process::CommandExt};
+    use std::process::{Child, Stdio};
+
+    struct Runner {
+        child: Child,
+        waited: bool,
+    }
+    impl Drop for Runner {
+        fn drop(&mut self) {
+            if !self.waited {
+                // The unreaped leader reserves this group ID, including when
+                // an assertion fails while the runner is blocked on the FIFO.
+                let _ = killpg(Pid::from_raw(self.child.id() as i32), Signal::SIGKILL);
+                let _ = self.child.wait();
+            }
+        }
+    }
+
+    let admitted = "printf '%s' $$ > admitted.pid; exec sleep 60";
+    let command = |name: &str, template: &str| {
+        serde_json::json!({
+            "name": name,
+            "template": template,
+            "context": {},
+            "template_name": HookSource::User.hook_label(worktrunk::HookType::PostCreate, Some(name)),
+            "label": HookSource::User.command_label(Some(name)),
+        })
+    };
+    let spec = serde_json::json!({
+        "worktree_path": repo.root_path(),
+        "branch": "main",
+        "hook_type": worktrunk::HookType::PostCreate,
+        "source": worktrunk::config::HookSource::User,
+        "steps": [{"Concurrent": [
+            command("admitted", admitted),
+            command("broken", "echo {{ does_not_exist }}"),
+        ]}],
+    });
+    let logs = resolve_git_common_dir(repo.root_path()).join("wt/logs");
+    let hook_logs = logs.join("main/user/post-start");
+    fs::create_dir_all(&hook_logs).unwrap();
+    let blocked_log = hook_logs.join("broken.log");
+    mkfifo(&blocked_log, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+
+    let runner_log = repo.root_path().join("runner-error.log");
+    let child = repo
+        .wt_command()
+        .args(["-vv", "hook", "run-pipeline"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(&runner_log).unwrap())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let mut runner = Runner {
+        child,
+        waited: false,
+    };
+    runner
+        .child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&serde_json::to_vec(&spec).unwrap())
+        .unwrap();
+
+    // Opening the second command's log blocks preparation until we have
+    // observed the first child's PID. The FIFO supplies ordering, not a delay.
+    let pid_path = repo.root_path().join("admitted.pid");
+    wait_for_file_content(&pid_path);
+    let pid = Pid::from_raw(fs::read_to_string(pid_path).unwrap().parse().unwrap());
+    kill(pid, None).expect("admitted child must still be running");
+    let _reader = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(OFlag::O_NONBLOCK.bits())
+        .open(blocked_log)
+        .unwrap();
+
+    crate::common::wait_for("concurrent preparation failure", || {
+        fs::read_to_string(&runner_log)
+            .unwrap()
+            .contains("Failed to expand post-start user:broken:")
+    });
+    assert_eq!(kill(pid, None), Err(nix::errno::Errno::ESRCH));
+
+    let trace = fs::read_to_string(logs.join("trace.jsonl")).unwrap();
+    let outcomes: Vec<_> = worktrunk::trace::parse_lines(&trace)
+        .into_iter()
+        .filter(|entry| {
+            matches!(&entry.kind,
+            worktrunk::trace::TraceEntryKind::Command { command, .. } if command == admitted)
+        })
+        .map(|entry| entry.is_success())
+        .collect();
+    assert_eq!(outcomes, [false], "{trace}");
+    let status = runner.child.wait().unwrap();
+    runner.waited = true;
+    assert_eq!(status.code(), Some(1));
+}
+
+/// Filtered background hooks keep each source's execution and logs independent.
+#[rstest]
+#[case::user(HookSource::User)]
+#[case::project(HookSource::Project)]
+fn test_filtered_background_hooks_preserve_sources(
+    repo: TestRepo,
+    #[case] failing_source: HookSource,
+) {
+    let user_exit = if failing_source == HookSource::User {
+        "exit 7"
+    } else {
+        "true"
+    };
+    let project_exit = if failing_source == HookSource::Project {
+        "exit 7"
+    } else {
+        "true"
+    };
+    repo.write_test_config(&format!(
+        r#"[post-start]
+fmt = "echo USER_LOG; echo ran > user.txt; {user_exit}"
+"#
+    ));
+    repo.write_project_config(&format!(
+        r#"[post-start]
+fmt = "echo PROJECT_LOG; echo ran > project.txt; {project_exit}"
+"#
+    ));
+
+    let output = repo
+        .wt_command()
+        .args(["hook", "post-start", "fmt", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    wait_for_file_content(&repo.root_path().join("user.txt"));
+    wait_for_file_content(&repo.root_path().join("project.txt"));
+
+    let logs = resolve_git_common_dir(repo.root_path()).join("wt/logs/main");
+    let runner = logs
+        .join(failing_source.to_string())
+        .join("post-start/runner.log");
+    crate::common::wait_for("source-qualified background failure", || {
+        fs::read_to_string(&runner)
+            .is_ok_and(|text| text.contains("failed (exit code 7)") && text.ends_with('\n'))
+    });
+    let user_log = fs::read_to_string(logs.join("user/post-start/fmt.log")).unwrap();
+    let project_log = fs::read_to_string(logs.join("project/post-start/fmt.log")).unwrap();
+    let failure = fs::read_to_string(runner).unwrap();
+    let settings = setup_snapshot_settings(&repo);
+    settings.bind(|| {
+        assert_snapshot!(format!("filtered_background_sources_{failing_source}"), format!(
+            "announcement:\n{}\nuser/fmt.log:\n{user_log}\nproject/fmt.log:\n{project_log}\n{failing_source}/runner.log:\n{failure}",
+            String::from_utf8_lossy(&output.stderr),
+        ));
+    });
+}
+
+/// Runner-log failures use the same hook/status grammar as foreground failures.
 #[rstest]
 fn test_background_hook_failure_labels_in_runner_log(repo: TestRepo) {
     repo.write_test_config(
         r#"post-start = [{ broken = "exit 7" }]
-post-switch = "exit 9"
+post-switch = """
+true
+exit 9
+"""
 "#,
     );
 
@@ -1327,17 +1602,20 @@ post-switch = "exit 9"
 
     let named = runner_log("post-start");
     wait_for_file_content(&named);
-    assert_snapshot!(fs::read_to_string(&named).unwrap(), @"[31m✗[39m [31mcommand failed with exit code 7: broken[39m");
+    assert_snapshot!(fs::read_to_string(&named).unwrap(), @"[31m✗[39m [31m[1mpost-start user:broken[22m failed (exit code 7)[39m");
 
     let unnamed = runner_log("post-switch");
     wait_for_file_content(&unnamed);
-    assert_snapshot!(fs::read_to_string(&unnamed).unwrap(), @"[31m✗[39m [31mcommand failed with exit code 9: exit 9[39m");
+    assert_snapshot!(fs::read_to_string(&unnamed).unwrap(), @"
+    [31m✗[39m [31m[1mpost-switch user hook[22m failed (exit code 9)[39m
+    [107m [0m [2m[0m[2m[34mtrue[0m
+    [107m [0m [2m[0m[2m[34mexit[0m[2m 9[0m
+    ");
 }
 
 /// A semantic template error in a foreground pipeline step surfaces when that
 /// step runs: earlier steps execute first, then the broken step's render
-/// aborts the pipeline. (Pre-change, prep expanded every template upfront and
-/// nothing ran.) Syntax errors still abort before step 1.
+/// aborts the pipeline. Syntax errors still abort before step 1.
 #[rstest]
 fn test_foreground_pipeline_undefined_var_runs_earlier_steps(repo: TestRepo) {
     repo.write_test_config(
@@ -1363,6 +1641,119 @@ fn test_foreground_pipeline_undefined_var_runs_earlier_steps(repo: TestRepo) {
         marker.exists(),
         "step 1 should have run before step 2's template error"
     );
+}
+
+/// Runtime expansion obeys the same foreground policy as child failures:
+/// Warn admits healthy concurrent siblings and later commands from either
+/// source; FailFast rejects the group before spawning any command in it.
+#[rstest]
+#[case::warn_serial(true, false, true)]
+#[case::warn_concurrent(true, true, true)]
+#[case::warn_all_broken(true, true, false)]
+#[case::failfast_serial(false, false, true)]
+#[case::failfast_concurrent(false, true, true)]
+fn test_foreground_template_failure_policy(
+    repo: TestRepo,
+    #[case] warn: bool,
+    #[case] concurrent: bool,
+    #[case] healthy_sibling: bool,
+) {
+    let hook_type = if warn { "post-start" } else { "pre-merge" };
+    let broken = r#"broken = "echo {{ does_not_exist }}""#;
+    let sibling = if healthy_sibling {
+        r#"sibling = "echo ran > sibling.txt", "#
+    } else {
+        r#"also_broken = "echo {{ missing_too }}", "#
+    };
+    let failing_step = if concurrent {
+        format!("{{ {sibling}{broken} }}")
+    } else {
+        format!("{{ {broken} }}")
+    };
+    repo.write_test_config(&format!(
+        r#"{hook_type} = [
+    {{ first = "echo ran > first.txt" }},
+    {failing_step},
+    {{ later = "echo ran > later.txt" }},
+]
+"#,
+    ));
+    repo.write_project_config(&format!(
+        r#"[{hook_type}]
+project = "echo ran > project.txt"
+"#,
+    ));
+    let output = repo
+        .wt_command()
+        .args(["hook", hook_type, "--foreground", "--yes"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.success(), warn, "{stderr}");
+    assert!(repo.root_path().join("first.txt").exists(), "{stderr}");
+    for name in ["later.txt", "project.txt"] {
+        assert_eq!(
+            repo.root_path().join(name).exists(),
+            warn,
+            "{name}: {stderr}"
+        );
+    }
+    assert_eq!(
+        repo.root_path().join("sibling.txt").exists(),
+        warn && concurrent && healthy_sibling,
+        "{stderr}",
+    );
+    let settings = setup_snapshot_settings(&repo);
+    settings.bind(|| {
+        assert_snapshot!(
+            format!("foreground_template_policy_{warn}_{concurrent}_{healthy_sibling}"),
+            stderr,
+        );
+    });
+}
+
+/// An ordinary shell status 130 remains a failure under Warn, so healthy
+/// concurrent siblings and subsequent source/serial commands still run.
+#[rstest]
+#[case::serial(false)]
+#[case::concurrent(true)]
+fn test_foreground_warn_status_130_continues(repo: TestRepo, #[case] concurrent: bool) {
+    let first = if concurrent {
+        r#"{ fail = "exit 130", sibling = "echo ran > sibling.txt" }"#
+    } else {
+        r#"{ fail = "exit 130" }"#
+    };
+    repo.write_test_config(&format!(
+        r#"post-start = [{first}, {{ later = "echo ran > later.txt" }}]
+"#,
+    ));
+    repo.write_project_config(
+        r#"[post-start]
+project = "echo ran > project.txt"
+"#,
+    );
+    let output = repo
+        .wt_command()
+        .args(["hook", "post-start", "--foreground", "--yes"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("failed (exit code 130)"), "{stderr}");
+    assert!(repo.root_path().join("later.txt").exists(), "{stderr}");
+    assert!(repo.root_path().join("project.txt").exists(), "{stderr}");
+    assert_eq!(repo.root_path().join("sibling.txt").exists(), concurrent);
+}
+
+#[rstest]
+fn test_hook_template_typo_names_variable(repo: TestRepo) {
+    repo.write_test_config("pre-merge = \"echo {{ brnch }}\"\n");
+    let settings = setup_snapshot_settings(&repo);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.args(["hook", "pre-merge", "--yes"]);
+        assert_cmd_snapshot!(cmd);
+    });
 }
 
 /// The other half of that contract: a *syntax* error anywhere in the pipeline
@@ -1467,32 +1858,91 @@ notify = "echo switched"
     });
 }
 
-// Note: The `return Ok(())` path in spawn_hooks_after_remove when UserConfig::load()
-// fails is defensive code for an extremely rare race condition where config becomes
-// invalid between command startup and hook execution. This is not easily testable
-// without complex timing manipulation.
-
+/// The approval gate freezes both removal hooks before either runs. If
+/// `pre-remove` makes the user config unreadable, `post-remove` must still run
+/// from that frozen plan rather than silently disappearing on a second load.
 #[rstest]
-fn test_standalone_hook_post_remove_invalid_template(repo: TestRepo) {
-    // Write project config with invalid template syntax (unclosed braces)
-    repo.write_project_config(r#"post-remove = "echo {{ invalid""#);
+fn test_post_remove_uses_config_snapshot_after_pre_remove_mutates_file(mut repo: TestRepo) {
+    let feature_wt = repo.add_worktree("feature");
+    let config_path = repo.test_config_path().to_slash_lossy();
+    let marker = repo
+        .root_path()
+        .parent()
+        .unwrap()
+        .join("post-remove-after-config-change.txt");
+    let marker_path = marker.to_slash_lossy();
 
-    let mut cmd = crate::common::wt_command();
-    cmd.current_dir(repo.root_path());
-    cmd.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    repo.write_test_config(&format!(
+        r#"[pre-remove]
+break-config = "printf 'invalid = [' > '{config_path}'"
+
+[post-remove]
+marker = "printf POST_REMOVE_RAN > '{marker_path}'"
+"#
+    ));
+
+    let output = repo
+        .wt_command()
+        .args(["remove", "--foreground", "--force-delete", "feature"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "removal should succeed after the planned pre-remove hook mutates config: {stderr}"
+    );
+    assert!(
+        !feature_wt.exists(),
+        "feature worktree should have been removed"
+    );
+    assert!(
+        stderr.contains("Running post-remove"),
+        "the frozen post-remove hook should still be registered: {stderr}"
+    );
+    wait_for_file_content(&marker);
+    assert_eq!(fs::read_to_string(marker).unwrap(), "POST_REMOVE_RAN");
+}
+
+/// Manual hook argument routing parses templates before pipeline preparation.
+/// Its syntax errors must identify the same source and command as execution
+/// errors, including which named command failed.
+#[rstest]
+#[case::user_unnamed(HookSource::User, None)]
+#[case::user_named(HookSource::User, Some("broken"))]
+#[case::project_unnamed(HookSource::Project, None)]
+#[case::project_named(HookSource::Project, Some("broken"))]
+fn test_standalone_hook_post_remove_invalid_template(
+    repo: TestRepo,
+    #[case] source: HookSource,
+    #[case] name: Option<&str>,
+) {
+    let config = match name {
+        Some(name) => format!(
+            r#"[post-remove]
+{name} = "echo {{{{ invalid"
+"#
+        ),
+        None => r#"post-remove = "echo {{ invalid""#.to_owned(),
+    };
+    match source {
+        HookSource::User => repo.write_test_config(&config),
+        HookSource::Project => repo.write_project_config(&config),
+    }
+
+    let mut cmd = repo.wt_command();
     cmd.args(["hook", "post-remove", "--yes"]);
 
-    let output = cmd.output().unwrap();
-    assert!(
-        !output.status.success(),
-        "wt hook post-remove should fail with invalid template"
-    );
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("syntax error"),
-        "Error should mention template expansion failure, got: {stderr}"
-    );
+    let settings = setup_snapshot_settings(&repo);
+    settings.bind(|| {
+        assert_cmd_snapshot!(
+            format!(
+                "standalone_hook_post_remove_invalid_template_{source}_{}",
+                name.unwrap_or("unnamed")
+            ),
+            cmd
+        );
+    });
 }
 
 #[rstest]
@@ -2018,6 +2468,181 @@ fn test_standalone_hook_post_start_foreground(repo: TestRepo) {
 }
 
 #[rstest]
+fn test_standalone_hook_post_start_foreground_inherits_stdin(repo: TestRepo) {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    // `--foreground` routes a `post-*` hook through the single-step foreground
+    // path, which inherits wt's stdin — so the hook can prompt in the mode that
+    // exists to debug it. (The detached default reads EOF; see
+    // `test_post_start_detached_hook_gets_no_stdin`.)
+    repo.write_project_config(r#"post-start = "cat > captured.txt""#);
+
+    let mut cmd = crate::common::wt_command();
+    cmd.current_dir(repo.root_path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    cmd.args(["hook", "post-start", "--yes", "--foreground"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("failed to spawn wt hook post-start");
+    child
+        .stdin
+        .take()
+        .expect("stdin piped")
+        .write_all(b"sentinel-from-parent-stdin\n")
+        .expect("failed to write to wt stdin");
+    let output = child.wait_with_output().expect("failed to run wt hook");
+
+    assert!(
+        output.status.success(),
+        "wt hook post-start --foreground should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let captured = repo.root_path().join("captured.txt");
+    assert!(
+        captured.exists(),
+        "captured.txt should have been created from the inherited stdin"
+    );
+
+    let contents = fs::read_to_string(&captured).unwrap();
+    assert_eq!(
+        contents, "sentinel-from-parent-stdin\n",
+        "`--foreground` should hand the hook the parent's raw stdin"
+    );
+}
+
+/// Foreground children share the caller's native job group.
+#[rstest]
+#[cfg(unix)]
+fn test_pre_start_hook_shares_parent_pgroup(repo: TestRepo) {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    repo.write_project_config(r#"pre-start = "ps -o pgid= -p $$ | tr -d ' \n' > hook_pgid.txt""#);
+
+    let mut cmd = crate::common::wt_command();
+    cmd.current_dir(repo.root_path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    cmd.args(["hook", "pre-start", "--yes"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // wt becomes its own pgroup leader, so wt.pid == wt.pgid.
+    cmd.process_group(0);
+    let mut child = cmd.spawn().expect("failed to spawn wt hook pre-start");
+    let wt_pid = child.id() as i32;
+    let status = child.wait().expect("failed to wait for wt");
+    assert!(status.success(), "hook should succeed, got: {status:?}");
+
+    let marker = repo.root_path().join("hook_pgid.txt");
+    let recorded = fs::read_to_string(&marker)
+        .unwrap_or_else(|e| panic!("missing pgid marker {marker:?}: {e}"));
+    let hook_pgid: i32 = recorded
+        .trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("could not parse pgid {recorded:?}: {e}"));
+    assert_eq!(
+        hook_pgid, wt_pid,
+        "foreground hook must share its caller group"
+    );
+}
+
+#[rstest]
+fn test_foreground_pipeline_steps_share_one_stdin(repo: TestRepo) {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    // Foreground steps run in order against wt's own stdin, so the first one
+    // to drain it to EOF leaves nothing behind — which is a property of the
+    // pipe this test constructs, not of a terminal, where each step could
+    // still prompt in turn. Steps accumulate across config files, so a user
+    // and a project hook of the same type reach this shape without an array.
+    repo.write_project_config(r#"post-start = ["cat > a.txt", "cat > b.txt"]"#);
+
+    let mut cmd = crate::common::wt_command();
+    cmd.current_dir(repo.root_path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    cmd.args(["hook", "post-start", "--yes", "--foreground"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("failed to spawn wt hook post-start");
+    child
+        .stdin
+        .take()
+        .expect("stdin piped")
+        .write_all(b"sentinel-from-parent-stdin\n")
+        .expect("failed to write to wt stdin");
+    let output = child.wait_with_output().expect("failed to run wt hook");
+
+    assert!(
+        output.status.success(),
+        "wt hook post-start --foreground should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(
+        fs::read_to_string(repo.root_path().join("a.txt")).unwrap(),
+        "sentinel-from-parent-stdin\n",
+        "the first foreground step should read the parent's stdin"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.root_path().join("b.txt")).unwrap(),
+        "",
+        "the first step drained stdin, so the second should see EOF"
+    );
+}
+
+#[rstest]
+fn test_standalone_hook_concurrent_group_gets_no_stdin_under_foreground(repo: TestRepo) {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    // A multi-key table parses as `HookStep::Concurrent`, whose children run at
+    // the same time and so can't share one terminal — each gets a closed stdin
+    // instead. This is the shape that silently takes the tty away from a
+    // `gum confirm`, so pin it rather than leaving it to the docs.
+    repo.write_project_config(
+        r#"[post-start]
+a = "cat > cap_a.txt"
+b = "true"
+"#,
+    );
+
+    let mut cmd = crate::common::wt_command();
+    cmd.current_dir(repo.root_path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    cmd.args(["hook", "post-start", "--yes", "--foreground"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("failed to spawn wt hook post-start");
+    child
+        .stdin
+        .take()
+        .expect("stdin piped")
+        .write_all(b"sentinel-from-parent-stdin\n")
+        .expect("failed to write to wt stdin");
+    let output = child.wait_with_output().expect("failed to run wt hook");
+
+    assert!(
+        output.status.success(),
+        "wt hook post-start --foreground should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let contents = fs::read_to_string(repo.root_path().join("cap_a.txt")).unwrap();
+    assert_eq!(
+        contents, "",
+        "a concurrent child should read EOF — neither the parent's stdin nor a JSON context"
+    );
+}
+
+#[rstest]
 fn test_standalone_hook_pre_commit(repo: TestRepo) {
     // Write project config with pre-commit hook
     repo.write_project_config(r#"pre-commit = "echo 'STANDALONE_PRE_COMMIT' > hook_ran.txt""#);
@@ -2534,38 +3159,77 @@ bar = "echo ran > project_bar.txt"
     );
 }
 
-/// A bare source filter (`user:` / `project:`) asks for every hook from one
-/// source, so it runs them all without naming any.
+/// Source selection excludes malformed templates in the other configuration.
 #[rstest]
-fn test_hook_bare_source_filter_runs_that_source(repo: TestRepo) {
-    repo.write_test_config(
-        r#"[pre-merge]
-fmt = "echo ran > user_fmt.txt"
-lint = "echo ran > user_lint.txt"
-"#,
-    );
-    repo.write_project_config(r#"pre-merge = "echo ran > project.txt""#);
+#[case::user(HookSource::User)]
+#[case::project(HookSource::Project)]
+fn test_hook_bare_source_filter_runs_that_source(repo: TestRepo, #[case] source: HookSource) {
+    let selected = r#"[pre-merge]
+fmt = "echo ran > selected_fmt.txt"
+lint = "echo ran > selected_lint.txt"
+"#;
+    let excluded = r#"pre-merge = "echo {{ unclosed""#;
+    match source {
+        HookSource::User => {
+            repo.write_test_config(selected);
+            repo.write_project_config(excluded);
+        }
+        HookSource::Project => {
+            repo.write_test_config(excluded);
+            repo.write_project_config(selected);
+        }
+    }
     repo.commit("Add pre-merge hooks");
-
+    let filter = format!("{source}:");
     let output = repo
         .wt_command()
-        .args(["hook", "pre-merge", "user:", "--yes"])
+        .args(["hook", "pre-merge", &filter, "--yes"])
         .output()
-        .expect("Failed to run wt hook pre-merge");
-
+        .unwrap();
     assert!(
         output.status.success(),
-        "wt hook pre-merge user: failed: {}",
+        "{}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        repo.root_path().join("user_fmt.txt").exists()
-            && repo.root_path().join("user_lint.txt").exists(),
-        "user: should run every user hook"
+        repo.root_path().join("selected_fmt.txt").exists()
+            && repo.root_path().join("selected_lint.txt").exists()
     );
+}
+
+/// Only selected commands participate in syntax validation and shorthand binding.
+#[rstest]
+#[case::syntax("echo {{ unclosed")]
+#[case::routing("echo {{ key }}")]
+fn test_hook_named_filter_selects_before_template_parsing(
+    repo: TestRepo,
+    #[case] excluded_template: &str,
+    #[values(HookSource::User, HookSource::Project)] source: HookSource,
+) {
+    let config = format!(
+        r#"[pre-merge]
+valid = "printf '%s' {{{{ args }}}} > selected.txt"
+broken = "{excluded_template}"
+"#
+    );
+    match source {
+        HookSource::User => repo.write_test_config(&config),
+        HookSource::Project => repo.write_project_config(&config),
+    }
+    let filter = format!("{source}:valid");
+    let output = repo
+        .wt_command()
+        .args(["hook", "pre-merge", &filter, "--yes", "--key=value"])
+        .output()
+        .unwrap();
     assert!(
-        !repo.root_path().join("project.txt").exists(),
-        "user: must not reach the project hook"
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(repo.root_path().join("selected.txt")).unwrap(),
+        "--key=value"
     );
 }
 
@@ -2868,6 +3532,35 @@ test = "echo '{{ branch }}' > shorthand_output.txt"
     );
 }
 
+/// `--args=VALUE` forwards into `{{ args }}` rather than binding it, since the
+/// forwarded positional list would overwrite the binding and drop the token.
+#[rstest]
+fn test_var_shorthand_args_key_forwards(repo: TestRepo) {
+    repo.write_test_config(
+        r#"[pre-start]
+test = "echo '{{ args }}' > args_output.txt"
+"#,
+    );
+
+    let output = repo
+        .wt_command()
+        .args(["hook", "pre-start", "--yes", "--args=KEPT"])
+        .output()
+        .expect("Failed to run wt hook");
+
+    assert!(
+        output.status.success(),
+        "Hook should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let contents = fs::read_to_string(repo.root_path().join("args_output.txt")).unwrap();
+    assert!(
+        contents.contains("--args=KEPT"),
+        "--args=KEPT should forward into args, got: {contents}"
+    );
+}
+
 #[rstest]
 fn test_var_shorthand_mixed_with_long_form(repo: TestRepo) {
     // Shorthand and `--var` forms coexist in the same invocation.
@@ -3120,37 +3813,6 @@ fn test_var_shorthand_does_not_leak_into_hook_show() {
     assert!(
         stderr.contains("unexpected argument") || stderr.contains("--branch"),
         "Expected clap to reject --branch on `hook show`, got: {stderr}"
-    );
-}
-
-#[rstest]
-fn test_var_flag_deprecated_alias_works(repo: TestRepo) {
-    // Test that deprecated variable aliases (main_worktree, repo_root, worktree) can be overridden
-    repo.write_test_config(
-        r#"[pre-start]
-test = "echo '{{ main_worktree }}' > alias_output.txt"
-"#,
-    );
-
-    let output = repo
-        .wt_command()
-        .args([
-            "hook",
-            "pre-start",
-            "--yes",
-            "--var",
-            "main_worktree=/custom/path",
-        ])
-        .output()
-        .expect("Failed to run wt hook");
-
-    assert!(output.status.success());
-
-    let output_file = repo.root_path().join("alias_output.txt");
-    let contents = std::fs::read_to_string(&output_file).expect("Should have created output file");
-    assert!(
-        contents.contains("/custom/path"),
-        "Deprecated alias should be overridden, got: {contents}"
     );
 }
 
@@ -3602,6 +4264,159 @@ capture = "echo 'target={{ target }} target_wt={{ target_worktree_path }} wt_pat
     );
 }
 
+/// Regression test for #4492: a worktree path selects the same worktree as its
+/// branch name, so the pre-switch vars must describe that destination too.
+/// The picker passes paths, so every picker switch takes this route.
+#[rstest]
+fn test_pre_switch_vars_with_path_argument(mut repo: TestRepo) {
+    let feature_path = repo.add_worktree("feature");
+    let feature_name = feature_path.file_name().unwrap().to_string_lossy();
+
+    repo.write_test_config(
+        r#"[pre-switch]
+capture = "echo 'branch={{ branch }} target={{ target }} wt_name={{ worktree_name }} target_wt={% if target_worktree_path %}set{% endif %} commit={% if commit %}set{% endif %}' > pre_switch_path.txt"
+"#,
+    );
+
+    let output = repo
+        .wt_command()
+        .args(["switch", feature_path.to_str().unwrap(), "--yes"])
+        .current_dir(repo.root_path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let content = fs::read_to_string(repo.root_path().join("pre_switch_path.txt")).unwrap();
+    assert_eq!(
+        content.trim(),
+        format!("branch=feature target=feature wt_name={feature_name} target_wt=set commit=set"),
+    );
+}
+
+/// A detached worktree is reachable only by path. Its pre-switch vars leave
+/// `branch`/`target` unset and take `commit` from the destination's HEAD, not
+/// the source's.
+#[rstest]
+fn test_pre_switch_vars_with_detached_path_argument(mut repo: TestRepo) {
+    let detached_path = repo.add_worktree("detached");
+    repo.commit_in_worktree(&detached_path, "file.txt", "content", "detached commit");
+    repo.detach_head_in_worktree("detached");
+    let detached_sha = repo.head_sha_in(&detached_path);
+
+    repo.write_test_config(
+        r#"[pre-switch]
+capture = "echo 'branch={% if branch is defined %}{{ branch }}{% else %}unset{% endif %} target={% if target is defined %}{{ target }}{% else %}unset{% endif %} commit={{ commit }}' > pre_switch_detached_path.txt"
+"#,
+    );
+
+    let output = repo
+        .wt_command()
+        .args(["switch", detached_path.to_str().unwrap(), "--yes"])
+        .current_dir(repo.root_path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let content =
+        fs::read_to_string(repo.root_path().join("pre_switch_detached_path.txt")).unwrap();
+    assert_eq!(
+        content.trim(),
+        format!("branch=unset target=unset commit={detached_sha}"),
+    );
+}
+
+/// A remote-tracking name (`origin/feature`, which the picker passes for a
+/// remote branch) switches to the local branch, so the pre-switch vars name
+/// that branch — with its worktree when it has one, and without when the
+/// switch creates it.
+#[rstest]
+#[case::existing_worktree("feature", "set")]
+#[case::remote_only("remote-feature", "unset")]
+fn test_pre_switch_vars_with_remote_prefixed_argument(
+    #[from(repo_with_remote)] mut repo: TestRepo,
+    #[case] branch: &str,
+    #[case] target_wt: &str,
+) {
+    if branch == "feature" {
+        repo.add_worktree("feature");
+        repo.run_git(&["push", "origin", "feature"]);
+    } else {
+        repo.run_git(&["branch", branch]);
+        repo.run_git(&["push", "origin", branch]);
+        repo.run_git(&["branch", "-D", branch]);
+    }
+
+    repo.write_test_config(
+        r#"[pre-switch]
+capture = "echo 'branch={{ branch }} target={{ target }} target_wt={% if target_worktree_path %}set{% else %}unset{% endif %}' > pre_switch_remote.txt"
+"#,
+    );
+
+    let output = repo
+        .wt_command()
+        .args(["switch", &format!("origin/{branch}"), "--yes"])
+        .current_dir(repo.root_path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let content = fs::read_to_string(repo.root_path().join("pre_switch_remote.txt")).unwrap();
+    assert_eq!(
+        content.trim(),
+        format!("branch={branch} target={branch} target_wt={target_wt}"),
+    );
+}
+
+/// A pre-switch hook that fetches makes a branch it fetched switchable in the
+/// same run — the fetch-if-stale use the hook exists for — whether the
+/// argument names the branch or its remote-tracking ref.
+#[rstest]
+#[case::branch("late")]
+#[case::remote_tracking("origin/late")]
+fn test_pre_switch_fetch_makes_branch_switchable(
+    #[from(repo_with_remote)] repo: TestRepo,
+    #[case] argument: &str,
+) {
+    // `late` exists on the remote, but nothing local knows about it yet.
+    repo.run_git(&["branch", "late"]);
+    repo.run_git(&["push", "origin", "late"]);
+    repo.run_git(&["branch", "-D", "late"]);
+    repo.run_git(&["update-ref", "-d", "refs/remotes/origin/late"]);
+
+    repo.write_test_config(
+        r#"[pre-switch]
+fetch = "git fetch -q origin"
+"#,
+    );
+
+    let output = repo
+        .wt_command()
+        .args(["switch", argument, "--no-cd", "--yes", "--format=json"])
+        .current_dir(repo.root_path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["action"], "created");
+    assert_eq!(json["branch"], "late");
+}
+
 /// Post-remove: target/target_worktree_path point to where user ends up.
 #[rstest]
 fn test_post_remove_has_target_vars(mut repo: TestRepo) {
@@ -3980,8 +4795,8 @@ fn test_user_post_start_pipeline_shell_escaping(repo: TestRepo) {
 #[rstest]
 fn test_user_post_start_pipeline_hook_name_per_step(repo: TestRepo) {
     // Each step in a pipeline should see its own hook_name, not the first step's name.
-    // Before the fix, step 2 would see step 1's hook_name because the shared pipeline
-    // context included hook_name from the first command's context_json.
+    // Before the fix, step 2 would see step 1's hook_name because a single shared
+    // pipeline context carried the first command's hook_name to every step.
     repo.write_test_config(
         r#"post-start = [
     { step_one = "echo {{ hook_name }} > step_one_name.txt" },
@@ -4203,6 +5018,73 @@ setup = "'{wt_toml}' switch --create hook-created --no-hooks"
         !stderr.contains("shell integration"),
         "inner wt should not warn about shell integration being uninstalled, got: {stderr}",
     );
+}
+
+/// A nested wt's directive outlives its target when a later step removes the
+/// worktree it switched to. The outer wt withdraws it on exit, so the shell
+/// wrapper doesn't `cd` into a missing directory.
+#[rstest]
+fn test_directive_to_worktree_removed_by_later_step_is_withdrawn(repo: TestRepo) {
+    use crate::common::{configure_directive_file, directive_file, wt_bin};
+
+    repo.commit("initial");
+    let created = repo.root_path().parent().unwrap().join("repo.hook-created");
+
+    let wt_toml = wt_bin().to_string_lossy().replace('\\', r"\\");
+    let created_toml = created.to_string_lossy().replace('\\', r"\\");
+    repo.write_test_config(&format!(
+        r#"
+[pre-start]
+setup = "'{wt_toml}' switch --create hook-created --no-hooks && git worktree remove --force '{created_toml}'"
+"#,
+    ));
+
+    let (cd_path, _guard) = directive_file();
+    let mut cmd = repo.wt_command();
+    configure_directive_file(&mut cmd, &cd_path);
+    cmd.args(["hook", "pre-start", "setup"]);
+    let output = cmd.output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "hook failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        !created.exists(),
+        "the hook should remove the worktree it created"
+    );
+    assert_eq!(
+        fs::read_to_string(&cd_path).unwrap(),
+        "",
+        "wt left a cd directive to the removed worktree"
+    );
+}
+
+/// A directive to a directory whose name ends in a space names a directory
+/// that exists, so wt keeps it. Unix only: Windows drops trailing spaces from
+/// directory names.
+#[cfg(unix)]
+#[rstest]
+fn test_directive_to_directory_ending_in_space_is_kept(repo: TestRepo) {
+    let target = repo.home_path().join("dir ");
+    fs::create_dir(&target).unwrap();
+    let target = target.to_string_lossy().to_string();
+    repo.write_project_config(&format!(
+        r#"[pre-start]
+cd = "printf %s '{target}' > \"$WORKTRUNK_DIRECTIVE_CD_FILE\""
+"#,
+    ));
+    let cd_file = repo.home_path().join("cd-directive");
+    let output = repo
+        .wt_command()
+        .args(["hook", "pre-start", "--yes"])
+        .env("WORKTRUNK_DIRECTIVE_CD_FILE", &cd_file)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(fs::read_to_string(cd_file).unwrap(), target);
 }
 
 // ============================================================================
@@ -4479,4 +5361,210 @@ fn test_concurrent_hook_does_not_inherit_git_discovery_vars(repo: TestRepo) {
     let marker = repo.root_path().join("env_seen.txt");
     assert!(marker.exists(), "concurrent hook did not run");
     assert_git_env_scrubbed(&marker);
+}
+
+/// A serial project hook and a concurrent user hook share status and source grammar.
+#[rstest]
+#[case(false, "project")]
+#[case(true, "user")]
+fn test_hook_failure_status_and_source(
+    repo: TestRepo,
+    #[case] concurrent: bool,
+    #[case] source: &str,
+) {
+    let config = if concurrent {
+        r#"pre-merge = [{ check = "exit 7", sibling = "true" }]"#
+    } else {
+        r#"pre-merge = [{ check = "exit 7" }]"#
+    };
+    if source == "project" {
+        repo.write_project_config(config);
+    } else {
+        repo.write_test_config(config);
+    }
+    let output = repo
+        .wt_command()
+        .args(["hook", "pre-merge", "--yes"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(7), "{stderr}");
+    setup_snapshot_settings(&repo).bind(|| {
+        assert_snapshot!(format!("hook_failure_status_{source}"), stderr);
+    });
+}
+
+/// A hook moves its worktree, so the next spawn fails. Serial and concurrent
+/// paths retain the failing command and OS cause under Warn and FailFast.
+#[rstest]
+#[cfg(unix)]
+#[case::warn_serial(true, false)]
+#[case::warn_concurrent(true, true)]
+#[case::failfast_serial(false, false)]
+#[case::failfast_concurrent(false, true)]
+fn test_foreground_hook_spawn_failure_has_one_io_detail(
+    mut repo: TestRepo,
+    #[case] warn: bool,
+    #[case] concurrent: bool,
+) {
+    let worktree = repo.add_worktree("move-away");
+    let hook = if warn { "post-start" } else { "pre-merge" };
+    let config = if concurrent {
+        r#"[
+    { move = "mv {{ worktree_path }} {{ worktree_path }}.moved" },
+    { check = "true", sibling = "true" },
+]
+"#
+    } else {
+        r#"[
+    { move = "mv {{ worktree_path }} {{ worktree_path }}.moved" },
+    { check = "true" },
+]
+"#
+    };
+    repo.write_test_config(&format!("{hook} = {config}"));
+    let output = repo
+        .wt_command()
+        .args(["hook", hook, "--foreground", "--yes"])
+        .current_dir(&worktree)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(if warn { 0 } else { 1 }),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !worktree.exists(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(worktree.with_file_name("repo.move-away.moved").exists());
+    assert!(repo.root_path().exists());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches("Failed to execute").count(),
+        if warn && concurrent { 2 } else { 1 },
+        "{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("os error 2").count(),
+        if warn && concurrent { 2 } else { 1 },
+        "{stderr}"
+    );
+    setup_snapshot_settings(&repo).bind(|| {
+        assert_snapshot!(
+            match (warn, concurrent) {
+                (true, false) => "foreground_hook_spawn_failure_has_one_io_detail",
+                (true, true) => "foreground_concurrent_hook_spawn_failure_has_one_io_detail",
+                (false, false) => "foreground_hook_failfast_spawn_failure_has_one_io_detail",
+                (false, true) =>
+                    "foreground_concurrent_hook_failfast_spawn_failure_has_one_io_detail",
+            },
+            stderr
+        );
+    });
+}
+
+/// Sibling count must not change access to /dev/tty. Exercise the reported
+/// terminal-settings failure, input allocation, and restoration after the job.
+#[rstest]
+#[cfg(all(unix, feature = "shell-integration-tests"))]
+#[case::single(false)]
+#[case::concurrent(true)]
+fn test_foreground_hook_terminal_job(repo: TestRepo, #[case] concurrent: bool) {
+    use crate::common::{configure_pty_command, open_pty, wt_bin};
+    use portable_pty::CommandBuilder;
+    use std::io::Read;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let probe = "stty -echo < /dev/tty; ps -o pgid= -p $$ > job.txt; ps -o tpgid= -p $$ >> job.txt; stty \"$WT_TEST_TERMINAL_MODES\" < /dev/tty";
+    let input = if concurrent {
+        "test ! -t 0"
+    } else {
+        "test -t 0"
+    };
+    let config = if concurrent {
+        format!(
+            "[pre-start]\none = '{probe}; {input}'\ntwo = 'stty -echo < /dev/tty; test ! -t 0; ps -o pgid= -p $$ > sibling.txt; stty \"$WT_TEST_TERMINAL_MODES\" < /dev/tty'\n"
+        )
+    } else {
+        format!("pre-start = '{probe}; {input}'\n")
+    };
+    repo.write_project_config(&config);
+    let mut command = CommandBuilder::new("bash");
+    command.args([
+        "--noprofile",
+        "--norc",
+        "-c",
+        r#"
+before=$(stty -g)
+export WT_TEST_TERMINAL_MODES="$before"
+"$WT_JOB_TEST_BINARY" hook pre-start --yes
+result=$?
+after=$(stty -g)
+[ "$before" = "$after" ] || exit 99
+printf 'TERMINAL-RESTORED\n'
+exit "$result"
+"#,
+    ]);
+    configure_pty_command(&mut command);
+    command.cwd(repo.root_path());
+    command.env("WT_JOB_TEST_BINARY", wt_bin());
+    command.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    let pair = open_pty();
+    let mut child = pair.slave.spawn_command(command).unwrap();
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    let (tx, rx) = mpsc::channel();
+    let reading = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let _ = reader.read_to_end(&mut output);
+        let _ = tx.send(String::from_utf8_lossy(&output).into_owned());
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            if let Some(group) = pair.master.process_group_leader() {
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(group),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+            let _ = child.kill();
+            panic!("foreground hook stopped or hung (concurrent={concurrent})");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    drop(pair.master);
+    let output = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    reading.join().unwrap();
+    assert_eq!(status.exit_code(), 0, "{output}");
+    assert!(output.contains("TERMINAL-RESTORED"), "{output}");
+    let groups: Vec<i32> = fs::read_to_string(repo.root_path().join("job.txt"))
+        .unwrap()
+        .split_whitespace()
+        .map(|group| group.parse().unwrap())
+        .collect();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(
+        groups[0], groups[1],
+        "child must own the terminal's foreground group"
+    );
+    if concurrent {
+        let sibling: i32 = fs::read_to_string(repo.root_path().join("sibling.txt"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            sibling, groups[0],
+            "siblings must share one foreground job group"
+        );
+    }
 }

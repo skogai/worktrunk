@@ -24,7 +24,7 @@ use crate::commands::list::layout::{LinkStyle, format_url_cell};
 /// (Gate 2) from metadata alone. The decision priority is:
 /// `prunable` > `locked` > detached > `duplicate_branch` >
 /// `branch_worktree_mismatch` > `None` — the yellow actionable states outrank
-/// the informational (dim yellow) `⊘` and `⚑`. The last two both render `⚑`,
+/// the informational `⊘` (yellow) and `⚐` (dim). The last two both render `⚐`,
 /// so their order decides only which cause the JSON `worktree.state` names; a
 /// duplicate wins because a force-added worktree lands off-template as a side
 /// effect of being force-added, not as the fact worth reporting.
@@ -79,7 +79,7 @@ pub struct WorktreeData {
     pub is_main: bool,
     /// Whether this is the current worktree (matches repo discovery path: PWD or `-C`)
     pub is_current: bool,
-    /// Whether this was the previous worktree (from `worktrunk.history`)
+    /// Whether this was the previous worktree (the `wt switch -` target)
     pub is_previous: bool,
     /// Whether the worktree is at an unexpected location (branch-worktree mismatch).
     /// Only true when: has branch name, not main worktree, and path differs from template.
@@ -93,7 +93,8 @@ pub struct WorktreeData {
 }
 
 impl WorktreeData {
-    /// Returns true if this worktree is prunable (directory deleted but git still tracks metadata).
+    /// Returns true if git reports this worktree prunable: its directory or
+    /// that directory's `.git` is gone.
     pub fn is_prunable(&self) -> bool {
         self.prunable.is_some()
     }
@@ -385,20 +386,14 @@ pub struct Collected {
 impl ListItem {
     /// Create a ListItem for a local branch without a worktree.
     pub(crate) fn new_branch(head: String, branch: String) -> Self {
-        Self::new_branch_with_scope(head, branch, BranchScope::Local)
+        let branch_ref = BranchRef::local_branch(&branch, &head);
+        Self::new(branch_ref, ItemKind::Branch(BranchScope::Local))
     }
 
     /// Create a ListItem for a remote-tracking branch (no local worktree).
-    pub(crate) fn new_remote_branch(head: String, branch: String) -> Self {
-        Self::new_branch_with_scope(head, branch, BranchScope::Remote)
-    }
-
-    fn new_branch_with_scope(head: String, branch: String, scope: BranchScope) -> Self {
-        let branch_ref = match scope {
-            BranchScope::Local => BranchRef::local_branch(&branch, &head),
-            BranchScope::Remote => BranchRef::remote_branch(&branch, &head),
-        };
-        Self::new(branch_ref, ItemKind::Branch(scope))
+    pub(crate) fn new_remote_branch(head: String, remote_name: String, branch: String) -> Self {
+        let branch_ref = BranchRef::remote_branch(&remote_name, &branch, &head);
+        Self::new(branch_ref, ItemKind::Branch(BranchScope::Remote))
     }
 
     /// Create a row for a registered worktree.
@@ -465,13 +460,10 @@ impl ListItem {
     /// invariant. The picker's removal morph reclassifies a throwaway clone
     /// (`build_morph_branch_row`), so the live row's `PickerRowId` is
     /// unaffected: a morphed row's previews stay under its worktree key.
-    pub(crate) fn reclassify_as_branch(&mut self, scope: BranchScope, branch: String) {
+    pub(crate) fn reclassify_as_branch(&mut self, branch: String) {
         let head = self.head().to_string();
-        self.branch_ref = match scope {
-            BranchScope::Local => BranchRef::local_branch(&branch, &head),
-            BranchScope::Remote => BranchRef::remote_branch(&branch, &head),
-        };
-        self.kind = ItemKind::Branch(scope);
+        self.branch_ref = BranchRef::local_branch(&branch, &head);
+        self.kind = ItemKind::Branch(BranchScope::Local);
     }
 
     pub fn branch(&self) -> Option<&str> {
@@ -497,8 +489,9 @@ impl ListItem {
     /// The glyph this row's unresolved cells render, given the render's
     /// current one.
     ///
-    /// A prunable worktree's directory is gone, so `work_items_for_worktree`
-    /// spawns nothing for it and no cell a task would fill will ever arrive.
+    /// A prunable worktree has lost its directory or its `.git`, so
+    /// `work_items_for_worktree` spawns nothing for it and no cell a task
+    /// would fill will ever arrive.
     /// The loading dot would promise data that isn't coming — for the life of
     /// the row, not for a tick — so those cells stay blank and the `⊟` in
     /// Status is the row's whole story.
@@ -959,9 +952,9 @@ impl ListItem {
 mod tests {
     use super::*;
 
-    /// The yellow actionable states outrank the informational (dim yellow)
-    /// `⊘` and `⚑`, so a demoted flag can never mask `⊟` or `⊞`. A force-added
-    /// duplicate lands off-template too, so the two `⚑` states routinely
+    /// The yellow actionable states outrank the informational `⊘` and `⚐`,
+    /// so a demoted flag can never mask `⊟` or `⊞`. A force-added
+    /// duplicate lands off-template too, so the two `⚐` states routinely
     /// co-occur and their order picks the cause the JSON reports.
     #[test]
     fn test_metadata_worktree_state_priority() {
@@ -1003,7 +996,7 @@ mod tests {
             WorktreeState::Locked
         );
 
-        // Off a branch, `⊘` outranks both `⚑` states — nothing else in the
+        // Off a branch, `⊘` outranks both `⚐` states — nothing else in the
         // row says the Branch cell is a hash — but still yields to `⊟`/`⊞`.
         assert_eq!(
             metadata_worktree_state(&duplicate, false),
@@ -1183,11 +1176,8 @@ mod tests {
         let mut item = ListItem::new_worktree(worktree_ref, WorktreeData::default());
         assert_eq!(item.id(), &worktree_id);
 
-        item.reclassify_as_branch(BranchScope::Remote, "feature".into());
-        assert_eq!(
-            item.id(),
-            BranchRef::remote_branch("feature", "abc123").id()
-        );
+        item.reclassify_as_branch("feature".into());
+        assert_eq!(item.id(), BranchRef::local_branch("feature", "abc123").id());
     }
 
     #[test]

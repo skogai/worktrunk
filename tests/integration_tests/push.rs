@@ -65,6 +65,73 @@ fn test_push_to_default_branch(#[from(repo_with_feature_worktree)] repo: TestRep
     snapshot_push("push_to_default", &repo, &[], Some(feature_wt));
 }
 
+/// A tag named after the target branch must not stand in for the branch. Git
+/// resolves a bare `main` to `refs/tags/main` before `refs/heads/main`, so
+/// with such a tag at the feature commit, `main..HEAD` counted zero commits
+/// and the push reported "Already up to date" without moving the branch.
+#[rstest]
+fn test_push_ignores_tag_named_like_target(mut repo: TestRepo) {
+    repo.add_main_worktree();
+    let feature_wt =
+        repo.add_worktree_with_commit("feature", "test.txt", "test content", "Add test file");
+    let feature_sha = repo.head_sha_in(&feature_wt);
+    repo.run_git(&["tag", "main", &feature_sha]);
+
+    let output = repo
+        .wt_command()
+        .args(["step", "push", "main"])
+        .current_dir(&feature_wt)
+        .output()
+        .expect("failed to run command");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "push failed: {stderr}");
+    assert!(
+        !stderr.contains("Already up to date"),
+        "push should not compare against the tag: {stderr}"
+    );
+
+    let main_sha = repo
+        .git_command()
+        .args(["rev-parse", "refs/heads/main"])
+        .run()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&main_sha.stdout).trim(),
+        feature_sha
+    );
+}
+
+/// The overlap check against the target worktree's uncommitted changes reads
+/// the push range from the branch, not a same-named tag. With the tag at the
+/// feature commit, the range looked empty and the overlap went unreported.
+#[rstest]
+fn test_push_dirty_target_overlap_ignores_tag_named_like_target(mut repo: TestRepo) {
+    std::fs::write(repo.root_path().join("conflict.txt"), "old content").unwrap();
+    let feature_wt = repo.add_worktree_with_commit(
+        "feature",
+        "conflict.txt",
+        "new content",
+        "Add conflict file",
+    );
+    let feature_sha = repo.head_sha_in(&feature_wt);
+    repo.run_git(&["tag", "main", &feature_sha]);
+
+    let output = repo
+        .wt_command()
+        .args(["step", "push", "main"])
+        .current_dir(&feature_wt)
+        .output()
+        .expect("failed to run command");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "push should refuse: {stderr}");
+    assert!(
+        stderr.contains("conflicting uncommitted changes") && stderr.contains("conflict.txt"),
+        "the overlap check should refuse and name the file: {stderr}"
+    );
+    let main_contents = std::fs::read_to_string(repo.root_path().join("conflict.txt")).unwrap();
+    assert_eq!(main_contents, "old content");
+}
+
 #[rstest]
 fn test_push_with_dirty_target(mut repo: TestRepo) {
     // Make main worktree (repo root) dirty with a conflicting file
@@ -158,6 +225,58 @@ fn test_push_dirty_target_changes_stay_in_place(mut repo: TestRepo) {
             .trim()
             .is_empty()
     );
+}
+
+/// Distinct non-UTF-8 paths must not collapse to the same replacement string
+/// during target-conflict detection.
+#[cfg(target_os = "linux")]
+#[rstest]
+fn test_push_distinguishes_non_utf8_target_paths(mut repo: TestRepo) {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let target_path = OsString::from_vec(b"collision-\xfe".to_vec());
+    let pushed_path = OsString::from_vec(b"collision-\xff".to_vec());
+    let root = repo.root_path().to_path_buf();
+    std::fs::write(root.join(&target_path), "target").unwrap();
+    std::fs::write(root.join(&pushed_path), "pushed").unwrap();
+    repo.run_git(&["add", "-A"]);
+    repo.run_git(&["commit", "-m", "Add raw paths"]);
+
+    let feature_wt = repo.add_worktree("feature");
+    std::fs::remove_file(feature_wt.join(&pushed_path)).unwrap();
+    repo.run_git_in(&feature_wt, &["add", "-A"]);
+    repo.run_git_in(&feature_wt, &["commit", "-m", "Delete pushed path"]);
+    std::fs::remove_file(root.join(&target_path)).unwrap();
+
+    let target_status = repo
+        .git_command()
+        .args(["status", "--porcelain", "-z"])
+        .run()
+        .unwrap();
+    assert_eq!(target_status.stdout, b" D collision-\xfe\0");
+    let repository = worktrunk::git::Repository::at(&root).unwrap();
+    assert_eq!(
+        repository.changed_files("main", "feature").unwrap(),
+        [b"collision-\xff".to_vec()]
+    );
+
+    let output = repo
+        .wt_command()
+        .current_dir(&feature_wt)
+        .args(["step", "push", "main"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "distinct raw paths must not conflict: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        repo.git_output(&["rev-parse", "main"]),
+        repo.git_output(&["rev-parse", "feature"])
+    );
+    assert!(!root.join(target_path).exists());
 }
 
 #[rstest]
@@ -439,7 +558,7 @@ fn test_push_dirty_target_overlap_in_untracked_dir(mut repo: TestRepo) {
 /// cherry-pick keeps HEAD on the branch, so `worktree_for_branch` finds the
 /// worktree directly; a rebase detaches HEAD, and `git worktree list
 /// --porcelain` reports that worktree with no branch at all — the lookup
-/// succeeds only because `finalize_worktree` backfills the branch from
+/// succeeds only because `finalize_worktrees` backfills the branch from
 /// `rebase-merge/head-name`. Were that backfill to stop covering the rebase
 /// case, `target_worktree_path` would go `None`, the gate would be skipped, and
 /// `advance_target` would return right after its compare-and-swap: the ref

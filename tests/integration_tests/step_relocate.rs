@@ -348,6 +348,133 @@ command = "cat > {} && echo 'chore: auto-commit before relocate'"
     );
 }
 
+/// A clobber backup can fail after validation has already committed work.
+/// Keep that commit and validation skips visible even though no worktree moved.
+#[cfg(unix)]
+#[rstest]
+#[case::json(true)]
+#[case::text(false)]
+fn test_relocate_json_retains_commits_when_clobber_backup_fails(
+    repo: TestRepo,
+    #[case] json: bool,
+) {
+    let parent = worktree_parent(&repo);
+    let feature = parent.join("wrong-feature");
+    let locked = parent.join("wrong-locked");
+    for (branch, path) in [("feature", &feature), ("locked", &locked)] {
+        repo.run_git(&["worktree", "add", "-b", branch, path.to_str().unwrap()]);
+    }
+    repo.run_git(&[
+        "worktree",
+        "lock",
+        "--reason",
+        "in use",
+        locked.to_str().unwrap(),
+    ]);
+    fs::write(feature.join("dirty.txt"), "work to retain").unwrap();
+    let before = repo.git_output(&["rev-parse", "feature"]);
+
+    // The destination itself is valid on Unix filesystems, but appending the
+    // timestamped backup suffix exceeds the 255-byte filename limit. This
+    // exercises a real rename failure without depending on permissions/root.
+    let destination_name = "x".repeat(250);
+    let destination = parent.join(&destination_name);
+    fs::write(&destination, "existing blocker").unwrap();
+    fs::write(
+        repo.test_config_path(),
+        format!(
+            r#"
+worktree-path = "../{{% if branch == 'feature' %}}{destination_name}{{% else %}}repo.{{{{ branch }}}}{{% endif %}}"
+[commit.generation]
+command = "cat >/dev/null && echo 'commit before failed relocation'"
+"#
+        ),
+    )
+    .unwrap();
+    let mut command = repo.wt_command();
+    command.args([
+        "step",
+        "relocate",
+        "feature",
+        "locked",
+        "--commit",
+        "--clobber",
+    ]);
+    if json {
+        command.arg("--format=json");
+    }
+    let output = command.output().unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Failed to move"), "{stderr}");
+    assert!(stderr.contains("locked: in use"), "{stderr}");
+    let after = repo.git_output(&["rev-parse", "feature"]);
+    assert_ne!(
+        after, before,
+        "validation must have committed the dirty work"
+    );
+    if json {
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let commits = response["commits"].as_array().unwrap();
+        assert_eq!(commits.len(), 1, "{response}");
+        assert_eq!(commits[0]["branch"], "feature");
+        assert_eq!(commits[0]["commit"], after);
+        assert_eq!(
+            response["skipped"],
+            serde_json::json!([{"branch": "locked", "reason": "locked"}])
+        );
+        assert!(response["entries"].as_array().unwrap().is_empty());
+    } else {
+        assert!(output.stdout.is_empty(), "{output:?}");
+    }
+    assert_eq!(
+        fs::read_to_string(&destination).unwrap(),
+        "existing blocker"
+    );
+    assert!(feature.is_dir());
+    assert!(locked.is_dir());
+}
+
+/// Auto-commits are durable even when validating a later worktree fails.
+#[rstest]
+fn test_relocate_json_retains_commits_before_validation_failure(repo: TestRepo) {
+    let parent = worktree_parent(&repo);
+    for branch in ["a", "b"] {
+        let path = parent.join(format!("wrong-{branch}"));
+        repo.run_git(&["worktree", "add", "-b", branch, path.to_str().unwrap()]);
+        fs::write(path.join("dirty.txt"), "new work").unwrap();
+    }
+    let marker = repo.home_path().join("first-commit-generated");
+    let marker = shell_escape::unix::escape(marker.to_slash_lossy());
+    fs::write(
+        repo.test_config_path(),
+        format!(
+            r#"
+[commit.generation]
+command = "if test -e {marker}; then exit 1; fi; touch {marker}; echo 'commit before relocation'"
+"#
+        ),
+    )
+    .unwrap();
+    let output = repo
+        .wt_command()
+        .args(["step", "relocate", "--commit", "--format=json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let commits = response["commits"].as_array().unwrap();
+    assert_eq!(commits.len(), 1, "{response}");
+    assert_eq!(commits[0]["branch"], "a");
+    assert_eq!(commits[0]["stage_mode"], "all");
+    assert_eq!(commits[0]["commit"], repo.git_output(&["rev-parse", "a"]));
+    assert!(response["entries"].as_array().unwrap().is_empty());
+    assert!(!String::from_utf8_lossy(&output.stderr).is_empty());
+    assert!(parent.join("wrong-a").is_dir());
+    assert!(parent.join("wrong-b").is_dir());
+    assert!(!parent.join("repo.a").exists());
+}
+
 /// Create a worktree for `branch` at `path`, stopped on an unresolved
 /// conflict: `git merge side` leaves the index at stages 1–3 with `<<<<<<<` on
 /// disk — the state `git add -A` would silently resolve.
@@ -458,6 +585,14 @@ command = "cat >/dev/null && echo 'chore: auto-commit before relocate'"
         String::from_utf8_lossy(&output.stderr)
     );
     let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+
+    let commits = parsed["commits"].as_array().unwrap();
+    assert_eq!(commits.len(), 1);
+    assert_eq!(commits[0]["branch"], "clean");
+    assert_eq!(
+        commits[0]["commit"],
+        repo.git_output(&["rev-parse", "clean"])
+    );
 
     let skipped = parsed["skipped"].as_array().expect("skipped array");
     assert!(
@@ -781,6 +916,87 @@ fn test_relocate_swap(repo: TestRepo) {
     // Verify both are now at their expected locations
     assert!(path_for_alpha.exists(), "alpha should be at repo.alpha");
     assert!(path_for_beta.exists(), "beta should be at repo.beta");
+}
+
+/// Two independent relocation cycles must not share a temporary worktree path.
+///
+/// These branch names produce the same filename under the current 3-character
+/// hash. The first cycle keeps its worktree in staging until all cycles have
+/// been broken, so the second cycle used to fail when it tried to reuse that
+/// live path.
+#[rstest]
+fn test_relocate_disjoint_swaps_with_colliding_temp_names(repo: TestRepo) {
+    const FIRST: &str = "a/a-a-a/a-a/a/a-a/a";
+    const SECOND: &str = "a-a-a-a/a/a-a/a/a-a";
+    assert_eq!(
+        worktrunk::path::sanitize_for_filename(FIRST),
+        worktrunk::path::sanitize_for_filename(SECOND),
+        "test premise: both branches must sanitize to the same filename"
+    );
+
+    let parent = worktree_parent(&repo);
+    let first_source = parent.join("aaa-first");
+    let first_target = parent.join("bbb-first-partner");
+    let second_source = parent.join("ccc-second");
+    let second_target = parent.join("ddd-second-partner");
+
+    for (branch, path) in [
+        (FIRST, &first_source),
+        ("first-partner", &first_target),
+        (SECOND, &second_source),
+        ("second-partner", &second_target),
+    ] {
+        repo.run_git(&["worktree", "add", "-b", branch, path.to_str().unwrap()]);
+    }
+
+    let worktrunk_config = format!(
+        r#"
+worktree-path = "{{% if branch == '{FIRST}' %}}{}{{% elif branch == 'first-partner' %}}{}{{% elif branch == '{SECOND}' %}}{}{{% elif branch == 'second-partner' %}}{}{{% else %}}../{{{{ repo }}}}.{{{{ branch | sanitize }}}}{{% endif %}}"
+"#,
+        first_target.to_slash_lossy(),
+        first_source.to_slash_lossy(),
+        second_target.to_slash_lossy(),
+        second_source.to_slash_lossy(),
+    );
+    fs::write(repo.test_config_path(), worktrunk_config).unwrap();
+
+    let output = repo
+        .wt_command()
+        .args([
+            "step",
+            "relocate",
+            FIRST,
+            "first-partner",
+            SECOND,
+            "second-partner",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "both swaps should relocate; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    for (path, branch) in [
+        (&first_target, FIRST),
+        (&first_source, "first-partner"),
+        (&second_target, SECOND),
+        (&second_source, "second-partner"),
+    ] {
+        let output = repo
+            .git_command()
+            .current_dir(path)
+            .args(["branch", "--show-current"])
+            .run()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            branch,
+            "{} should contain {branch}",
+            path.display()
+        );
+    }
 }
 
 /// A worktree whose target is occupied by a *blocked* worktree must itself be
@@ -1398,8 +1614,10 @@ worktree-path = "../{{ undefined_var }}.{{ branch }}"
 /// Windows user hits this too: their shell holds the cwd across the move. So the
 /// preservation path is reachable, and testable, only on Unix.
 #[rstest]
+#[case::success(false)]
+#[case::directive_failure(true)]
 #[cfg_attr(windows, ignore)]
-fn test_relocate_preserves_subdir(repo: TestRepo) {
+fn test_relocate_preserves_subdir(repo: TestRepo, #[case] directive_failure: bool) {
     let parent = worktree_parent(&repo);
     let (cd_path, _guard) = directive_file();
 
@@ -1415,17 +1633,35 @@ fn test_relocate_preserves_subdir(repo: TestRepo) {
     ]);
     let subdir = Path::new("apps").join("gateway");
     fs::create_dir_all(wrong_path.join(&subdir)).unwrap();
+    fs::write(wrong_path.join(&subdir).join("dirty.txt"), "new work").unwrap();
 
     let mut cmd = repo.wt_command();
+    if directive_failure {
+        fs::remove_file(&cd_path).unwrap();
+        fs::create_dir(&cd_path).unwrap();
+    }
     configure_directive_file(&mut cmd, &cd_path);
-    cmd.args(["step", "relocate"])
+    cmd.args(["step", "relocate", "--commit", "--format=json"])
         .current_dir(wrong_path.join(&subdir));
 
     let output = cmd.output().unwrap();
-    assert!(
-        output.status.success(),
-        "wt step relocate failed: {output:?}"
+    assert_eq!(output.status.success(), !directive_failure, "{output:?}");
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let entries = response["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["branch"], "feature");
+    let commits = response["commits"].as_array().unwrap();
+    assert_eq!(commits.len(), 1);
+    assert_eq!(commits[0]["branch"], "feature");
+    assert_eq!(
+        commits[0]["commit"],
+        repo.git_output(&["rev-parse", "feature"])
     );
+    assert!(parent.join("repo.feature").join(&subdir).is_dir());
+    if directive_failure {
+        assert!(!String::from_utf8_lossy(&output.stderr).is_empty());
+        return;
+    }
 
     // The cd directive should land in the equivalent subdirectory of the
     // worktree's new location, not at its root.
@@ -1556,7 +1792,107 @@ fn step_relocate_rejects_prunable_worktree(mut repo: TestRepo) {
     assert!(!output.status.success(), "a prunable worktree should fail");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("directory is gone"),
+        stderr.contains("it is stale"),
         "expected a prunable-worktree error, got: {stderr}"
+    );
+}
+
+/// A swap moves one worktree through a temporary location. The shell of a user
+/// standing in either worktree must follow its branch to the new path, whichever
+/// of the two takes the temporary route.
+///
+/// Ignored on Windows for the same reason as `test_relocate_preserves_subdir`.
+#[rstest]
+#[case::in_alpha("alpha")]
+#[case::in_beta("beta")]
+#[cfg_attr(windows, ignore)]
+fn test_relocate_swap_moves_shell_with_its_branch(repo: TestRepo, #[case] standing_in: &str) {
+    let parent = worktree_parent(&repo);
+    let (cd_path, _guard) = directive_file();
+
+    // alpha sits at beta's expected path and beta at alpha's.
+    let path_for_beta = parent.join("repo.beta");
+    let path_for_alpha = parent.join("repo.alpha");
+    repo.run_git(&[
+        "worktree",
+        "add",
+        "-b",
+        "alpha",
+        path_for_beta.to_str().unwrap(),
+    ]);
+    repo.run_git(&[
+        "worktree",
+        "add",
+        "-b",
+        "beta",
+        path_for_alpha.to_str().unwrap(),
+    ]);
+
+    let (cwd, expected) = if standing_in == "alpha" {
+        (&path_for_beta, &path_for_alpha)
+    } else {
+        (&path_for_alpha, &path_for_beta)
+    };
+
+    let mut cmd = repo.wt_command();
+    configure_directive_file(&mut cmd, &cd_path);
+    cmd.args(["step", "relocate"]).current_dir(cwd);
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "wt step relocate failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let cd_content = fs::read_to_string(&cd_path).unwrap_or_default();
+    assert_eq!(
+        cd_content.trim(),
+        expected.to_string_lossy(),
+        "the shell should follow {standing_in} to its new path"
+    );
+}
+
+/// Relocating the main worktree's branch must not move a shell that stands in a
+/// different worktree nested inside the main one, as the
+/// `.worktrees/{{ branch | sanitize }}` layout produces.
+#[rstest]
+fn test_relocate_main_leaves_shell_in_nested_worktree(repo: TestRepo) {
+    let root = repo.root_path().to_path_buf();
+    let (cd_path, _guard) = directive_file();
+    fs::write(
+        repo.test_config_path(),
+        "worktree-path = \".worktrees/{{ branch | sanitize }}\"\n",
+    )
+    .unwrap();
+    fs::write(root.join(".git/info/exclude"), ".worktrees\n").unwrap();
+
+    // `other` is already at its expected nested path; the main worktree is on
+    // `feature`, so relocate moves `feature` out to `.worktrees/feature`.
+    let other_path = root.join(".worktrees").join("other");
+    repo.run_git(&[
+        "worktree",
+        "add",
+        "-b",
+        "other",
+        other_path.to_str().unwrap(),
+    ]);
+    repo.run_git(&["checkout", "-b", "feature"]);
+
+    let mut cmd = repo.wt_command();
+    configure_directive_file(&mut cmd, &cd_path);
+    cmd.args(["step", "relocate"]).current_dir(&other_path);
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "wt step relocate failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(root.join(".worktrees").join("feature").exists());
+
+    let cd_content = fs::read_to_string(&cd_path).unwrap_or_default();
+    assert_eq!(
+        cd_content.trim(),
+        "",
+        "the shell in `other` should stay put, not follow `feature`"
     );
 }

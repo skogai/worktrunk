@@ -117,6 +117,7 @@ pub struct ScanResult {
     pub configured: Vec<ConfigureResult>,
     pub completion_results: Vec<CompletionResult>,
     pub skipped: Vec<(Shell, PathBuf)>, // Shell + first path that was checked
+    pub failures: Vec<String>,
     /// Zsh was configured but compinit is missing (completions won't work without it)
     pub zsh_needs_compinit: bool,
     /// Legacy/stranded files cleaned up during install, paired with the shell
@@ -355,11 +356,12 @@ pub fn handle_configure_shell(
     skip_confirmation: bool,
     dry_run: bool,
     cmd: String,
-) -> Result<ScanResult, String> {
+) -> Result<ScanResult, ShellConfigError> {
     shell::validate_shell_command_name(&cmd)?;
 
     // First, do a dry-run to see what would be changed
-    let mut preview = scan_shell_configs(shell_filter, true, &cmd)?;
+    let mut preview = scan_shell_configs_inner(shell_filter, true, &cmd, true)?;
+    preview.completion_results = preview_shell_completions(&preview.configured, &cmd)?;
 
     // If nothing to do, return early
     if preview.configured.is_empty() {
@@ -407,7 +409,7 @@ pub fn handle_configure_shell(
             prompt,
         )?
     {
-        return Err("Cancelled by user".to_string());
+        return Err("Cancelled by user".to_string().into());
     }
 
     apply_confirmed_shell_config(preview, shell_filter, &cmd)
@@ -428,13 +430,13 @@ pub(crate) fn apply_confirmed_shell_config(
     mut preview: ScanResult,
     shell_filter: Option<Shell>,
     cmd: &str,
-) -> Result<ScanResult, String> {
+) -> Result<ScanResult, ShellConfigError> {
     if !install_changes_needed(&preview) {
         preview.legacy_cleanups = collect_legacy_cleanups(&preview.configured, cmd, false);
         return Ok(preview);
     }
 
-    let mut result = scan_shell_configs(shell_filter, false, cmd)?;
+    let mut result = scan_shell_configs_inner(shell_filter, false, cmd, true)?;
     result.completion_results =
         apply_shell_completions(preview.completion_results, &result.configured, cmd)?;
 
@@ -512,11 +514,71 @@ fn should_auto_configure_powershell() -> bool {
     }
 }
 
+/// Why a shell config scan or edit failed. A cancelled PowerShell profile
+/// query stays typed, so a consumer that treats ordinary failures as "not
+/// configured" still stops the command instead of moving on to its next step.
+#[derive(Debug)]
+pub enum ShellConfigError {
+    /// The profile query was cancelled by this signal.
+    Interrupted(i32),
+    Failed(String),
+}
+
+impl ShellConfigError {
+    fn config_paths(shell: Shell, error: std::io::Error) -> Self {
+        match shell::profile_query_interruption(&error) {
+            Some(signal) => Self::Interrupted(signal),
+            None => Self::Failed(format!("Failed to get config paths for {shell}: {error}")),
+        }
+    }
+
+    /// Prefix an ordinary failure with `context`; a cancellation stays typed.
+    pub(crate) fn context(self, context: &str) -> anyhow::Error {
+        match self {
+            Self::Failed(message) => anyhow::anyhow!("{context}: {message}"),
+            interrupted => interrupted.into(),
+        }
+    }
+}
+
+impl From<String> for ShellConfigError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl From<ShellConfigError> for anyhow::Error {
+    fn from(error: ShellConfigError) -> Self {
+        match error {
+            ShellConfigError::Interrupted(signal) => {
+                worktrunk::git::WorktrunkError::Interrupted { signal, hint: None }.into()
+            }
+            ShellConfigError::Failed(message) => anyhow::anyhow!(message),
+        }
+    }
+}
+
+/// Read or apply shell integration files. Completion planning belongs to the
+/// installation flow so a completion error cannot hide integration status.
 pub fn scan_shell_configs(
     shell_filter: Option<Shell>,
     dry_run: bool,
     cmd: &str,
-) -> Result<ScanResult, String> {
+) -> Result<ScanResult, ShellConfigError> {
+    scan_shell_configs_inner(shell_filter, dry_run, cmd, false)
+}
+
+/// Preview an install while retaining rc-file failures so other shells can be offered.
+pub(crate) fn preview_shell_configs_for_install(cmd: &str) -> Result<ScanResult, ShellConfigError> {
+    scan_shell_configs_inner(None, true, cmd, true)
+}
+
+fn scan_shell_configs_inner(
+    shell_filter: Option<Shell>,
+    dry_run: bool,
+    cmd: &str,
+    continue_on_error: bool,
+) -> Result<ScanResult, ShellConfigError> {
     shell::validate_shell_command_name(cmd)?;
 
     // Iterate every supported shell. Shells the user doesn't have are filtered
@@ -538,11 +600,12 @@ pub fn scan_shell_configs(
 
     let mut results = Vec::new();
     let mut skipped = Vec::new();
+    let mut failures = Vec::new();
 
     for shell in shells {
         let paths = shell
             .config_paths(cmd)
-            .map_err(|e| format!("Failed to get config paths for {shell}: {e}"))?;
+            .map_err(|e| ShellConfigError::config_paths(shell, e))?;
 
         // Find the first existing config file
         let target_path = paths.iter().find(|p| p.exists());
@@ -598,9 +661,11 @@ pub fn scan_shell_configs(
                     Ok(Some(result)) => results.push(result),
                     Ok(None) => {} // No action needed
                     Err(e) => {
-                        // For non-critical errors, we could continue with other shells
-                        // but for now we'll fail fast
-                        return Err(format!("Failed to configure {shell}: {e}"));
+                        let message = format!("Failed to configure {shell}: {e}");
+                        if !continue_on_error {
+                            return Err(message.into());
+                        }
+                        failures.push(message);
                     }
                 }
             }
@@ -623,17 +688,11 @@ pub fn scan_shell_configs(
         }
     }
 
-    let completion_results = if dry_run {
-        let configured_shells: Vec<_> = results.iter().map(|result| result.shell).collect();
-        preview_shell_completions(&configured_shells, cmd)?
-    } else {
-        Vec::new()
-    };
-
     Ok(ScanResult {
         configured: results,
-        completion_results,
+        completion_results: Vec::new(),
         skipped,
+        failures,
         zsh_needs_compinit: false,   // Caller handles compinit detection
         legacy_cleanups: Vec::new(), // Caller handles legacy cleanup
     })
@@ -823,6 +882,12 @@ fn contains_shell_integration(
     shell: Shell,
     cmd: &str,
 ) -> Result<bool, String> {
+    if content.starts_with(&[0xff, 0xfe]) || content.starts_with(&[0xfe, 0xff]) {
+        return Err(format!(
+            "{} is not UTF-8 (looks like UTF-16); re-save it as UTF-8 to configure {shell}",
+            format_path_for_display(path)
+        ));
+    }
     // Check for the canonical line and older/manual forms for this shell.
     for line in content.split(|byte| *byte == b'\n') {
         let line = std::str::from_utf8(line).map_err(|e| {
@@ -831,18 +896,11 @@ fn contains_shell_integration(
                 format_path_for_display(path)
             )
         })?;
-        if is_install_shell_integration_line(line.trim_end_matches('\r'), shell, cmd) {
+        if shell::shell_integration(line, cmd) == Some(shell) {
             return Ok(true);
         }
     }
     Ok(false)
-}
-
-fn is_install_shell_integration_line(line: &str, shell: Shell, cmd: &str) -> bool {
-    shell::is_shell_integration_line(line, cmd)
-        && line
-            .to_ascii_lowercase()
-            .contains(&format!("config shell init {shell}"))
 }
 
 /// Extract non-comment, non-blank lines from fish/nushell source.
@@ -1150,18 +1208,21 @@ complete --keep-order --exclusive --command {cmd} --arguments "(test -n \"\$WORK
 /// Note: Bash and Zsh use inline lazy completions in the init script.
 /// Fish uses a separate completion file at ~/.config/fish/completions/{cmd}.fish
 /// that finds the command in PATH (with WORKTRUNK_BIN as optional override) to bypass the shell wrapper.
-fn preview_shell_completions(shells: &[Shell], cmd: &str) -> Result<Vec<CompletionResult>, String> {
+pub(crate) fn preview_shell_completions(
+    configured: &[ConfigureResult],
+    cmd: &str,
+) -> Result<Vec<CompletionResult>, String> {
     let mut results = Vec::new();
     let fish_completion = fish_completion_content(cmd);
 
-    for &shell in shells {
+    for entry in configured {
+        let shell = entry.shell;
         // Only fish has a separate completion file
         if shell != Shell::Fish {
             continue;
         }
 
-        let completion_path = shell
-            .completion_path(cmd)
+        let completion_path = shell::fish_completion_path(cmd)
             .map_err(|e| format!("Failed to get completion path for {shell}: {e}"))?;
 
         let (action, preimage) = match fs::read(&completion_path) {
@@ -1268,7 +1329,7 @@ pub fn handle_unconfigure_shell(
     shell_filter: Option<Shell>,
     skip_confirmation: bool,
     dry_run: bool,
-) -> Result<UninstallScanResult, String> {
+) -> Result<UninstallScanResult, ShellConfigError> {
     let preview = scan_for_uninstall(shell_filter)?;
 
     // If nothing to do, return early
@@ -1294,12 +1355,12 @@ pub fn handle_unconfigure_shell(
     if !skip_confirmation
         && !prompt_for_uninstall_confirmation(&preview.results, &preview.completion_results)?
     {
-        return Err("Cancelled by user".to_string());
+        return Err("Cancelled by user".to_string().into());
     }
 
     // User confirmed (or --yes flag was used), so apply exactly the paths and
     // rc-line multiplicities represented by the preview above.
-    preview.apply()
+    Ok(preview.apply()?)
 }
 
 /// Uninstall scans the shell-owned directories and removes every worktrunk-managed
@@ -1311,7 +1372,9 @@ pub fn handle_unconfigure_shell(
 /// completion header for `completions/`). For Bash/Zsh/PowerShell (line-based),
 /// it scans the rc/profile files and uses `is_shell_integration_line_for_uninstall_any_cmd`.
 /// No `--cmd` is needed because the marker is the content, not the file name.
-fn scan_for_uninstall(shell_filter: Option<Shell>) -> Result<UninstallScanResult, String> {
+fn scan_for_uninstall(
+    shell_filter: Option<Shell>,
+) -> Result<UninstallScanResult, ShellConfigError> {
     // For uninstall, scan every shell (Shell::all includes PowerShell) to clean
     // up any existing profiles.
     let default_shells = Shell::all();
@@ -1327,7 +1390,12 @@ fn scan_for_uninstall(shell_filter: Option<Shell>) -> Result<UninstallScanResult
     for &shell in &shells {
         match shell {
             Shell::Fish => {
-                let functions_dir = home.join(".config").join("fish").join("functions");
+                // Uninstall follows fish's own config dir, so it scans the
+                // directory install writes to. A wrapper an older worktrunk
+                // left under `~/.config/fish` while `$XDG_CONFIG_HOME` pointed
+                // elsewhere is not chased: fish never loaded it, so it is not
+                // integration to remove.
+                let functions_dir = shell::fish_config_dir(&home).join("functions");
                 let confd_dir = home.join(".config").join("fish").join("conf.d");
 
                 let canonical =
@@ -1387,7 +1455,8 @@ fn scan_for_uninstall(shell_filter: Option<Shell>) -> Result<UninstallScanResult
             }
 
             Shell::Bash | Shell::Zsh | Shell::PowerShell => {
-                let paths = shell::line_based_config_paths(shell, &home);
+                let paths = shell::line_based_config_paths(shell, &home)
+                    .map_err(|e| ShellConfigError::config_paths(shell, e))?;
                 let mut found = false;
 
                 for path in &paths {
@@ -1414,7 +1483,7 @@ fn scan_for_uninstall(shell_filter: Option<Shell>) -> Result<UninstallScanResult
     let mut completion_results = Vec::new();
     let mut completion_not_found = Vec::new();
     if shells.contains(&Shell::Fish) {
-        let completions_dir = home.join(".config").join("fish").join("completions");
+        let completions_dir = shell::fish_config_dir(&home).join("completions");
         let completions =
             scan_managed_files(&completions_dir, "fish", |c| c.contains(COMPLETION_MARKER))?;
         if completions.is_empty() {
@@ -1634,7 +1703,7 @@ pub fn handle_show_theme() {
     eprintln!(
         "{}",
         format_bash_with_gutter(
-            "eval \"$(wt config shell init bash)\"\necho 'This is a long command that will wrap to the next line when the terminal is narrow enough to require wrapping.'\necho 'hello\nworld'\ncargo build --release &&\ncargo test\ncp {{ repo_root }}/target {{ worktree }}/target"
+            "eval \"$(wt config shell init bash)\"\necho 'This is a long command that will wrap to the next line when the terminal is narrow enough to require wrapping.'\necho 'hello\nworld'\ncargo build --release &&\ncargo test\ncp {{ repo_path }}/target {{ worktree_path }}/target"
         )
     );
 
@@ -1710,6 +1779,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_shell_config_error_config_paths_ordinary_failure() {
+        let error = ShellConfigError::config_paths(Shell::Bash, std::io::Error::other("no home"));
+        assert!(
+            matches!(&error, ShellConfigError::Failed(message)
+                if message == "Failed to get config paths for bash: no home"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
     fn test_config_action_description() {
         assert_eq!(ConfigAction::Added.description(), "Added");
         assert_eq!(
@@ -1731,53 +1810,6 @@ mod tests {
     }
 
     #[test]
-    fn test_is_shell_integration_line() {
-        // Valid integration lines for "wt"
-        assert!(shell::is_shell_integration_line(
-            "eval \"$(wt config shell init bash)\"",
-            "wt"
-        ));
-        assert!(shell::is_shell_integration_line(
-            "  eval \"$(wt config shell init zsh)\"  ",
-            "wt"
-        ));
-        assert!(shell::is_shell_integration_line(
-            "if command -v wt; then eval \"$(wt config shell init bash)\"; fi",
-            "wt"
-        ));
-        assert!(shell::is_shell_integration_line(
-            "source <(wt config shell init fish)",
-            "wt"
-        ));
-
-        // Valid integration lines for "git-wt"
-        assert!(shell::is_shell_integration_line(
-            "eval \"$(git-wt config shell init bash)\"",
-            "git-wt"
-        ));
-        assert!(!shell::is_shell_integration_line(
-            "eval \"$(wt config shell init bash)\"",
-            "git-wt"
-        ));
-
-        // Not integration lines (comments)
-        assert!(!shell::is_shell_integration_line(
-            "# eval \"$(wt config shell init bash)\"",
-            "wt"
-        ));
-
-        // Not integration lines (no eval/source/if)
-        assert!(!shell::is_shell_integration_line(
-            "wt config shell init bash",
-            "wt"
-        ));
-        assert!(!shell::is_shell_integration_line(
-            "echo wt config shell init bash",
-            "wt"
-        ));
-    }
-
-    #[test]
     fn test_fish_completion_content() {
         insta::assert_snapshot!(fish_completion_content("wt"));
     }
@@ -1785,6 +1817,33 @@ mod tests {
     #[test]
     fn test_fish_completion_content_custom_cmd() {
         insta::assert_snapshot!(fish_completion_content("myapp"));
+    }
+
+    /// The `worktrunk-bin` AUR package installs fish completions from a
+    /// heredoc in `.github/aur/PKGBUILD` — makepkg runs no Rust, so that
+    /// literal is a hand-copied second copy of `fish_completion_content("wt")`,
+    /// as its own `TODO` says. Nothing else pins the two together: editing the
+    /// generator here ships a stale completion to AUR users on the next
+    /// release, and the only symptom is someone's tab-completion quietly
+    /// producing nothing. `release.yaml` still publishes the package: the docs
+    /// point at the official Arch package now, but `worktrunk-bin` was kept
+    /// publishing deliberately (#2052) and users track it for newer releases.
+    ///
+    /// `.github/aur/PKGBUILD` is read at test time and so never appears in
+    /// coverage; the `workspace.metadata.affected.rule` for it in `Cargo.toml`
+    /// is what force-selects this test when the PKGBUILD alone changes.
+    #[test]
+    fn test_aur_pkgbuild_ships_the_current_fish_completion() {
+        let pkgbuild_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/aur/PKGBUILD");
+        let pkgbuild = std::fs::read_to_string(&pkgbuild_path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", pkgbuild_path.display()));
+        let expected = fish_completion_content("wt");
+        assert!(
+            pkgbuild.contains(&expected),
+            ".github/aur/PKGBUILD ships a fish completion that no longer matches \
+             `fish_completion_content(\"wt\")`. Replace the body of its heredoc with:\n\n{expected}"
+        );
     }
 
     #[test]
@@ -1900,8 +1959,16 @@ mod tests {
         // Fish and Nushell are configured via wrapper files, not line-based rc
         // edits, so the line-based path list is empty for them.
         let home = Path::new("/home/user");
-        assert!(shell::line_based_config_paths(Shell::Fish, home).is_empty());
-        assert!(shell::line_based_config_paths(Shell::Nushell, home).is_empty());
+        assert!(
+            shell::line_based_config_paths(Shell::Fish, home)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            shell::line_based_config_paths(Shell::Nushell, home)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2095,7 +2162,11 @@ mod tests {
             .unwrap();
         assert!(contender.try_lock_exclusive().is_err());
         drop(locked);
-        contender.try_lock_exclusive().unwrap();
+        // A child that a concurrent test forks while `locked` is open inherits
+        // the lock until it execs, so the release can take an instant to land.
+        worktrunk::testing::wait_for("the rc lock to be released", || {
+            contender.try_lock_exclusive().is_ok()
+        });
     }
 
     #[test]

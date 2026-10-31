@@ -32,9 +32,9 @@ use std::sync::{LazyLock, Mutex, OnceLock};
 
 use anyhow::Context;
 use color_print::cformat;
-use minijinja::Environment;
 use shell_escape::unix::escape;
 
+use super::template_analysis::TemplateVars;
 use crate::config::WorktrunkConfig;
 use crate::shell_exec::Cmd;
 use crate::styling::{
@@ -97,16 +97,40 @@ pub fn warnings_suppressed() -> bool {
 static WARNED_UNKNOWN_PATHS: LazyLock<Mutex<HashSet<PathBuf>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
-/// Mapping from deprecated variable name to its replacement
-const DEPRECATED_VARS: &[(&str, &str)] = &[
+/// Retired template variables, mapped to their replacement. No renderer
+/// supplies the old name any more, so the rewrite is
+/// [`DeprecationRule::Structural`]: it applies on every load, before serde
+/// parses, and is what keeps an unmigrated template rendering what it always
+/// did. The warning still fires and still points at `wt config update`, which
+/// writes the rename into the user's file.
+///
+/// Every row is a mechanical identifier swap — the replacement resolves to the
+/// same value the old name did — which is what makes rewriting the in-memory
+/// config on every load safe. `commits` is squash-template-only, and each
+/// `commit_details` element renders as its subject when printed bare, so a
+/// migrated `{% for c in commit_details %}{{ c }}` reads identically to the old
+/// `{% for c in commits %}{{ c }}` (see #2984 and `CommitDetailValue`).
+///
+/// The rewrite happens at load, not on request, because an old name that
+/// reached a renderer would fail differently depending on where it sat. A
+/// hook, alias, or `worktree-path` template would fail its `SemiStrict`
+/// expansion with an undefined-variable error — loud, and fixable from the
+/// message. A squash template would render nothing at all: `build_prompt`
+/// renders under minijinja's default `UndefinedBehavior::Lenient`, which
+/// iterates an undefined value as an empty sequence, so the prompt would lose
+/// its commit list silently — the outcome #2984 opens by calling out.
+///
+/// TODO(retired-vars): revisit dropping these rows after 2026-12-16, three
+/// months on from the load-time rewrite (#4080). Dropping a row stops the
+/// rename, so the old name has to fail loudly on its own before it goes, and
+/// the split above is what makes the rows non-uniform: the `SemiStrict`
+/// surfaces already do, while `commits` can only go once `build_prompt`
+/// rejects the name itself (#2984).
+const RETIRED_VARS: &[(&str, &str)] = &[
     ("repo_root", "repo_path"),
     ("worktree", "worktree_path"),
     ("main_worktree", "repo"),
     ("main_worktree_path", "primary_worktree_path"),
-    // Squash-template-only. The rename is a safe mechanical rewrite because each
-    // `commit_details` element renders as its subject when printed bare, so a
-    // migrated `{% for c in commit_details %}{{ c }}` reads identically to the
-    // old `{% for c in commits %}{{ c }}` (see #2984 and `CommitDetailValue`).
     ("commits", "commit_details"),
 ];
 
@@ -155,220 +179,74 @@ pub const DEPRECATED_SECTION_KEYS: &[DeprecatedSection] = &[
 ///
 /// Returns `Cow::Borrowed` if no replacements needed, avoiding allocation.
 pub fn normalize_template_vars(template: &str) -> Cow<'_, str> {
-    let replacements = deprecated_vars_in_template(template);
-    if replacements.is_empty() {
-        return Cow::Borrowed(template);
+    match migrate_retired_vars(template) {
+        Some((migrated, _)) => Cow::Owned(migrated),
+        None => Cow::Borrowed(template),
     }
-
-    rewrite_template_var_identifiers(template, &replacements)
-        .map(Cow::Owned)
-        .unwrap_or(Cow::Borrowed(template))
 }
 
-/// The deprecated `(old, new)` pairs used as variables in `template`, in
-/// [`DEPRECATED_VARS`] order. Empty when none appear (or the template doesn't
-/// parse). An identifier appearing only as an attribute name
-/// (`{{ foo.repo_root }}`) or an assignment target doesn't count — only
-/// genuine variable uses, which is exactly what the rewrite replaces.
-fn deprecated_vars_in_template(template: &str) -> Vec<(&'static str, &'static str)> {
-    // Quick check: if none of the deprecated vars appear, skip parsing
-    if !DEPRECATED_VARS
-        .iter()
-        .any(|(old, _)| template.contains(old))
-    {
-        return Vec::new();
+/// Rewrite every retired template variable in `template`, returning the new
+/// text alongside the `(old, new)` pairs it replaced, in [`RETIRED_VARS`]
+/// order.
+///
+/// `None` leaves the template exactly as written: no retired name is read, it
+/// doesn't parse, or a statement binds either half of a pair. An identifier
+/// that isn't a variable read — an attribute
+/// (`{{ foo.repo_root }}`), a keyword argument, an assignment target — isn't a
+/// use, so it doesn't bring a pair in on its own.
+///
+/// Detection and migration are this one call: the rule warns about the pairs
+/// the same invocation rewrites, so the two cannot drift.
+fn migrate_retired_vars(template: &str) -> Option<(String, Vec<(&'static str, &'static str)>)> {
+    // Quick check: if none of the retired vars appear, skip parsing
+    if !RETIRED_VARS.iter().any(|(old, _)| template.contains(old)) {
+        return None;
     }
 
-    let env = Environment::new();
-    let Ok(parsed) = env.template_from_str(template) else {
-        return Vec::new();
-    };
-    let used_vars = parsed.undeclared_variables(false);
-    DEPRECATED_VARS
+    // Renames are template-wide, so exclude both sides of a pair when either
+    // is locally bound. Renaming only some reads could capture a local value.
+    let vars = TemplateVars::of(template)?;
+    let replacements = RETIRED_VARS
         .iter()
         .copied()
-        .filter(|(old, _)| used_vars.contains(*old))
-        .collect()
-}
+        .filter(|(old, new)| {
+            vars.reads.iter().any(|(name, _)| name == old)
+                && !vars.bound.contains(old)
+                && !vars.bound.contains(new)
+        })
+        .collect::<Vec<_>>();
+    if replacements.is_empty() {
+        return None;
+    }
 
-fn rewrite_template_var_identifiers(
-    template: &str,
-    replacements: &[(&str, &'static str)],
-) -> Option<String> {
-    let mut out = String::with_capacity(template.len());
+    let mut edits = vars
+        .reads
+        .into_iter()
+        .filter_map(|(name, at)| {
+            let (_, new) = replacements.iter().find(|(old, _)| *old == name)?;
+            Some((at, *new))
+        })
+        .collect::<Vec<_>>();
+    // Reads are collected in visit order, which is not source order — a
+    // conditional expression is visited test-first (`{{ a if b }}` yields `b`
+    // before `a`), and a map's keys all precede its values.
+    edits.sort_by_key(|(at, _)| at.start);
+
+    let mut migrated = String::with_capacity(template.len());
     let mut cursor = 0;
-    let mut changed = false;
-    let mut in_raw = false;
-
-    while let Some((tag_start, tag_kind)) = find_next_template_tag(template, cursor) {
-        out.push_str(&template[cursor..tag_start]);
-
-        let (body_start, close_delim) = match tag_kind {
-            TemplateTagKind::Variable => (tag_start + 2, "}}"),
-            TemplateTagKind::Block => (tag_start + 2, "%}"),
-            TemplateTagKind::Comment => {
-                let end = template[tag_start + 2..].find("#}")? + tag_start + 4;
-                out.push_str(&template[tag_start..end]);
-                cursor = end;
-                continue;
-            }
-        };
-        let tag_end = template[body_start..].find(close_delim)? + body_start;
-        let full_tag_end = tag_end + close_delim.len();
-
-        if tag_kind == TemplateTagKind::Block
-            && matches!(
-                template_block_name(&template[body_start..tag_end]),
-                Some("raw")
-            )
-        {
-            in_raw = true;
-        }
-
-        if in_raw {
-            out.push_str(&template[tag_start..full_tag_end]);
-            if tag_kind == TemplateTagKind::Block
-                && matches!(
-                    template_block_name(&template[body_start..tag_end]),
-                    Some("endraw")
-                )
-            {
-                in_raw = false;
-            }
-        } else {
-            let body_start =
-                body_start + usize::from(template[body_start..tag_end].starts_with('-'));
-            let body_end = tag_end - usize::from(template[body_start..tag_end].ends_with('-'));
-            let (rewritten_body, body_changed) =
-                rewrite_template_tag_body(&template[body_start..body_end], replacements);
-            out.push_str(&template[tag_start..body_start]);
-            out.push_str(&rewritten_body);
-            out.push_str(&template[body_end..full_tag_end]);
-            changed |= body_changed;
-        }
-
-        cursor = full_tag_end;
+    for (at, new) in edits {
+        migrated.push_str(&template[cursor..at.start]);
+        migrated.push_str(new);
+        cursor = at.end;
     }
-
-    out.push_str(&template[cursor..]);
-    changed.then_some(out)
+    migrated.push_str(&template[cursor..]);
+    Some((migrated, replacements))
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum TemplateTagKind {
-    Variable,
-    Block,
-    Comment,
-}
-
-fn find_next_template_tag(template: &str, from: usize) -> Option<(usize, TemplateTagKind)> {
-    let mut search_from = from;
-    loop {
-        let rel = template[search_from..].find('{')?;
-        let idx = search_from + rel;
-        let rest = &template[idx..];
-        let kind = if rest.starts_with("{{") {
-            TemplateTagKind::Variable
-        } else if rest.starts_with("{%") {
-            TemplateTagKind::Block
-        } else if rest.starts_with("{#") {
-            TemplateTagKind::Comment
-        } else {
-            search_from = idx + 1;
-            continue;
-        };
-        return Some((idx, kind));
-    }
-}
-
-fn template_block_name(body: &str) -> Option<&str> {
-    let body = body.strip_prefix('-').unwrap_or(body).trim_start();
-    let end = body
-        .find(|c: char| !is_template_identifier_char(c))
-        .unwrap_or(body.len());
-    (end > 0).then_some(&body[..end])
-}
-
-fn rewrite_template_tag_body(body: &str, replacements: &[(&str, &'static str)]) -> (String, bool) {
-    let mut out = String::with_capacity(body.len());
-    let mut cursor = 0;
-    let mut changed = false;
-
-    while let Some(ch) = body.get(cursor..).and_then(|s| s.chars().next()) {
-        if ch == '"' || ch == '\'' {
-            let end = quoted_template_string_end(body, cursor, ch);
-            out.push_str(&body[cursor..end]);
-            cursor = end;
-        } else if is_template_identifier_start(ch) {
-            let end = identifier_end(body, cursor);
-            let ident = &body[cursor..end];
-            if !is_template_attribute_or_assignment(body, cursor, end)
-                && let Some((_, new)) = replacements.iter().find(|(old, _)| *old == ident)
-            {
-                out.push_str(new);
-                changed = true;
-            } else {
-                out.push_str(ident);
-            }
-            cursor = end;
-        } else {
-            out.push(ch);
-            cursor += ch.len_utf8();
-        }
-    }
-
-    (out, changed)
-}
-
-fn quoted_template_string_end(body: &str, start: usize, quote: char) -> usize {
-    let mut escaped = false;
-    let mut cursor = start + quote.len_utf8();
-    while let Some(ch) = body.get(cursor..).and_then(|s| s.chars().next()) {
-        cursor += ch.len_utf8();
-        if escaped {
-            escaped = false;
-        } else if ch == '\\' {
-            escaped = true;
-        } else if ch == quote {
-            break;
-        }
-    }
-    cursor
-}
-
-fn identifier_end(body: &str, start: usize) -> usize {
-    let mut cursor = start;
-    while let Some(ch) = body.get(cursor..).and_then(|s| s.chars().next()) {
-        if !is_template_identifier_char(ch) {
-            break;
-        }
-        cursor += ch.len_utf8();
-    }
-    cursor
-}
-
-fn is_template_attribute_or_assignment(body: &str, start: usize, end: usize) -> bool {
-    let previous = body[..start].chars().rev().find(|c| !c.is_whitespace());
-    if previous == Some('.') {
-        return true;
-    }
-
-    let next = body[end..].trim_start();
-    next.starts_with('=') && !next.starts_with("==")
-}
-
-fn is_template_identifier_start(ch: char) -> bool {
-    ch == '_' || ch.is_ascii_alphabetic()
-}
-
-fn is_template_identifier_char(ch: char) -> bool {
-    ch == '_' || ch.is_ascii_alphanumeric()
-}
-
-/// Replace deprecated template vars in every string value of the document,
-/// mutating the `toml_edit` tree in place; returns one
+/// Replace every [`RETIRED_VARS`] template variable in every string value of
+/// the document, mutating the `toml_edit` tree in place; returns one
 /// [`DeprecationKind::TemplateVar`] per `(old, new)` pair replaced, in
-/// [`DEPRECATED_VARS`] order.
+/// [`RETIRED_VARS`] order.
 ///
 /// Operating on the parsed tree (rather than a raw `str::replace` against the
 /// file text) is correct when the TOML source uses escapes: the decoded value
@@ -398,13 +276,9 @@ fn migrate_template_vars_doc(doc: &mut toml_edit::DocumentMut) -> Deprecations {
     fn walk_value(value: &mut toml_edit::Value, replaced: &mut Replaced) {
         match value {
             toml_edit::Value::String(s) => {
-                let pairs = deprecated_vars_in_template(s.value());
-                if pairs.is_empty() {
-                    return;
-                }
-                if let Some(new) = rewrite_template_var_identifiers(s.value(), &pairs) {
+                if let Some((migrated, pairs)) = migrate_retired_vars(s.value()) {
                     let decor = s.decor().clone();
-                    let mut formatted = toml_edit::Formatted::new(new);
+                    let mut formatted = toml_edit::Formatted::new(migrated);
                     *formatted.decor_mut() = decor;
                     *value = toml_edit::Value::String(formatted);
                     replaced.extend(pairs);
@@ -426,7 +300,7 @@ fn migrate_template_vars_doc(doc: &mut toml_edit::DocumentMut) -> Deprecations {
 
     let mut replaced = Replaced::new();
     walk_table(doc.as_table_mut(), &mut replaced);
-    DEPRECATED_VARS
+    RETIRED_VARS
         .iter()
         .filter(|pair| replaced.contains(*pair))
         .map(|&(old, new)| DeprecationKind::TemplateVar { old, new })
@@ -524,11 +398,13 @@ type SilentMigrateFn = fn(&mut toml_edit::DocumentMut) -> bool;
 enum DeprecationRule {
     /// Warns, and is rewritten on every config load before serde parses.
     Structural(MigrateFn),
-    /// Warns, but the deprecated form still works at runtime (deprecated
-    /// template variables resolve via [`normalize_template_vars`];
-    /// `approved-commands` is still a valid serde field), so the load path
+    /// Warns, but the deprecated form still works at runtime
+    /// (`approved-commands` is still a valid serde field), so the load path
     /// leaves it alone. Rewritten only via [`compute_migrated_content`]
-    /// (`wt config show` / `wt config update`).
+    /// (`wt config show` / `wt config update`). A template variable nothing
+    /// supplies any more belongs in [`RETIRED_VARS`], which is rewritten
+    /// structurally instead — an unmigrated name would otherwise reach a
+    /// renderer that has nothing to resolve it to.
     UpdateOnly(MigrateFn),
     /// Silently-migrated rename: rewritten on every load like `Structural`,
     /// but with no warning by construction.
@@ -555,16 +431,18 @@ enum RulePass {
 /// earlier rules have already migrated, so a rule reports a pattern in its
 /// post-migration shape.
 ///
-/// The `[ci]` → `[forge]` rule is order-independent: `[forge]` takes over
-/// `[ci]`'s explicit document position (see [`migrate_ci_doc`]), so its
+/// The `[ci]` → `[forge]` rule is order-independent: `[forge]` renders at an
+/// explicit document position either way — the one it was parsed at, or
+/// `[ci]`'s when the rule creates the table (see [`migrate_ci_doc`]) — so its
 /// rendered placement doesn't depend on which tables other rules re-append.
 ///
 /// A [`DeprecationRule::Structural`] rule must not depend on an `UpdateOnly`
 /// rewrite preceding it: the load path skips `UpdateOnly` rules while
 /// detection applies them, so such a dependency would make the load-path
-/// rewrite diverge from what was warned. The current `UpdateOnly` rules
-/// rewrite key spaces no other rule reads (template strings and
-/// `approved-commands`).
+/// rewrite diverge from what was warned. No rule here has such a dependency —
+/// the template-variable row reads and writes a key space
+/// (`{{ … }}` identifiers inside string values) that no other rule touches,
+/// and `approved-commands` is read by no other rule.
 ///
 /// A rule that moves a section's table wholesale into a new location must
 /// remove the keys its destination has no field for, reporting each via
@@ -580,9 +458,12 @@ enum RulePass {
 /// section). A silently-migrated rename is just a [`DeprecationRule::Silent`]
 /// row.
 const DEPRECATION_RULES: &[DeprecationRule] = &[
-    // Template variables: {{ repo_root }} → {{ repo_path }} etc., inside any
-    // string value.
-    DeprecationRule::UpdateOnly(migrate_template_vars_doc),
+    // Retired template variables: {{ repo_root }} → {{ repo_path }},
+    // {{ commits }} → {{ commit_details }}, etc., inside any string value.
+    // Structural because no renderer supplies any of these names any more —
+    // the load-path rewrite is what keeps an unmigrated template rendering
+    // what it always did.
+    DeprecationRule::Structural(migrate_template_vars_doc),
     // [commit-generation] → [commit.generation], top-level and per-project.
     DeprecationRule::Structural(migrate_commit_generation_doc),
     // approved-commands under [projects."..."] → approvals.toml. The rule only
@@ -596,11 +477,7 @@ const DEPRECATION_RULES: &[DeprecationRule] = &[
     // but in-memory migration to canonical keeps round-trip analysis
     // (`unknown_tree`) coherent for the table and array-of-tables forms,
     // where serde aliases on the field don't cover every shape.
-    DeprecationRule::Silent(|doc| {
-        let pre = rename_hook_key(doc, "pre-create", "pre-start");
-        let post = rename_hook_key(doc, "post-create", "post-start");
-        pre || post
-    }),
+    DeprecationRule::Silent(canonicalize_hook_keys),
     // [ci] → [forge]. Moves `platform` only; unrelated `[ci]` keys stay where
     // the user wrote them, so they keep warning at their own path rather than
     // being relocated (contrast the wholesale-move rules above, which drop
@@ -680,19 +557,62 @@ fn apply_rules(doc: &mut toml_edit::DocumentMut, pass: RulePass, kinds: &mut Dep
 /// Scope walk: apply `f` mutably to the top-level table (scope
 /// `None`) and to each `[projects."key"]` table (scope `Some(key)`), returning
 /// whether any scope reported a change.
+///
+/// Both the `projects` container and each entry inside it can be written as a
+/// standard table or inline (`"host/org/repo" = { merge = { no-ff = true } }`),
+/// and `toml_edit` surfaces those as different node types. Every rule routed
+/// through this walk sees the same scopes either way: an inline entry is
+/// migrated through a table view and written back inline, so a shape the user
+/// chose can't decide whether their config gets migrated. The alternative —
+/// skipping inline entries — leaves a deprecated key unmigrated at a path serde
+/// has no alias for, which drops the setting from the typed config on load.
 fn for_each_config_table_mut(
     doc: &mut toml_edit::DocumentMut,
     mut f: impl FnMut(Option<&str>, &mut toml_edit::Table) -> bool,
 ) -> bool {
     let mut modified = f(None, doc.as_table_mut());
-    if let Some(projects) = doc.get_mut("projects").and_then(|p| p.as_table_mut()) {
-        for (key, value) in projects.iter_mut() {
-            if let Some(table) = value.as_table_mut() {
-                modified |= f(Some(key.get()), table);
+    match doc.get_mut("projects") {
+        Some(toml_edit::Item::Table(projects)) => {
+            for (key, entry) in projects.iter_mut() {
+                let scope = key.get();
+                modified |= match entry {
+                    toml_edit::Item::Table(table) => f(Some(scope), table),
+                    toml_edit::Item::Value(value) => migrate_inline_scope(scope, value, &mut f),
+                    _ => false,
+                };
             }
         }
+        Some(toml_edit::Item::Value(toml_edit::Value::InlineTable(projects))) => {
+            for (key, entry) in projects.iter_mut() {
+                modified |= migrate_inline_scope(key.get(), entry, &mut f);
+            }
+        }
+        _ => {}
     }
     modified
+}
+
+/// Apply `f` to an inline `[projects."key"]` entry through a table view,
+/// writing the result back inline only when `f` reported a change so an
+/// untouched entry keeps its original formatting.
+///
+/// That write-back is what `f` owes in return: a rule that mutates the scope
+/// table while reporting no change keeps its edit on the standard-table path
+/// and loses it here, so the shape would decide the outcome again — the bug
+/// this walk exists to close.
+fn migrate_inline_scope<F>(scope: &str, entry: &mut toml_edit::Value, f: &mut F) -> bool
+where
+    F: FnMut(Option<&str>, &mut toml_edit::Table) -> bool,
+{
+    let toml_edit::Value::InlineTable(inline) = entry else {
+        return false;
+    };
+    let mut as_table = inline.clone().into_table();
+    if !f(Some(scope), &mut as_table) {
+        return false;
+    }
+    *inline = as_table.into_inline_table();
+    true
 }
 
 /// Keys `[switch.picker]` accepts — the destination of the `[select]` rename.
@@ -874,11 +794,60 @@ fn has_table_like_child(item: Option<&toml_edit::Item>, key: &str) -> bool {
     }
 }
 
+/// Replace a key's inline-table value with a standard table, carrying the line's
+/// comments onto the table header.
+///
+/// The key was parsed from `merge = { … }`, so its leaf decor holds whatever
+/// preceded the line — comments, blank lines — plus the space before `=`. A
+/// standard table renders that decor *inside* its brackets, so leaving it in
+/// place writes `[# comment\nmerge ]`: a config file wt can no longer parse,
+/// and the user's own comment is what breaks it. Move the prefix to the header
+/// and drop the rest.
+///
+/// A trailing comment after the closing brace sits in the inline value's own
+/// decor, which `InlineTable::into_table` discards, so it is read from
+/// `existing` before the replacement and lands after the header's `]`. It is
+/// carried only when it holds a comment; bare whitespace there would just trail
+/// the header.
+fn replace_inline_with_table(
+    existing: &mut toml_edit::Table,
+    key: &str,
+    mut table: toml_edit::Table,
+) {
+    let prefix = existing
+        .key(key)
+        .and_then(|k| k.leaf_decor().prefix())
+        .filter(|prefix| prefix.as_str() != Some(""))
+        .cloned();
+    let suffix = existing
+        .get(key)
+        .and_then(|item| item.as_inline_table())
+        .and_then(|inline| inline.decor().suffix())
+        .filter(|suffix| suffix.as_str().is_some_and(|s| s.contains('#')))
+        .cloned();
+    if let Some(prefix) = prefix {
+        table.decor_mut().set_prefix(prefix);
+    }
+    if let Some(suffix) = suffix {
+        table.decor_mut().set_suffix(suffix);
+    }
+    if let Some(mut key_mut) = existing.key_mut(key) {
+        key_mut.leaf_decor_mut().clear();
+    }
+    existing[key] = toml_edit::Item::Table(table);
+}
+
 /// Ensure a table-like parent is writable as a standard table.
 ///
 /// Inline tables can deserialize like tables, but TOML forbids extending them
 /// with later subtables. Convert before inserting migrated nested sections so
 /// existing inline parent fields survive alongside the new child table.
+///
+/// The conversion goes through [`replace_inline_with_table`] so the
+/// key's leading comments and blank lines land above the header rather than
+/// inside its brackets. These rules run on the load path, so a header the key's
+/// decor broke is a config file that stops parsing on every command, not just
+/// one `wt config update` writes back.
 fn ensure_standard_table_parent<'a>(
     table: &'a mut toml_edit::Table,
     key: &str,
@@ -889,11 +858,14 @@ fn ensure_standard_table_parent<'a>(
         table.insert(key, toml_edit::Item::Table(parent));
     }
 
-    let item = table.get_mut(key)?;
-    if let Some(inline) = item.as_inline_table().cloned() {
-        *item = toml_edit::Item::Table(inline.into_table());
+    if let Some(inline) = table
+        .get(key)
+        .and_then(|item| item.as_inline_table())
+        .cloned()
+    {
+        replace_inline_with_table(table, key, inline.into_table());
     }
-    item.as_table_mut()
+    table.get_mut(key)?.as_table_mut()
 }
 
 /// Convert a table-like TOML item into a `Table`. Returns `None` for other shapes.
@@ -1081,12 +1053,18 @@ fn table_like_len(item: &toml_edit::Item) -> Option<usize> {
 /// rewrite could meaningfully move. Removes `[ci]` if `platform` was its only
 /// field.
 ///
-/// An existing `forge` key of any shape suppresses the migration: a `[forge]`
-/// table means the user already migrated, and overwriting a malformed scalar
-/// `forge = "x"` would silently drop their config — serde's type error points
-/// at it instead.
+/// What suppresses the migration is an occupied *destination key*, not the
+/// presence of `forge`: a `[forge]` that already carries `platform` means the
+/// user already migrated, and a `forge` that isn't a table (`forge = "x"`) has
+/// no key to insert into — overwriting it would silently drop their config,
+/// where serde's type error points at it instead. A `[forge]` table without
+/// `platform` is the common half-migrated shape (`hostname` set for a GHE or
+/// self-hosted GitLab remote, `platform` still back in `[ci]`), and its slot is
+/// free, so `platform` lands there. Suppressing on the table's mere existence
+/// left that user un-migrated *and* unwarned, so the deprecated key kept
+/// working silently — right up until `[ci]` is removed.
 ///
-/// `[forge]` takes over `[ci]`'s document position — a fresh table has no
+/// A fresh `[forge]` takes over `[ci]`'s document position — a new table has no
 /// position and would render at the end of the file instead of in the user's
 /// original spot. The `platform` entry moves wholesale (key and item), so
 /// comments attached to the line survive. When `[ci]` is fully consumed, its
@@ -1094,10 +1072,26 @@ fn table_like_len(item: &toml_edit::Item) -> Option<usize> {
 /// when other keys keep `[ci]` alive, the decor stays there and `[forge]`
 /// renders directly after the remainder — it shares `[ci]`'s position, the
 /// position sort is stable, and `[forge]` is inserted later in visit order.
+///
+/// Inserting into an *existing* `[forge]` has no position to take over and no
+/// home for `[ci]`'s decor: `[forge]` is wherever the user wrote it, which can
+/// be far from the comment above `[ci]`. So an emptied `[ci]` is removed only
+/// when its own decor is blank — a commented one stays as an empty section,
+/// which contributes no config, raises no warning, and keeps the user's prose
+/// where they put it.
 fn migrate_ci_doc(doc: &mut toml_edit::DocumentMut) -> Deprecations {
-    if doc.get("forge").is_some() {
-        return Vec::new();
-    }
+    // Read the destination before touching `[ci]`, so a suppressed migration
+    // leaves the document byte-identical.
+    let forge_slot = match doc.get("forge") {
+        None => ForgeSlot::Absent,
+        Some(forge) => match forge.as_table() {
+            Some(table) if !table.contains_key("platform") => ForgeSlot::FreeSlot,
+            // `platform` already there, or `forge` is a scalar, an array, or an
+            // inline table we can't extend without reformatting what the user
+            // wrote.
+            _ => return Vec::new(),
+        },
+    };
 
     let Some(ci_table) = doc.get_mut("ci").and_then(|ci| ci.as_table_mut()) else {
         return Vec::new();
@@ -1114,17 +1108,55 @@ fn migrate_ci_doc(doc: &mut toml_edit::DocumentMut) -> Deprecations {
     let (key, item) = ci_table
         .remove_entry("platform")
         .expect("checked platform exists above");
-    let mut forge_table = toml_edit::Table::new();
-    forge_table.insert_formatted(&key, item);
-    forge_table.set_position(ci_table.position());
-    if ci_table.is_empty() {
-        *forge_table.decor_mut() = ci_table.decor().clone();
-        doc.remove("ci");
+    let ci_emptied = ci_table.is_empty();
+    let ci_position = ci_table.position();
+    let ci_decor = ci_table.decor().clone();
+
+    match forge_slot {
+        ForgeSlot::Absent => {
+            let mut forge_table = toml_edit::Table::new();
+            forge_table.insert_formatted(&key, item);
+            forge_table.set_position(ci_position);
+            if ci_emptied {
+                *forge_table.decor_mut() = ci_decor;
+                doc.remove("ci");
+            }
+            doc.insert("forge", toml_edit::Item::Table(forge_table));
+        }
+        ForgeSlot::FreeSlot => {
+            let forge_table = doc
+                .get_mut("forge")
+                .and_then(|forge| forge.as_table_mut())
+                .expect("checked forge is a table above");
+            forge_table.insert_formatted(&key, item);
+            // A `[forge]` that exists only because of a sub-table renders no
+            // header of its own until something is written directly into it.
+            forge_table.set_implicit(false);
+            if ci_emptied && decor_prefix_is_blank(&ci_decor) {
+                doc.remove("ci");
+            }
+        }
     }
 
-    doc.insert("forge", toml_edit::Item::Table(forge_table));
-
     vec![DeprecationKind::CiSection]
+}
+
+/// Where the migrated `platform` key is headed — see [`migrate_ci_doc`].
+enum ForgeSlot {
+    /// No `forge` key at all: build the table and take over `[ci]`'s position.
+    Absent,
+    /// A `[forge]` table whose `platform` slot is free: insert in place.
+    FreeSlot,
+}
+
+/// Whether a table's leading decor carries nothing worth keeping (no comment,
+/// just whitespace). Decor that was never parsed from a document reads as
+/// blank — it holds no user text either way.
+fn decor_prefix_is_blank(decor: &toml_edit::Decor) -> bool {
+    decor
+        .prefix()
+        .and_then(|prefix| prefix.as_str())
+        .is_none_or(|prefix| prefix.trim().is_empty())
 }
 
 /// Migrate a negated boolean field within a table (e.g., `no-ff = true` →
@@ -1203,49 +1235,54 @@ fn migrate_content_doc(doc: &mut toml_edit::DocumentMut) -> bool {
     apply_rules(doc, RulePass::Load, &mut Vec::new())
 }
 
-/// Rename `old_key` to `new_key` at the top level and under each `[projects."..."]`.
+/// Apply the load-path migrations to `doc`, reporting what they changed.
 ///
-/// Skips any location where `new_key` already exists — the user has already
+/// The config mutations use this where [`migrate_content_doc`]'s bool isn't
+/// enough: writing an edit into a migrated file removes the keys the
+/// destinations have no field for, which the mutation names to the user.
+pub(crate) fn migrate_doc(doc: &mut toml_edit::DocumentMut) -> Deprecations {
+    let mut deprecations = Vec::new();
+    apply_rules(doc, RulePass::Load, &mut deprecations);
+    deprecations
+}
+
+/// Rename the `pre-create`/`post-create` hook aliases to `pre-start`/`post-start`,
+/// in every config scope (see [`for_each_config_table_mut`]).
+fn canonicalize_hook_keys(doc: &mut toml_edit::DocumentMut) -> bool {
+    for_each_config_table_mut(doc, |_, table| {
+        let pre = rename_hook_key(table, "pre-create", "pre-start");
+        let post = rename_hook_key(table, "post-create", "post-start");
+        pre || post
+    })
+}
+
+/// Rename `old_key` to `new_key` in `table`, keeping the comment lines above it.
+///
+/// Skips a table where `new_key` already exists — the user has already
 /// consolidated there, and clobbering their canonical value would lose config.
 /// The rewrite preserves the value shape (string, `[table]`, or
 /// `[[array-of-tables]]`) since it moves the `Item` unchanged.
-fn rename_hook_key(doc: &mut toml_edit::DocumentMut, old_key: &str, new_key: &str) -> bool {
-    let mut modified = false;
-
-    if doc.get(new_key).is_none()
-        && let Some(value) = doc.remove(old_key)
-    {
-        doc.insert(new_key, value);
-        modified = true;
+fn rename_hook_key(table: &mut toml_edit::Table, old_key: &str, new_key: &str) -> bool {
+    if table.contains_key(new_key) {
+        return false;
     }
-
-    if let Some(projects) = doc.get_mut("projects").and_then(|p| p.as_table_mut()) {
-        for (_key, project_value) in projects.iter_mut() {
-            if let Some(project_table) = project_value.as_table_mut()
-                && project_table.get(new_key).is_none()
-                && let Some(value) = project_table.remove(old_key)
-            {
-                project_table.insert(new_key, value);
-                modified = true;
-            }
-        }
-    }
-
-    modified
+    let Some((key, item)) = table.remove_entry(old_key) else {
+        return false;
+    };
+    let renamed = toml_edit::Key::new(new_key).with_leaf_decor(key.leaf_decor().clone());
+    table.insert_formatted(&renamed, item);
+    true
 }
 
 /// Remove `key` from a top-level `section` in a table, dropping a
 /// `[projects."<id>"]`-scoped section that the removal empties.
 ///
 /// A default section serializes away, so an empty one is absent from the
-/// round-trip `unknown_tree` compares against. `seed_schema_skeleton` puts
-/// every valid *top-level* key back, which is why an emptied top-level
-/// `[list]` reads as known and an emptied `[projects."<id>".list]` reads as
-/// `unknown field projects.<id>.list`. So only the project scope needs the
-/// section removed; a top-level one keeps its position and the comments above
-/// its header. (An empty nested section the user wrote by hand warns the same
-/// way — that false positive belongs to `unknown_tree`, and this rule only
-/// avoids adding to it.)
+/// round-trip `unknown_tree` compares against; `seed_schema_skeleton` puts the
+/// valid keys back at both levels, so an emptied section reads as known in
+/// either scope. The project scope still drops the section it empties, leaving
+/// nothing behind at a path the user's remaining config never mentions, while a
+/// top-level one keeps its position and the comments above its header.
 ///
 /// A section can be written as a section table (`[list]`) or inline
 /// (`list = { … }`); `toml_edit` surfaces these as different node types, so
@@ -1336,12 +1373,8 @@ fn validate_existing_approvals_file(approvals_path: &Path) -> anyhow::Result<()>
             crate::path::format_path_for_display(approvals_path)
         )
     })?;
-    toml::from_str::<super::approvals::Approvals>(&content).with_context(|| {
-        format!(
-            "Failed to parse existing approvals file {}",
-            crate::path::format_path_for_display(approvals_path)
-        )
-    })?;
+    toml::from_str::<super::approvals::Approvals>(&content)
+        .map_err(|error| super::ConfigParseError::approvals(approvals_path, error))?;
     Ok(())
 }
 
@@ -1578,36 +1611,101 @@ pub fn compute_migrated_content(content: &str) -> String {
     }
 }
 
+/// Render the `Proposed diff:` block for a migration, or a warning line when
+/// git cannot produce the patch.
+///
+/// The three outcomes of `format_migration_diff` stay distinct here: an
+/// identical pair renders nothing, a differing pair renders the patch, and a
+/// git failure renders a warning rather than disappearing. Both consumers
+/// (`wt config show` and `wt config update`) go through this so neither can
+/// present a failed diff as "no changes"; the migration itself is computed in
+/// memory and is unaffected, so a broken renderer degrades the preview rather
+/// than failing the command.
+///
+/// Returns a string ending in a newline, or empty when there is nothing to show.
+pub fn format_migration_diff_block(original: &str, migrated: &str, label: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    match format_migration_diff(original, migrated, label) {
+        Ok(Some(diff)) => {
+            let _ = writeln!(out, "{}", info_message("Proposed diff:"));
+            let _ = writeln!(out, "{diff}");
+        }
+        Ok(None) => {}
+        Err(e) => {
+            let _ = writeln!(
+                out,
+                "{}",
+                warning_message("Could not render the proposed diff")
+            );
+            // `{e:#}` rather than `to_string()`: the git-failure arm bails with
+            // the whole payload, but a spawn or tempfile failure carries its
+            // cause one `.context` layer down, and plain Display drops it.
+            let _ = writeln!(out, "{}", format_with_gutter(&format!("{e:#}"), None));
+        }
+    }
+    out
+}
+
 /// Render a colored unified diff between `original` and `migrated`, with
 /// `label` shown as the file name in the diff header (e.g. `config.toml`).
 ///
 /// Uses a private tempdir containing two files named `<label>/current` and
 /// `<label>/migrated`; `git diff --no-index` is invoked from inside that
 /// tempdir so the diff header shows clean relative paths. The tempdir is
-/// dropped on return. Returns `None` when the contents match.
-pub fn format_migration_diff(original: &str, migrated: &str, label: &str) -> Option<String> {
-    let dir = tempfile::tempdir().expect("failed to create tempdir for migration diff");
+/// dropped on return. Returns `Ok(None)` when the contents match.
+///
+/// `--no-ext-diff` keeps the patch worktrunk's own: a user's `diff.external`
+/// program would otherwise be handed these two temp files and could emit
+/// something that isn't a patch, block on a GUI, or die and take the preview
+/// with it.
+///
+/// `git diff --no-index` exits 0 when the files match and 1 when they differ,
+/// so those two are the answer and anything else is a failure. Branching on
+/// stdout alone conflated "no changes" with "git refused to run" — the shape
+/// this guards against (#4118).
+fn format_migration_diff(
+    original: &str,
+    migrated: &str,
+    label: &str,
+) -> anyhow::Result<Option<String>> {
+    let dir = tempfile::tempdir().context("failed to create tempdir for migration diff")?;
     let subdir = dir.path().join(label);
-    std::fs::create_dir(&subdir).expect("failed to create subdir in fresh tempdir");
-    let current = subdir.join("current");
-    let migrated_path = subdir.join("migrated");
-    std::fs::write(&current, original).expect("failed to write current config to tempfile");
-    std::fs::write(&migrated_path, migrated).expect("failed to write migrated config to tempfile");
+    std::fs::create_dir(&subdir).context("failed to create subdir in fresh tempdir")?;
+    std::fs::write(subdir.join("current"), original)
+        .context("failed to write current config to tempfile")?;
+    std::fs::write(subdir.join("migrated"), migrated)
+        .context("failed to write migrated config to tempfile")?;
 
     let output = Cmd::new("git")
-        .args(["diff", "--no-index", "--color=always", "-U3", "--"])
+        .args([
+            "diff",
+            "--no-index",
+            "--no-ext-diff",
+            "--color=always",
+            "-U3",
+            "--",
+        ])
         .arg(format!("{label}/current"))
         .arg(format!("{label}/migrated"))
         .current_dir(dir.path())
         .run()
-        .expect("git diff --no-index failed");
+        .context("failed to run git diff --no-index")?;
 
-    // git diff --no-index exits 1 when files differ, which is expected.
-    let diff_output = String::from_utf8_lossy(&output.stdout);
-    if diff_output.is_empty() {
-        return None;
+    match output.status.code() {
+        Some(0) => Ok(None),
+        Some(1) => Ok(Some(format_with_gutter(
+            String::from_utf8_lossy(&output.stdout).trim_end(),
+            None,
+        ))),
+        // `ExitStatus`'s own rendering covers a signal-killed child too, so
+        // there is no separate arm for one.
+        _ => anyhow::bail!(
+            "git diff --no-index, {}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim_end()
+        ),
     }
-    Some(format_with_gutter(diff_output.trim_end(), None))
 }
 
 /// Format deprecation warning lines (without apply hints or diff).
@@ -1622,6 +1720,9 @@ pub fn format_deprecation_warnings(info: &DeprecationInfo) -> String {
 /// Render one `warning_message` line per kind (the commit-generation kind can
 /// emit several). The kinds arrive in emission order, so a single pass
 /// reproduces the original output verbatim.
+///
+/// A rewrite that has already happened is named by [`format_applied_lines`]
+/// instead: these lines say what is still outstanding.
 fn format_warning_lines<'a>(
     kinds: impl IntoIterator<Item = &'a DeprecationKind>,
     label: &str,
@@ -1740,6 +1841,72 @@ fn format_warning_lines<'a>(
     out
 }
 
+/// Render one `warning_message` line per kind, for migrations already applied.
+///
+/// The sibling of [`format_warning_lines`], in the tense the config mutations
+/// need: they report what their write just did to the file, where the load
+/// path's "is deprecated in favor of" and "will be removed" name work still
+/// ahead. Both live here so a new [`DeprecationKind`] is worded in one place.
+pub(crate) fn format_applied_lines<'a>(
+    kinds: impl IntoIterator<Item = &'a DeprecationKind>,
+) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let mut line = |text: String| {
+        let _ = writeln!(out, "{}", warning_message(text));
+    };
+
+    for kind in kinds {
+        match kind {
+            DeprecationKind::TemplateVar { old, new } => line(cformat!(
+                "Renamed template variable <bold>{old}</> to <bold>{new}</>"
+            )),
+            DeprecationKind::CommitGeneration(scopes) => {
+                if scopes.has_top_level {
+                    line(cformat!(
+                        "Moved <bold>[commit-generation]</> to <bold>[commit.generation]</>"
+                    ));
+                }
+                for k in &scopes.project_keys {
+                    line(cformat!(
+                        "Moved <bold>[projects.\"{k}\".commit-generation]</> to <bold>[projects.\"{k}\".commit.generation]</>"
+                    ));
+                }
+            }
+            DeprecationKind::ApprovedCommands => line(cformat!(
+                "Moved <bold>approved-commands</> under <bold>[projects]</> to <bold>approvals.toml</>"
+            )),
+            DeprecationKind::Select(scopes) => {
+                if scopes.has_top_level {
+                    line(cformat!(
+                        "Moved <bold>[select]</> to <bold>[switch.picker]</>"
+                    ));
+                }
+                for k in &scopes.project_keys {
+                    line(cformat!(
+                        "Moved <bold>[projects.\"{k}\".select]</> to <bold>[projects.\"{k}\".switch.picker]</>"
+                    ));
+                }
+            }
+            DeprecationKind::UnsupportedKey { section, key } => line(cformat!(
+                "Removed <bold>{section} {key}</>, which its replacement has no field for"
+            )),
+            DeprecationKind::CiSection => line(cformat!("Moved <bold>[ci]</> to <bold>[forge]</>")),
+            DeprecationKind::NoFf => line(cformat!(
+                "Replaced <bold>merge.no-ff</> with <bold>merge.ff</> (inverted)"
+            )),
+            DeprecationKind::NoCd => line(cformat!(
+                "Replaced <bold>switch.no-cd</> with <bold>switch.cd</> (inverted)"
+            )),
+            DeprecationKind::ListTaskTimeout => line(cformat!(
+                "Removed <bold>list.task-timeout-ms</>, which nothing reads"
+            )),
+        }
+    }
+
+    out
+}
+
 /// Format deprecation details for display (for use by `wt config show`).
 ///
 /// Returns formatted output including:
@@ -1760,7 +1927,7 @@ pub fn format_deprecation_details(info: &DeprecationInfo, original_content: &str
         let _ = writeln!(
             out,
             "{}",
-            hint_message(cformat!("To apply: <underline>{cmd}</>"))
+            hint_message(cformat!("To apply these updates, run <underline>{cmd}</>"))
         );
         return out;
     }
@@ -1768,7 +1935,9 @@ pub fn format_deprecation_details(info: &DeprecationInfo, original_content: &str
     let _ = writeln!(
         out,
         "{}",
-        hint_message(cformat!("To apply: <underline>wt config update</>"))
+        hint_message(cformat!(
+            "To apply these updates, run <underline>wt config update</>"
+        ))
     );
 
     let migrated = compute_migrated_content(original_content);
@@ -1777,10 +1946,11 @@ pub fn format_deprecation_details(info: &DeprecationInfo, original_content: &str
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "config".to_string());
-    if let Some(diff) = format_migration_diff(original_content, &migrated, &label) {
-        let _ = writeln!(out, "{}", info_message("Proposed diff:"));
-        let _ = writeln!(out, "{diff}");
-    }
+    out.push_str(&format_migration_diff_block(
+        original_content,
+        &migrated,
+        &label,
+    ));
 
     out
 }
@@ -1870,7 +2040,10 @@ pub fn scope_to_repo_note(other_description: &str, key: &str) -> Option<&'static
 
 /// Classification of an unknown config key for warning purposes.
 pub enum UnknownKeyKind {
-    /// Deprecated key in its correct config type — deprecation system handles it
+    /// Deprecated key in its correct config type — the deprecation system
+    /// owns the message. Registration is all this says: whether the migration
+    /// actually ran is the caller's to check (see `collect_unknown_warnings`),
+    /// since a declined rewrite leaves the key unread and unreported.
     DeprecatedHandled,
     /// Deprecated key in the wrong config type
     DeprecatedWrongConfig {
@@ -2140,6 +2313,39 @@ post-start = "ln -sf {{ repo_root }}/node_modules {{ worktree }}/node_modules"
         );
     }
 
+    /// Every retired variable is rewritten on load, not just by
+    /// `wt config update`: nothing supplies the old names at render time, so a
+    /// template that reached a renderer un-rewritten would fail its expansion
+    /// (`worktree-path`) or render nothing (`squash-template`). Detection
+    /// reports the same pairs either way.
+    #[test]
+    fn test_retired_vars_migrate_on_load_and_on_update() {
+        let content = r#"worktree-path = "../{{ repo_root }}.{{ branch }}"
+
+[commit.generation]
+squash-template = "{% for c in commits %}{{ c }}\n{% endfor %}"
+"#;
+        assert_eq!(
+            find_deprecated_vars(content),
+            vec![("repo_root", "repo_path"), ("commits", "commit_details")]
+        );
+
+        for (label, migrated) in [
+            ("load", migrate_content(content)),
+            ("update", compute_migrated_content(content)),
+        ] {
+            assert!(
+                migrated.contains("{{ repo_path }}")
+                    && migrated.contains("for c in commit_details"),
+                "{label} must rewrite both retired vars: {migrated}"
+            );
+            assert!(
+                !migrated.contains("repo_root") && !migrated.contains("in commits"),
+                "{label} must leave no retired var behind: {migrated}"
+            );
+        }
+    }
+
     #[test]
     fn test_find_deprecated_vars_with_filter() {
         let content = r#"
@@ -2385,6 +2591,285 @@ timeout = 30
         let result = normalize_template_vars(template);
         assert!(matches!(result, Cow::Borrowed(_)), "Should not allocate");
         assert_eq!(result, template);
+    }
+
+    /// A `}}` inside a quoted string does not end the tag. Scanning for the
+    /// first textual `}}` cut the tag short, so the real reference after the
+    /// string was never reached, and literal text in a later string was
+    /// rewritten as though it were a tag.
+    #[test]
+    fn test_normalize_ignores_delimiters_inside_quoted_strings() {
+        assert_eq!(
+            normalize_template_vars(r#"{{ "}} " ~ repo_root }}"#),
+            r#"{{ "}} " ~ repo_path }}"#
+        );
+        // The literal `{{ repo_root }}` inside the string is output text, not
+        // a reference; only the real tag after it changes.
+        assert_eq!(
+            normalize_template_vars(r#"{{ "}} {{ repo_root }}" }}{{ repo_root }}"#),
+            r#"{{ "}} {{ repo_root }}" }}{{ repo_path }}"#
+        );
+        // Same for a single-quoted string and a block tag.
+        assert_eq!(
+            normalize_template_vars(r#"{% if '%}' ~ repo_root %}x{% endif %}"#),
+            r#"{% if '%}' ~ repo_path %}x{% endif %}"#
+        );
+    }
+
+    /// A deprecated name that a block binds somewhere in the template is left
+    /// alone everywhere: the rewriter has no scope tracking, so renaming the
+    /// global reference would also rename the later local use. Binding the
+    /// canonical name holds the rename back for the same reason from the other
+    /// side — the rename would walk a genuine global use into that binding.
+    /// Either way the pair is dropped from the replacement set that detection
+    /// reads too, so the template stops warning as well — the price of not
+    /// renaming half a scope.
+    #[test]
+    fn test_normalize_skips_names_bound_by_a_block() {
+        for template in [
+            // read as the global first, then rebound and read as the local
+            r#"{{ repo_root }}{% set repo_root = "local" %}{{ repo_root }}"#,
+            r#"{{ repo_root }}{% for repo_root in items %}{{ repo_root }}{% endfor %}"#,
+            r#"{{ repo_root }}{% with repo_root = "local" %}{{ repo_root }}{% endwith %}"#,
+            // `+` is whitespace control just as `-` is, on either end
+            r#"{{ repo_root }}{%+ set repo_root = "local" %}{{ repo_root }}"#,
+            r#"{{ repo_root }}{% set repo_root = "local" +%}{{ repo_root }}"#,
+            // parenthesized tuple targets, which MiniJinja's `parse_assignment`
+            // accepts for all three keywords and nests arbitrarily
+            r#"{{ repo_root }}{% for (repo_root, x) in items %}{{ repo_root }}{% endfor %}"#,
+            r#"{{ repo_root }}{% for (a, (repo_root, x)) in items %}{{ repo_root }}{% endfor %}"#,
+            r#"{{ repo_root }}{% set (repo_root, x) = items %}{{ repo_root }}"#,
+            r#"{{ repo_root }}{% with (repo_root, x) = items %}{{ repo_root }}{% endwith %}"#,
+            // the second pair of a multi-assignment `with`
+            r#"{{ repo_root }}{% with a = 1, repo_root = 2 %}{{ repo_root }}{% endwith %}"#,
+            // `set`'s block form binds its target before the filter chain the
+            // `|` arm cuts the target region at
+            r#"{{ repo_root }}{% set repo_root %}b{% endset %}{{ repo_root }}"#,
+            r#"{{ repo_root }}{% set repo_root | default(1) %}b{% endset %}{{ repo_root }}"#,
+            // binding the *canonical* name captures the use the rename
+            // produces: `{{ repo_root }}` reads the global here and the local
+            // once it is spelled `repo_path`
+            r#"{{ repo_root }}{% set repo_path = "local" %}{{ repo_root }}"#,
+            r#"{{ repo_root }}{% for repo_path in items %}{{ repo_root }}{% endfor %}"#,
+            r#"{{ repo_root }}{% with repo_path = "local" %}{{ repo_root }}{% endwith %}"#,
+            // the same collision in the squash template's pair
+            r#"{% for commit_details in items %}{{ commits }}{% endfor %}"#,
+        ] {
+            let result = normalize_template_vars(template);
+            assert!(
+                matches!(result, Cow::Borrowed(_)),
+                "should not rewrite: {template}"
+            );
+            assert_eq!(result, template);
+            assert!(
+                detect_deprecations(&format!("worktree-path = \"{template}\"\n")).is_empty(),
+                "a template left unrewritten must not warn: {template}"
+            );
+        }
+    }
+
+    /// `{% raw %}` content is literal text to MiniJinja, so a binding-shaped
+    /// tag inside one binds nothing and must not hold back a real use outside
+    /// it. The raw contents are left exactly as written, `+` whitespace
+    /// control included.
+    #[test]
+    fn test_normalize_ignores_raw_block_contents() {
+        assert_eq!(
+            normalize_template_vars(
+                r#"{% raw %}{% set repo_root = "x" %}{% endraw %}{{ repo_root }}"#
+            ),
+            r#"{% raw %}{% set repo_root = "x" %}{% endraw %}{{ repo_path }}"#
+        );
+        assert_eq!(
+            normalize_template_vars("{{ repo_root }}{%+ raw %}{{ repo_root }}{%+ endraw %}"),
+            "{{ repo_path }}{%+ raw %}{{ repo_root }}{%+ endraw %}"
+        );
+    }
+
+    /// A template MiniJinja can't parse has no reading to migrate against, so
+    /// it is left untouched rather than guessed at — and it raises no warning
+    /// either, since detection reads the same parse.
+    #[test]
+    fn test_normalize_leaves_an_unparsable_template_untouched() {
+        let template = "{{ repo_root";
+        let result = normalize_template_vars(template);
+        assert!(matches!(result, Cow::Borrowed(_)), "should not rewrite");
+        assert_eq!(result, template);
+        assert!(
+            detect_deprecations(&format!("worktree-path = \"{template}\"\n")).is_empty(),
+            "a template left unrewritten must not warn"
+        );
+    }
+
+    /// `{% raw %}` content is literal text, so a tag opened inside one never
+    /// has to be terminated. The hand-rolled scan this replaced had to find
+    /// that tag's end itself and gave up on the whole template; MiniJinja's
+    /// parser reads the raw block as the literal it is, and the reference
+    /// before it migrates.
+    #[test]
+    fn test_normalize_migrates_past_a_tag_opened_inside_a_raw_block() {
+        assert_eq!(
+            normalize_template_vars(r#"{{ repo_root }}{% raw %}{{ " {% endraw %}"#),
+            r#"{{ repo_path }}{% raw %}{{ " {% endraw %}"#
+        );
+    }
+
+    /// Binding detection only looks at the binding keywords — a deprecated
+    /// name merely *used* inside a block tag still migrates.
+    #[test]
+    fn test_normalize_rewrites_names_used_but_not_bound_in_blocks() {
+        assert_eq!(
+            normalize_template_vars("{% if repo_root %}{{ repo_root }}{% endif %}"),
+            "{% if repo_path %}{{ repo_path }}{% endif %}"
+        );
+        assert_eq!(
+            normalize_template_vars("{% for x in repo_root %}{{ x }}{% endfor %}"),
+            "{% for x in repo_path %}{{ x }}{% endfor %}"
+        );
+        assert_eq!(
+            normalize_template_vars("{% set p = repo_root %}{{ p }}"),
+            "{% set p = repo_path %}{{ p }}"
+        );
+        // A value region the target scan must not claim: a `for` filter, a
+        // comparison whose `=` is not an assignment, a collection literal.
+        assert_eq!(
+            normalize_template_vars("{% for x in items if repo_root %}{{ x }}{% endfor %}"),
+            "{% for x in items if repo_path %}{{ x }}{% endfor %}"
+        );
+        assert_eq!(
+            normalize_template_vars(r#"{% set a = repo_root == "x" %}{{ a }}"#),
+            r#"{% set a = repo_path == "x" %}{{ a }}"#
+        );
+        assert_eq!(
+            normalize_template_vars("{% with a = [repo_root, 1] %}{{ a }}{% endwith %}"),
+            "{% with a = [repo_path, 1] %}{{ a }}{% endwith %}"
+        );
+        // A dotted target mutates an attribute of the global rather than
+        // binding it, so the global still migrates.
+        assert_eq!(
+            normalize_template_vars("{% set repo_root.x = 1 %}{{ repo_root }}"),
+            "{% set repo_path.x = 1 %}{{ repo_path }}"
+        );
+        // `set` takes one assignment, so the comma after its `=` builds a
+        // tuple value — the name beside it reads the global and migrates,
+        // unlike the second pair of a `with`.
+        assert_eq!(
+            normalize_template_vars("{% set a = 1, repo_root %}{{ repo_root }}"),
+            "{% set a = 1, repo_path %}{{ repo_path }}"
+        );
+        // A `set` block's filter chain is value too: only `x` is bound, so
+        // the argument and the later global both migrate.
+        assert_eq!(
+            normalize_template_vars("{% set x | default(repo_root) %}b{% endset %}{{ repo_root }}"),
+            "{% set x | default(repo_path) %}b{% endset %}{{ repo_path }}"
+        );
+        // The squash-template migration this must not regress.
+        assert_eq!(
+            normalize_template_vars("{% for c in commits %}{{ c }}{% endfor %}"),
+            "{% for c in commit_details %}{{ c }}{% endfor %}"
+        );
+    }
+
+    /// Identifier positions that are not variable reads: a keyword argument's
+    /// name and a map key. Neither resolves against the render context, so
+    /// neither is rewritten — while a real reference beside it still is.
+    #[test]
+    fn test_normalize_skips_identifiers_that_are_not_reads() {
+        assert_eq!(
+            normalize_template_vars("{{ dict(repo_root=1) }}{{ repo_root }}"),
+            "{{ dict(repo_root=1) }}{{ repo_path }}"
+        );
+        assert_eq!(
+            normalize_template_vars(r#"{{ {"repo_root": repo_root} }}"#),
+            r#"{{ {"repo_root": repo_path} }}"#
+        );
+    }
+
+    /// The parser hands reads back in visit order, which is not source order:
+    /// a conditional expression is visited test-first, and a map's keys all
+    /// precede its values. Two migrations whose visit order inverts their
+    /// positions must still splice into one coherent template.
+    #[test]
+    fn test_normalize_rewrites_reads_out_of_visit_order() {
+        assert_eq!(
+            normalize_template_vars("{{ repo_root if worktree }}"),
+            "{{ repo_path if worktree_path }}"
+        );
+        assert_eq!(
+            normalize_template_vars("{{ {a: repo_root, worktree: b} }}"),
+            "{{ {a: repo_path, worktree_path: b} }}"
+        );
+    }
+
+    /// `{% do %}` is a statement of its own, not an expression emitted by a
+    /// `{{ }}`, so its call's arguments are reads like any other.
+    #[test]
+    fn test_normalize_rewrites_inside_a_do_statement() {
+        assert_eq!(
+            normalize_template_vars("{% do dict(x=repo_root) %}"),
+            "{% do dict(x=repo_path) %}"
+        );
+    }
+
+    /// A read is a read wherever the expression puts it, so every node the
+    /// walk descends through has to reach the `Expr::Var` underneath. One case
+    /// per shape the parser can produce.
+    #[test]
+    fn test_normalize_rewrites_reads_in_every_expression_shape() {
+        for (template, expected) in [
+            ("{{ items[repo_root:] }}", "{{ items[repo_path:] }}"),
+            (
+                "{{ items[:repo_root:worktree] }}",
+                "{{ items[:repo_path:worktree_path] }}",
+            ),
+            ("{{ items[repo_root] }}", "{{ items[repo_path] }}"),
+            ("{{ not repo_root }}", "{{ not repo_path }}"),
+            ("{{ -repo_root }}", "{{ -repo_path }}"),
+            // `Expr::Compare` needs a *chained* comparison: `parse_compare`
+            // lowers a single one to `Expr::BinOp`, so `repo_root == "x"`
+            // never reaches the arm that walks the operand list.
+            ("{{ 1 < repo_root < 3 }}", "{{ 1 < repo_path < 3 }}"),
+            // A conditional's `else` arm, which the visit-order case above
+            // leaves off.
+            ("{{ a if b else repo_root }}", "{{ a if b else repo_path }}"),
+            (
+                "{{ repo_root ~ worktree }}",
+                "{{ repo_path ~ worktree_path }}",
+            ),
+            ("{{ repo_root is defined }}", "{{ repo_path is defined }}"),
+            (
+                "{{ repo_root | default(worktree) }}",
+                "{{ repo_path | default(worktree_path) }}",
+            ),
+            ("{{ dict(**repo_root) }}", "{{ dict(**repo_path) }}"),
+            ("{{ dict(*repo_root) }}", "{{ dict(*repo_path) }}"),
+            (
+                "{{ repo_root(worktree) }}",
+                "{{ repo_path(worktree_path) }}",
+            ),
+            (
+                "{% autoescape repo_root %}{{ worktree }}{% endautoescape %}",
+                "{% autoescape repo_path %}{{ worktree_path }}{% endautoescape %}",
+            ),
+            (
+                "{% filter upper %}{{ repo_root }}{% endfilter %}",
+                "{% filter upper %}{{ repo_path }}{% endfilter %}",
+            ),
+            (
+                "{% for x in items %}{% else %}{{ repo_root }}{% endfor %}",
+                "{% for x in items %}{% else %}{{ repo_path }}{% endfor %}",
+            ),
+            (
+                "{% if a %}{% else %}{{ repo_root }}{% endif %}",
+                "{% if a %}{% else %}{{ repo_path }}{% endif %}",
+            ),
+        ] {
+            assert_eq!(
+                normalize_template_vars(template),
+                expected,
+                "for: {template}"
+            );
+        }
     }
 
     /// Identifiers inside `{# #}` comments must not be rewritten.
@@ -3248,7 +3733,7 @@ ff = false
         "#);
     }
 
-    /// A `forge` key of any shape suppresses the `[ci]` migration — a scalar
+    /// A `forge` that isn't a table suppresses the `[ci]` migration — a scalar
     /// `forge = "x"` must not be overwritten by the migrated table (serde's
     /// type error points at it instead).
     #[test]
@@ -3265,6 +3750,75 @@ json-schema = 1
         assert!(detect_deprecations(content).is_empty());
     }
 
+    /// A `[forge]` table that only sets `hostname` has the `platform` slot
+    /// free, so the deprecated key moves into it rather than being left behind.
+    /// This is the shape a self-hosted GitLab or GHE user lands in by adding
+    /// `[forge] hostname` to a config that already carried `[ci] platform`;
+    /// suppressing on the table's mere existence left them un-migrated and
+    /// unwarned. `[ci]` was consumed entirely, so it goes.
+    #[test]
+    fn test_ci_migration_fills_free_slot_in_existing_forge() {
+        let content = r#"[ci]
+platform = "gitlab"
+
+[forge]
+hostname = "gitlab.example.com"
+"#;
+        assert!(matches!(
+            detect_deprecations(content).as_slice(),
+            [DeprecationKind::CiSection]
+        ));
+        insta::assert_snapshot!(migrate_content(content), @r#"
+        [forge]
+        hostname = "gitlab.example.com"
+        platform = "gitlab"
+        "#);
+    }
+
+    /// An existing `[forge]` is wherever the user wrote it, so there is nowhere
+    /// to carry a comment sitting above `[ci]`. An emptied but commented `[ci]`
+    /// stays as an empty section — it contributes no config and raises no
+    /// warning, and dropping it would drop the user's prose with it.
+    #[test]
+    fn test_ci_migration_keeps_commented_ci_when_forge_exists() {
+        let content = r#"# talk to the internal instance
+[ci]
+platform = "gitlab"
+
+[forge]
+hostname = "gitlab.example.com"
+"#;
+        insta::assert_snapshot!(migrate_content(content), @r#"
+        # talk to the internal instance
+        [ci]
+
+        [forge]
+        hostname = "gitlab.example.com"
+        platform = "gitlab"
+        "#);
+    }
+
+    /// A surviving `[ci]` key keeps the section either way; only `platform`
+    /// moves, and it lands in the existing `[forge]` rather than a new one.
+    #[test]
+    fn test_ci_migration_into_existing_forge_preserves_other_keys() {
+        let content = r#"[ci]
+platform = "gitea"
+hostname = "ci.example"
+
+[forge]
+hostname = "forge.example"
+"#;
+        insta::assert_snapshot!(migrate_content(content), @r#"
+        [ci]
+        hostname = "ci.example"
+
+        [forge]
+        hostname = "forge.example"
+        platform = "gitea"
+        "#);
+    }
+
     /// The framework invariant: a warning fires exactly when `wt config
     /// update` would change the file. Degenerate configs that can't be safely
     /// rewritten produce no warning and no rewrite; deprecated configs
@@ -3279,9 +3833,10 @@ json-schema = 1
             "[ci]\nplatform = \"\"\n",
             "[ci]\nplatform = 42\n",
             "[ci]\nhostname = \"ghe.example\"\n",
-            // forge already exists — table or malformed scalar
+            // the destination key is occupied, or `forge` is not a table
             "[forge]\nplatform = \"gitlab\"\n\n[ci]\nplatform = \"github\"\n",
             "forge = \"x\"\n\n[ci]\nplatform = \"github\"\n",
+            "forge = { hostname = \"ghe.example\" }\n\n[ci]\nplatform = \"github\"\n",
             // empty deprecated sections contribute no config
             "[commit-generation]\n",
             "[select]\n",
@@ -3300,6 +3855,29 @@ json-schema = 1
             "switch = \"x\"\n\n[select]\nheight = \"50%\"\n",
             // empty approved-commands is not deprecated
             "[projects.\"github.com/u/r\"]\napproved-commands = []\n",
+            // a retired name a block binds is not the global, so the
+            // rewriter leaves the whole template alone
+            "worktree-path = \"{{ repo_root }}{% set repo_root = 'x' %}{{ repo_root }}\"\n",
+            // `+` is whitespace control too, so the binding still counts
+            "worktree-path = \"{{ repo_root }}{%+ set repo_root = 'x' %}{{ repo_root }}\"\n",
+            // a parenthesized tuple target binds just as a bare one does
+            "worktree-path = \"{{ repo_root }}{% for (repo_root, x) in items %}{{ repo_root }}{% endfor %}\"\n",
+            // binding the *canonical* name holds the rename back from the
+            // other side
+            "worktree-path = \"{{ repo_root }}{% for repo_path in items %}{{ repo_root }}{% endfor %}\"\n",
+            // a template MiniJinja can't parse has no reading to migrate
+            // against, and the renderer won't take it either
+            "worktree-path = \"{{ repo_root\"\n",
+            // Live variables whose names merely contain a retired one. The
+            // rewrite matches whole identifiers, and it now runs on every
+            // load, so a substring match here would mangle a current variable
+            // in every user's config on every command — `worktree` inside
+            // `worktree_path`, `main_worktree` inside `main_worktree_path`
+            // (itself retired, to a different name), `commits` inside
+            // `recent_commits`
+            "[commit.generation]\nsquash-template = \"{{ recent_commits | length }}\"\n",
+            "worktree-path = \"{{ worktree_path }}\"\n",
+            "post-start = \"ln -sf {{ primary_worktree_path }}/node_modules .\"\n",
         ];
         for content in untouched {
             assert!(
@@ -3315,6 +3893,10 @@ json-schema = 1
 
         let rewritten = [
             "[ci]\nplatform = \"github\"\n",
+            // a `[forge]` table whose `platform` slot is free is a destination,
+            // not a blocker — with and without a comment holding `[ci]` open
+            "[ci]\nplatform = \"github\"\n\n[forge]\nhostname = \"ghe.example\"\n",
+            "# internal\n[ci]\nplatform = \"github\"\n\n[forge]\nhostname = \"ghe.example\"\n",
             "[merge]\nff = true\nno-ff = true\n",
             // negated bool written inline (`merge = { no-ff = true }`) migrates
             // like the section form
@@ -3333,7 +3915,29 @@ json-schema = 1
             // list.task-timeout-ms, section and inline forms
             "[projects.\"github.com/u/r\".list]\ntask-timeout-ms = 500\n",
             "[projects.\"github.com/u/r\"]\nlist = { task-timeout-ms = 500 }\n",
+            // the project scope itself written inline, and the whole
+            // `projects` container written inline: the scope walk reaches
+            // both, so the shape doesn't decide whether a rule fires
+            "[projects]\n\"github.com/u/r\" = { merge = { no-ff = true } }\n",
+            "[projects]\n\"github.com/u/r\" = { list = { task-timeout-ms = 500 } }\n",
+            "[projects]\n\"github.com/u/r\" = { select = { timeout-ms = 500 } }\n",
+            "projects = { \"github.com/u/r\" = { switch = { no-cd = true } } }\n",
+            // Retired template variables, rewritten on load as well as by
+            // update. `main_worktree_path` is the near-miss of the row above
+            // it in the table and must reach its own replacement.
             "worktree-path = \"../{{ repo_root }}.{{ branch }}\"\n",
+            "worktree-path = \"../{{ main_worktree }}.{{ branch }}\"\n",
+            "post-start = \"ln -sf {{ main_worktree_path }}/node_modules .\"\n",
+            "post-start = \"cp {{ worktree }}/.env .\"\n",
+            "[commit.generation]\nsquash-template = \"{{ commits | length }}\"\n",
+            // a `}}` inside a quoted string doesn't end the tag
+            "worktree-path = '{{ \"}} \" ~ repo_root }}'\n",
+            // a binding-shaped tag inside `{% raw %}` binds nothing
+            "worktree-path = \"{% raw %}{% set repo_root = 'x' %}{% endraw %}{{ repo_root }}\"\n",
+            // the comma after a `set`'s `=` starts a tuple value, not a target
+            "worktree-path = \"{% set a = 1, repo_root %}{{ repo_root }}\"\n",
+            // a `set` block's filter chain is value, not target
+            "worktree-path = \"{% set x | default(repo_root) %}b{% endset %}{{ repo_root }}\"\n",
             "[projects.\"github.com/u/r\"]\napproved-commands = [\"npm test\"]\n",
         ];
         for content in rewritten {
@@ -3706,6 +4310,36 @@ approved-commands = ["npm install"]
         assert_eq!(result, content, "Invalid TOML should be returned unchanged");
     }
 
+    /// The three outcomes the block renderer has to keep apart: identical
+    /// content, changed content, and (covered by the integration tests that
+    /// break `git diff`) a failure. Before #4118 a failure rendered as the
+    /// first of these.
+    #[test]
+    fn test_migration_diff_block_separates_identical_from_changed() {
+        // This test spawns the real `git diff`, and no fixture constructor runs
+        // here to latch the floor for it — without this the child reads the
+        // developer's own global config, where a single unparsable `diff.*`
+        // value turns the first assertion into the failure arm.
+        crate::shell_exec::enable_hermetic_test_env();
+
+        let original = "worktree-path = \"../{{ repo }}.{{ branch }}\"\n";
+        assert_eq!(
+            format_migration_diff_block(original, original, "config.toml"),
+            "",
+            "identical content renders nothing"
+        );
+
+        let block = format_migration_diff_block(
+            original,
+            "worktree-path = \"../{{ repo }}.{{ branch | sanitize }}\"\n",
+            "config.toml",
+        );
+        assert!(
+            block.contains("Proposed diff:") && block.contains("sanitize"),
+            "changed content renders the patch, got:\n{block}"
+        );
+    }
+
     #[test]
     fn test_format_deprecation_details_approved_commands() {
         let content = r#"
@@ -3819,10 +4453,7 @@ approved-commands = ["npm install"]
             "Invalid existing approvals.toml must surface as Err; got {result:?}"
         );
         assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Failed to parse existing approvals file"),
+            result.unwrap_err().to_string().contains("Approvals @"),
             "Error should identify the invalid approvals file"
         );
     }
@@ -4014,6 +4645,61 @@ pager = "delta --paging=never"
     }
 
     #[test]
+    fn test_migrate_commented_inline_parent_keeps_the_config_loadable() {
+        // The parent has to become a standard table before `[commit.generation]`
+        // can be added, and the key's decor — the comment above it — renders
+        // inside the header brackets. Left there it wrote
+        // `[# my commit settings\ncommit ]`, and because this rule runs before
+        // serde on every load, the user's config stopped parsing entirely.
+        let content = r#"# my commit settings
+commit = { stage = "tracked" }
+commit-generation = { command = "llm" }
+"#;
+        let result = migrate_content(content);
+        assert!(
+            result.contains("# my commit settings\n[commit]"),
+            "the comment belongs above the header, not inside it: {result}"
+        );
+
+        let config = crate::config::UserConfig::load_from_str(content)
+            .unwrap_or_else(|e| panic!("config must still load: {e}\n{result}"));
+        assert_eq!(config.commit.stage, Some(crate::config::StageMode::Tracked));
+        assert_eq!(
+            config
+                .commit
+                .generation
+                .and_then(|generation| generation.command)
+                .as_deref(),
+            Some("llm"),
+        );
+    }
+
+    #[test]
+    fn test_migrate_inline_parent_after_blank_line_keeps_the_config_loadable() {
+        // Same decor path with no comment: a blank line before the inline
+        // section is prefix decor too, which makes any inline section past the
+        // first line of the file a candidate.
+        let content = r#"skip-shell-integration-prompt = true
+
+switch = { cd = false }
+
+[select]
+pager = "delta"
+"#;
+        let config = crate::config::UserConfig::load_from_str(content)
+            .unwrap_or_else(|e| panic!("config must still load: {e}"));
+        assert_eq!(config.switch.cd, Some(false));
+        assert_eq!(
+            config
+                .switch
+                .picker
+                .and_then(|picker| picker.pager)
+                .as_deref(),
+            Some("delta"),
+        );
+    }
+
+    #[test]
     fn test_migrate_select_when_switch_parent_is_inline_table() {
         let content = r#"switch = { cd = false }
 
@@ -4143,16 +4829,40 @@ pager = "delta --paging=never"
         );
     }
 
+    /// `[commit-generation]` migrates into `commit`, which TOML forbids
+    /// extending when the file wrote it inline — so it becomes a standard
+    /// table, and the line's trailing comment lands after the new header's `]`.
+    #[test]
+    fn test_migrate_carries_an_inline_parent_comment_onto_its_header() {
+        let content = r#"commit = { stage = "all" }  # how to stage
+
+[commit-generation]
+template = "MINE"
+"#;
+        insta::assert_snapshot!(migrate_content(content), @r#"
+        [commit]  # how to stage
+        stage = "all"
+
+        [commit.generation]
+        template = "MINE"
+        "#);
+    }
+
     /// The silent create-hooks rule renames the deprecated `pre-create`/`post-create`
     /// keys to canonical `pre-start`/`post-start`, preserving the value shape
-    /// (string, `[table]`, `[[array-of-tables]]`) at both the top level and
-    /// inside `[projects."..."]`.
+    /// (string, `[table]`, `[[array-of-tables]]`) and the comment above the key,
+    /// at the top level and inside `[projects."..."]` entries written either as
+    /// tables or inline.
     #[test]
     fn test_migrate_create_hooks_renames_every_shape() {
-        let content = r#"pre-create = "npm install"
+        let content = r#"# install first
+pre-create = "npm install"
 
 [[post-create]]
 lint = "cargo clippy"
+
+[projects]
+"inline-project" = { post-create = "make" }
 
 [projects."my-project"]
 pre-create = "cargo build"
@@ -4160,27 +4870,22 @@ pre-create = "cargo build"
 [projects."my-project".post-create]
 server = "npm run dev"
 "#;
-        let result = migrate_content(content);
-        assert!(
-            !result.contains("pre-create") && !result.contains("post-create"),
-            "no deprecated key may remain; got:\n{result}"
-        );
-        assert!(
-            result.contains(r#"pre-start = "npm install""#),
-            "top-level string renamed; got:\n{result}"
-        );
-        assert!(
-            result.contains("[[post-start]]"),
-            "top-level array-of-tables renamed; got:\n{result}"
-        );
-        assert!(
-            result.contains(r#"pre-start = "cargo build""#),
-            "per-project string renamed; got:\n{result}"
-        );
-        assert!(
-            result.contains(r#"[projects."my-project".post-start]"#),
-            "per-project table renamed; got:\n{result}"
-        );
+        insta::assert_snapshot!(migrate_content(content), @r#"
+        # install first
+        pre-start = "npm install"
+
+        [[post-start]]
+        lint = "cargo clippy"
+
+        [projects]
+        "inline-project" = { post-start = "make" }
+
+        [projects."my-project"]
+        pre-start = "cargo build"
+
+        [projects."my-project".post-start]
+        server = "npm run dev"
+        "#);
     }
 
     /// When the canonical `-start` key already exists, the migrator leaves the
@@ -4365,6 +5070,48 @@ timeout-ms = 500
         "#);
     }
 
+    /// The same kinds as above, in the tense a config mutation reports its
+    /// write in — the second half of what "Adding a deprecation" words.
+    #[test]
+    fn test_format_applied_lines_all_kinds() {
+        let kinds = vec![
+            DeprecationKind::TemplateVar {
+                old: "repo_root",
+                new: "repo_path",
+            },
+            DeprecationKind::CommitGeneration(ScopedSections {
+                has_top_level: true,
+                project_keys: vec!["github.com/user/repo".to_string()],
+            }),
+            DeprecationKind::ApprovedCommands,
+            DeprecationKind::Select(ScopedSections {
+                has_top_level: true,
+                project_keys: vec!["github.com/user/repo".to_string()],
+            }),
+            DeprecationKind::UnsupportedKey {
+                section: "[select]".to_string(),
+                key: "height".to_string(),
+            },
+            DeprecationKind::CiSection,
+            DeprecationKind::NoFf,
+            DeprecationKind::NoCd,
+            DeprecationKind::ListTaskTimeout,
+        ];
+        assert_snapshot!(format_applied_lines(&kinds).ansi_strip(), @r#"
+        ▲ Renamed template variable repo_root to repo_path
+        ▲ Moved [commit-generation] to [commit.generation]
+        ▲ Moved [projects."github.com/user/repo".commit-generation] to [projects."github.com/user/repo".commit.generation]
+        ▲ Moved approved-commands under [projects] to approvals.toml
+        ▲ Moved [select] to [switch.picker]
+        ▲ Moved [projects."github.com/user/repo".select] to [projects."github.com/user/repo".switch.picker]
+        ▲ Removed [select] height, which its replacement has no field for
+        ▲ Moved [ci] to [forge]
+        ▲ Replaced merge.no-ff with merge.ff (inverted)
+        ▲ Replaced switch.no-cd with switch.cd (inverted)
+        ▲ Removed list.task-timeout-ms, which nothing reads
+        "#);
+    }
+
     #[test]
     fn test_detect_no_ff_deprecation() {
         let deprecations = detect_deprecations("[merge]\nno-ff = true\n");
@@ -4447,6 +5194,79 @@ no-ff = true
         let result = migrate_content(content);
         assert!(result.contains("ff = false"), "Should migrate: {result}");
         assert!(!result.contains("no-ff"), "Should remove no-ff: {result}");
+    }
+
+    #[test]
+    fn test_migrate_no_ff_inline_project_scope() {
+        // A project entry written inline is the same config as the section
+        // form, so it migrates the same way. `UserProjectOverrides` has no
+        // `no-ff` alias, so an unmigrated key is dropped from the typed value
+        // on load — the setting would silently stop applying.
+        let content = "[projects]\n\"github.com/user/repo\" = { merge = { no-ff = true } }\n";
+        let result = migrate_content(content);
+        assert!(result.contains("ff = false"), "should migrate: {result}");
+        assert!(!result.contains("no-ff"), "should remove no-ff: {result}");
+
+        let config = crate::config::UserConfig::load_from_str(content).unwrap();
+        assert_eq!(
+            config.projects["github.com/user/repo"].merge.ff,
+            Some(false),
+            "the migrated setting should reach the typed config"
+        );
+    }
+
+    #[test]
+    fn test_migrate_no_ff_fully_inline_projects_table() {
+        // ...including when the `projects` container itself is inline.
+        let content = "projects = { \"github.com/user/repo\" = { merge = { no-ff = true } } }\n";
+        let result = migrate_content(content);
+        assert!(result.contains("ff = false"), "should migrate: {result}");
+        assert!(!result.contains("no-ff"), "should remove no-ff: {result}");
+    }
+
+    #[test]
+    fn test_migrate_leaves_unrelated_inline_project_keys_alone() {
+        // The table round-trip an inline scope goes through must not disturb
+        // keys no rule touched, and an entry no rule changed keeps its shape.
+        let content = "[projects]\n\"a/b\" = { worktree-path = \"../{{ branch }}\" }\n\"c/d\" = { merge = { no-ff = true, squash = true } }\n";
+        let result = migrate_content(content);
+        assert!(
+            result.contains("\"a/b\" = { worktree-path = \"../{{ branch }}\" }"),
+            "untouched entry should keep its formatting: {result}"
+        );
+        assert!(result.contains("squash = true"), "should keep: {result}");
+        assert!(result.contains("ff = false"), "should migrate: {result}");
+    }
+
+    #[test]
+    fn test_migrate_leaves_project_entries_that_are_not_tables_alone() {
+        // A project entry can be hand-written as something other than a table.
+        // The scope walk has no scope to offer a rule there, so it skips the
+        // entry and leaves the text for serde's own type error and the
+        // unknown-field check — it must not panic or rewrite.
+        for (content, untouched) in [
+            // a scalar entry
+            (
+                "[projects]\n\"a/b\" = \"scalar\"\n[merge]\nno-ff = true\n",
+                "\"a/b\" = \"scalar\"\n",
+            ),
+            // an array-of-tables entry
+            (
+                "[[projects.\"a/b\"]]\nno-ff = true\n[merge]\nno-ff = true\n",
+                "[[projects.\"a/b\"]]\nno-ff = true\n",
+            ),
+        ] {
+            let result = migrate_content(content);
+            assert!(
+                result.contains(untouched),
+                "the entry should survive unrewritten: {result}"
+            );
+            // The top-level rule still fires, so the walk itself ran.
+            assert!(
+                result.contains("ff = false"),
+                "top-level scope should still migrate: {result}"
+            );
+        }
     }
 
     #[test]
@@ -4580,6 +5400,75 @@ ff = true
             "[commit-generation]\ncommand = \"llm\"\n",
             &path,
             ConfigFileKind::Project,
+        );
+    }
+
+    /// A deprecated section the migration declined to rewrite still carries
+    /// live user intent that nothing reads, so the unknown-field channel has
+    /// to speak for it — the deprecation channel stays silent by design when
+    /// the rewrite is unsafe.
+    #[test]
+    fn test_unmigrated_deprecated_section_warns_as_unknown() {
+        use crate::config::{UnknownWarning, UserConfig, collect_unknown_warnings};
+
+        // Malformed: `select` is a scalar, so `migrate_select_table` leaves it
+        // alone rather than dropping the user's value.
+        let warnings = collect_unknown_warnings::<UserConfig>("select = \"not a table\"\n");
+        assert!(
+            matches!(
+                warnings.as_slice(),
+                [UnknownWarning::TopLevelUnknown { key }] if key == "select"
+            ),
+            "expected select → unknown field, got {warnings:?}"
+        );
+
+        // Destination already occupied: the rewrite is skipped so it cannot
+        // clobber the live `[switch.picker]`, leaving `[select]` read by
+        // nobody.
+        let warnings = collect_unknown_warnings::<UserConfig>(
+            "[switch.picker]\npager = \"delta\"\n\n[select]\npreview = \"p\"\n",
+        );
+        assert!(
+            matches!(
+                warnings.as_slice(),
+                [UnknownWarning::TopLevelUnknown { key }] if key == "select"
+            ),
+            "expected occupied-destination select → unknown field, got {warnings:?}"
+        );
+
+        // A scalar occupant (`switch = "x"`) is a *type* error for a known
+        // field, so the round-trip analysis is unreliable and serde's own
+        // message is the diagnostic — this channel stays out of it.
+        assert!(
+            collect_unknown_warnings::<UserConfig>("switch = \"x\"\n\n[select]\npreview = \"p\"\n")
+                .is_empty(),
+            "a type error belongs to serde, not the unknown-field channel"
+        );
+
+        // An empty deprecated section contributes no config; it stays silent.
+        assert!(
+            collect_unknown_warnings::<UserConfig>("[select]\n").is_empty(),
+            "empty [select] must stay silent"
+        );
+
+        // A section the migration did rewrite is handled — no second warning
+        // from this channel.
+        assert!(
+            collect_unknown_warnings::<UserConfig>("[select]\npager = \"delta\"\n").is_empty(),
+            "migrated [select] must not warn"
+        );
+
+        // The rule is the registry's, not `select`'s: a malformed
+        // `commit-generation` is skipped by its own migration and needs the
+        // same fallback. (`ci` is exempt — it is still a live
+        // `ProjectConfig` field, so its leftovers already warn per key.)
+        let warnings = collect_unknown_warnings::<UserConfig>("commit-generation = \"keep me\"\n");
+        assert!(
+            matches!(
+                warnings.as_slice(),
+                [UnknownWarning::TopLevelUnknown { key }] if key == "commit-generation"
+            ),
+            "expected malformed commit-generation → unknown field, got {warnings:?}"
         );
     }
 

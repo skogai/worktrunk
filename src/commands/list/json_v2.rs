@@ -38,8 +38,8 @@ use worktrunk::git::{
 
 use super::ci_status::{CiSource, CiStatus, PrStatus, ReviewState};
 use super::custom_columns::ResolvedCustomColumn;
-use super::json_output::{JsonDiff, format_raw_symbols};
-use super::model::{BranchScope, Collected, ItemKind, ListItem, MainState, WorktreeData};
+use super::json_output::JsonDiff;
+use super::model::{Collected, ItemKind, ListItem, MainState, WorktreeData};
 
 /// Tri-state field encoding the absence rule (see module docs).
 #[derive(Debug, Clone, PartialEq)]
@@ -126,6 +126,8 @@ pub fn schema_document() -> serde_json::Value {
         "title".to_string(),
         "wt list --format=json (schema 2)".into(),
     );
+    // Keep the published schema stable regardless of JSON map storage order.
+    value.sort_all_objects();
     value
 }
 
@@ -333,8 +335,8 @@ pub struct JsonDefaultBranch {
     pub orphan: Option<bool>,
 
     /// How committed content is integrated; absent when determined
-    /// not-integrated, null when undetermined (dirty trees skip the
-    /// expensive checks).
+    /// not-integrated, null when undetermined (a check timed out or was
+    /// skipped).
     #[serde(skip_serializing_if = "Tri::is_absent")]
     pub integration: Tri<JsonIntegration>,
 
@@ -593,19 +595,14 @@ impl JsonItemV2 {
         ci_provider_override: Option<&str>,
         custom_columns: &[ResolvedCustomColumn],
     ) -> Self {
-        let (worktree_data, remote_scope) = match item.kind() {
-            ItemKind::Worktree(data) => (Some(data.as_ref()), false),
-            ItemKind::Branch(scope) => (None, *scope == BranchScope::Remote),
+        let worktree_data = match item.kind() {
+            ItemKind::Worktree(data) => Some(data.as_ref()),
+            ItemKind::Branch(_) => None,
         };
 
-        // Remote rows store the remote-qualified short name ("origin/feature");
-        // split it into the remote and the bare branch name.
-        let (branch, remote) = match (item.branch(), remote_scope) {
-            (Some(name), true) => match name.split_once('/') {
-                Some((remote, branch)) => (Some(branch.to_string()), Some(remote.to_string())),
-                None => (Some(name.to_string()), None),
-            },
-            (name, _) => (name.map(str::to_string), None),
+        let (branch, remote) = match item.branch_ref().remote_parts() {
+            Some((remote, branch)) => (Some(branch.to_string()), Some(remote.to_string())),
+            None => (item.branch().map(str::to_string), None),
         };
 
         // HEAD — null for unborn branches (no sentinel strings).
@@ -704,7 +701,7 @@ impl JsonItemV2 {
                 .status_symbols
                 .main_state
                 .and_then(JsonMainState::from_main_state),
-            symbols: Some(format_raw_symbols(&item.status_symbols)).filter(|s| !s.is_empty()),
+            symbols: Some(item.status_symbols.format_raw()).filter(|s| !s.is_empty()),
             statusline: item.statusline.clone(),
             columns,
         };
@@ -1097,11 +1094,19 @@ mod tests {
 
     #[test]
     fn test_remote_row_splits_branch_and_remote() {
-        let mut item = item_with("origin/feature");
-        item.reclassify_as_branch(BranchScope::Remote, "origin/feature".into());
+        let item = ListItem::new_remote_branch("a".repeat(40), "origin".into(), "feature".into());
         let json = to_value(&convert(&item, Collected::default()));
         assert_eq!(json["branch"], "feature");
         assert_eq!(json["remote"], "origin");
+    }
+
+    #[test]
+    fn test_remote_row_preserves_slash_named_remote() {
+        let item =
+            ListItem::new_remote_branch("a".repeat(40), "team/fork".into(), "feature".into());
+        let json = to_value(&convert(&item, Collected::default()));
+        assert_eq!(json["branch"], "feature");
+        assert_eq!(json["remote"], "team/fork");
     }
 
     #[test]
@@ -1124,8 +1129,7 @@ mod tests {
         // default branch — the name check must compare the remote-stripped
         // "main", not the raw "origin/main", so it gets no self-referential
         // relation object.
-        let mut item = item_with("origin/main");
-        item.reclassify_as_branch(BranchScope::Remote, "origin/main".into());
+        let item = ListItem::new_remote_branch("a".repeat(40), "origin".into(), "main".into());
         let json = to_value(&convert(&item, Collected::default()));
         assert_eq!(json["branch"], "main");
         assert!(json.get("default_branch").is_none());
@@ -1333,15 +1337,6 @@ mod tests {
             });
             assert_eq!(wire.as_deref(), expected, "for {state:?}");
         }
-    }
-
-    #[test]
-    fn test_remote_row_without_slash_keeps_name() {
-        let mut item = item_with("weird");
-        item.reclassify_as_branch(BranchScope::Remote, "weird".into());
-        let json = to_value(&convert(&item, Collected::default()));
-        assert_eq!(json["branch"], "weird");
-        assert!(json.get("remote").is_none());
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! This module handles locating shell configuration files (e.g., `.bashrc`, `.zshrc`)
 //! and completion directories for different shells.
 
-use etcetera::base_strategy::{BaseStrategy, choose_base_strategy};
+use etcetera::base_strategy::{BaseStrategy, Xdg, choose_base_strategy};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -55,9 +55,9 @@ fn parse_nu_path(line: &str) -> Option<PathBuf> {
 /// once per process (memoised).
 ///
 /// Returns [`NuDirs::default`] (all `None`) when `nu` is not in PATH or the
-/// query fails. A single `wt config shell install` resolves both the write
-/// target (`completion_path`) and the installed-state candidates
-/// (`config_paths`), which would otherwise each spawn `nu` for the same answer.
+/// query fails. A single `wt config shell install` or `wt config show` resolves
+/// the Nushell candidates (`config_paths`, the uninstall scan, detection) more
+/// than once, which would otherwise each spawn `nu` for the same answer.
 fn nu_dirs() -> NuDirs {
     static CACHE: OnceLock<NuDirs> = OnceLock::new();
     CACHE
@@ -92,40 +92,6 @@ fn nu_dirs() -> NuDirs {
         .clone()
 }
 
-/// Fallback for Nushell's `$nu.data-dir` when `nu` can't be queried.
-///
-/// Mirrors `nu_path::data_dir`: `XDG_DATA_HOME` (when absolute) wins on every
-/// platform, otherwise `dirs::data_dir()` (`~/Library/Application Support` on
-/// macOS, `%APPDATA%` on Windows, `~/.local/share` on Linux). Nushell appends
-/// `nushell`.
-fn nushell_data_dir_fallback(home: &std::path::Path) -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        let path = PathBuf::from(xdg);
-        if path.is_absolute() {
-            return path.join("nushell");
-        }
-    }
-    dirs::data_dir()
-        .unwrap_or_else(|| home.join(".local").join("share"))
-        .join("nushell")
-}
-
-/// The Nushell vendor-autoload directory worktrunk writes its wrapper to.
-///
-/// Prefers the path `nu` reports (`$nu.vendor-autoload-dirs | last`); otherwise
-/// reconstructs `<data-dir>/vendor/autoload`.
-fn nushell_vendor_autoload_dir(
-    home: &std::path::Path,
-    queried: Option<&std::path::Path>,
-) -> PathBuf {
-    match queried {
-        Some(dir) => dir.to_path_buf(),
-        None => nushell_data_dir_fallback(home)
-            .join("vendor")
-            .join("autoload"),
-    }
-}
-
 /// Legacy `<config-dir>/vendor/autoload` directories where older worktrunk
 /// versions wrongly installed the Nushell wrapper (issue #2878).
 ///
@@ -141,8 +107,11 @@ fn legacy_nushell_autoload_dirs(
     if let Some(dir) = default_config {
         dirs.push(dir.to_path_buf());
     }
-    if let Ok(xdg_config) = std::env::var("XDG_CONFIG_HOME") {
-        dirs.push(PathBuf::from(xdg_config).join("nushell"));
+    // etcetera's XDG strategy: `$XDG_CONFIG_HOME` when absolute, `~/.config`
+    // otherwise. `~/.config` stays listed on its own because an absolute
+    // `$XDG_CONFIG_HOME` displaces it, and older worktrunk wrote there too.
+    if let Ok(xdg) = Xdg::new() {
+        dirs.push(xdg.config_dir().join("nushell"));
     }
     dirs.push(home.join(".config").join("nushell"));
     if let Ok(strategy) = choose_base_strategy() {
@@ -156,21 +125,16 @@ fn legacy_nushell_autoload_dirs(
 /// Nushell autoload directories to check for an installed wrapper, in priority
 /// order.
 ///
-/// The first entry is the canonical write target (the current vendor-autoload
-/// dir); the rest are the data-dir fallback and the legacy config-dir locations
-/// kept so install/uninstall can clean up stranded files.
+/// The first entry is the canonical write target (the vendor-autoload dir `nu`
+/// reports); the rest are the legacy config-dir locations kept so
+/// install/uninstall can clean up stranded files. Empty when `nu` can't be
+/// queried: without `nu` there is no Nushell to integrate with.
 pub fn nushell_autoload_candidates(home: &std::path::Path) -> Vec<PathBuf> {
     let dirs = nu_dirs();
-    let mut candidates = vec![nushell_vendor_autoload_dir(
-        home,
-        dirs.vendor_autoload.as_deref(),
-    )];
-    // New-style fallback, in case `nu` was queryable at install time but not now.
-    candidates.push(
-        nushell_data_dir_fallback(home)
-            .join("vendor")
-            .join("autoload"),
-    );
+    let Some(target) = dirs.vendor_autoload else {
+        return Vec::new();
+    };
+    let mut candidates = vec![target];
     candidates.extend(legacy_nushell_autoload_dirs(
         home,
         dirs.default_config.as_deref(),
@@ -182,31 +146,202 @@ pub fn nushell_autoload_candidates(home: &std::path::Path) -> Vec<PathBuf> {
     candidates
 }
 
+/// Parse the profile path `pwsh` prints: one absolute path, else `None`.
+#[cfg(unix)]
+fn parse_powershell_profile(stdout: &str) -> Option<PathBuf> {
+    let line = stdout.trim();
+    let path = PathBuf::from(line);
+    (!line.contains('\n') && path.is_absolute()).then_some(path)
+}
+
+/// Classify a profile query's outcome.
+///
+/// `Ok(None)` — use the conventional path — when the runtime is missing,
+/// fails, times out, or prints anything but one absolute path. `Err(signal)`
+/// when the query was cancelled: the child died of SIGINT/SIGTERM, or the
+/// command operation was cancelled while wt waited.
+#[cfg(unix)]
+fn powershell_profile_from(
+    output: &std::io::Result<std::process::Output>,
+    operation_signal: Option<i32>,
+) -> Result<Option<PathBuf>, i32> {
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    use std::os::unix::process::ExitStatusExt;
+    let output = output.as_ref().ok();
+    if let Some(signal) = output
+        .and_then(|output| output.status.signal())
+        .filter(|signal| matches!(*signal, SIGINT | SIGTERM))
+        .or(operation_signal)
+    {
+        return Err(signal);
+    }
+    Ok(output
+        .filter(|output| output.status.success())
+        .and_then(|output| parse_powershell_profile(&String::from_utf8_lossy(&output.stdout))))
+}
+
+/// The profile query's answer, or the signal that cancelled it.
+#[cfg(unix)]
+static POWERSHELL_PROFILE: OnceLock<Result<Option<PathBuf>, i32>> = OnceLock::new();
+
+/// The current-user, current-host profile (`$PROFILE.CurrentUserCurrentHost`)
+/// the installed `pwsh` loads, queried at most once per process so install,
+/// uninstall and detection all act on the same answer.
+///
+/// `-NoProfile` keeps the query from running the profiles it names, and the
+/// telemetry and update-check opt-outs keep it off the network. Bounded by the
+/// shared local-probe timeout. A timed child runs in its own process group, so
+/// a terminal Ctrl-C reaches only wt, whose default disposition ends it;
+/// SIGTERM to wt is latched by the command operation and read back here.
+#[cfg(unix)]
+fn queried_powershell_profile() -> std::io::Result<Option<PathBuf>> {
+    POWERSHELL_PROFILE
+        .get_or_init(|| {
+            let output = crate::shell_exec::Cmd::new("pwsh")
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "$PROFILE.CurrentUserCurrentHost",
+                ])
+                .env("POWERSHELL_TELEMETRY_OPTOUT", "1")
+                .env("POWERSHELL_UPDATECHECK", "Off")
+                .timeout(crate::git::reap::probe_timeout())
+                .run();
+            let result = powershell_profile_from(
+                &output,
+                crate::signal_forwarder::operation_interrupt_signal(),
+            );
+            if let Err(signal) = result {
+                crate::signal_forwarder::cancel_foreground(signal);
+            }
+            result
+        })
+        .clone()
+        .map_err(|signal| {
+            std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                ProfileQueryInterrupted(signal),
+            )
+        })
+}
+
+/// The payload of the `io::Error` the profile path helpers return when the
+/// PowerShell profile query was cancelled, naming the signal.
+#[cfg(unix)]
+#[derive(Debug)]
+struct ProfileQueryInterrupted(i32);
+
+#[cfg(unix)]
+impl std::fmt::Display for ProfileQueryInterrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "PowerShell profile query interrupted by signal {}",
+            self.0
+        )
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for ProfileQueryInterrupted {}
+
+/// The signal that cancelled the PowerShell profile query, when `error` is
+/// that cancellation rather than an ordinary path failure.
+pub fn profile_query_interruption(error: &std::io::Error) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        error
+            .get_ref()?
+            .downcast_ref::<ProfileQueryInterrupted>()
+            .map(|interrupted| interrupted.0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        None
+    }
+}
+
 /// Get PowerShell profile paths in order of preference.
+///
 /// On Windows, returns both PowerShell Core (7+) and Windows PowerShell (5.1) paths.
-/// On Unix, uses the conventional ~/.config/powershell location.
-pub fn powershell_profile_paths(home: &std::path::Path) -> Vec<PathBuf> {
+/// On Unix, returns the current-user, current-host profile the installed `pwsh`
+/// reports, and nothing when `pwsh` can't be queried: without `pwsh` there is
+/// no PowerShell to integrate with. Errors only when the query was cancelled.
+pub fn powershell_profile_paths(home: &std::path::Path) -> std::io::Result<Vec<PathBuf>> {
     #[cfg(windows)]
     {
         // Use platform-specific Documents path (handles non-English Windows)
         let docs = dirs::document_dir().unwrap_or_else(|| home.join("Documents"));
-        vec![
+        Ok(vec![
             // PowerShell Core 6+ (pwsh.exe) - preferred
             docs.join("PowerShell")
                 .join("Microsoft.PowerShell_profile.ps1"),
             // Windows PowerShell 5.1 (powershell.exe) - legacy but still common
             docs.join("WindowsPowerShell")
                 .join("Microsoft.PowerShell_profile.ps1"),
-        ]
+        ])
     }
     #[cfg(not(windows))]
     {
-        vec![
-            home.join(".config")
-                .join("powershell")
-                .join("Microsoft.PowerShell_profile.ps1"),
-        ]
+        let _ = home;
+        #[cfg(unix)]
+        let queried = queried_powershell_profile()?;
+        #[cfg(not(unix))]
+        let queried = None;
+        Ok(queried.into_iter().collect())
     }
+}
+
+/// The directory fish reads its configuration from — fish's own
+/// `$__fish_config_dir`: `$XDG_CONFIG_HOME/fish` when that variable holds an
+/// absolute path, otherwise `~/.config/fish`. `etcetera`'s [`Xdg`] strategy is
+/// that rule, so nothing about it is restated here.
+///
+/// [`Xdg`] rather than `choose_base_strategy`, which resolves `%APPDATA%` on
+/// Windows: fish has no `%APPDATA%` notion on any platform, so one directory
+/// holds the wrapper and the completion there too. It isn't one a Windows fish
+/// reads — `Xdg::new` takes its home from `std::env::home_dir`, which is
+/// `%USERPROFILE%` there and, since Rust 1.85, deliberately not the POSIX
+/// `$HOME` a Cygwin or MSYS fish runs under. The two strategies are the same
+/// everywhere else.
+///
+/// Every path fish itself reads goes through this one function — the wrapper
+/// (`config_paths`) and the completion (`fish_completion_path`) — because they have
+/// to agree. Resolving the wrapper's directory separately from the completion's
+/// put the wrapper under `~/.config/fish` whenever `$XDG_CONFIG_HOME` pointed
+/// anywhere else, which fish never reads, while the completion landed in the
+/// directory it does read; install reported success for both and `wt` was never
+/// defined. `legacy_fish_conf_d_path` is deliberately not one of these — see
+/// its own note.
+pub fn fish_config_dir(home: &std::path::Path) -> PathBuf {
+    Xdg::new()
+        .map(|xdg| xdg.config_dir())
+        .unwrap_or_else(|_| home.join(".config"))
+        .join("fish")
+}
+
+/// The directory worktrunk reads and writes zsh's rc file in: `$ZDOTDIR` when
+/// it holds an absolute path, otherwise `$HOME`.
+///
+/// zsh's rule is `$ZDOTDIR`, or `$HOME` when it is unset. The absolute-only
+/// guard on top is the same one etcetera's [`Xdg`] applies to
+/// `$XDG_CONFIG_HOME` ([`fish_config_dir`]).
+///
+/// A non-absolute value resolves against the current directory, and that
+/// directory is `wt`'s: zsh resolves one against *zsh's* own startup
+/// directory, which `wt` has no way to know at install time. Honouring it
+/// would send install, and the whole-file rewrite `wt config shell uninstall`
+/// performs, to a file neither side meant — a `.zshrc` in a dotfiles checkout
+/// that happened to be the invocation directory. `$HOME` is also where
+/// `wt config show` reads back from, so install and detection agree.
+pub(super) fn zsh_config_dir(home: &std::path::Path) -> PathBuf {
+    std::env::var_os("ZDOTDIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| home.to_path_buf())
 }
 
 /// Rc/profile files scanned line-by-line for integration lines.
@@ -215,21 +350,19 @@ pub fn powershell_profile_paths(home: &std::path::Path) -> Vec<PathBuf> {
 /// are independent of the binary name; Fish and Nushell use per-name wrapper
 /// files instead and have no line-based config. `config_paths` builds on this
 /// for the line-based shells, so install and uninstall cannot drift apart.
-pub fn line_based_config_paths(shell: super::Shell, home: &std::path::Path) -> Vec<PathBuf> {
-    match shell {
+pub fn line_based_config_paths(
+    shell: super::Shell,
+    home: &std::path::Path,
+) -> std::io::Result<Vec<PathBuf>> {
+    Ok(match shell {
         super::Shell::Bash => {
             // Use .bashrc - sourced by interactive shells (login shells should source .bashrc)
             vec![home.join(".bashrc")]
         }
-        super::Shell::Zsh => {
-            let zdotdir = std::env::var("ZDOTDIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| home.to_path_buf());
-            vec![zdotdir.join(".zshrc")]
-        }
-        super::Shell::PowerShell => powershell_profile_paths(home),
+        super::Shell::Zsh => vec![zsh_config_dir(home).join(".zshrc")],
+        super::Shell::PowerShell => powershell_profile_paths(home)?,
         super::Shell::Fish | super::Shell::Nushell => Vec::new(),
-    }
+    })
 }
 
 /// Returns the config file paths for a shell.
@@ -241,7 +374,7 @@ pub(super) fn config_paths(shell: super::Shell, cmd: &str) -> Result<Vec<PathBuf
 
     Ok(match shell {
         super::Shell::Bash | super::Shell::Zsh | super::Shell::PowerShell => {
-            line_based_config_paths(shell, &home)
+            line_based_config_paths(shell, &home)?
         }
         super::Shell::Fish => {
             // For fish, we write to functions/ which is autoloaded on first use.
@@ -249,18 +382,17 @@ pub(super) fn config_paths(shell: super::Shell, cmd: &str) -> Result<Vec<PathBuf
             // fixing the issue where Homebrew PATH setup in config.fish runs
             // after conf.d/ files. See: https://github.com/max-sixty/worktrunk/issues/566
             vec![
-                home.join(".config")
-                    .join("fish")
+                fish_config_dir(&home)
                     .join("functions")
                     .join(format!("{}.fish", cmd)),
             ]
         }
         super::Shell::Nushell => {
             // Nushell autoloads `*.nu` from `$nu.vendor-autoload-dirs`; the last
-            // entry (under `$nu.data-dir`) is the write target. Earlier entries
-            // are fallbacks plus the legacy `<config-dir>/vendor/autoload`
-            // locations older worktrunk wrote to (never autoloaded — issue
-            // #2878), kept so install/uninstall can clean them up.
+            // entry (under `$nu.data-dir`) is the write target. The rest are the
+            // legacy `<config-dir>/vendor/autoload` locations older worktrunk
+            // wrote to (never autoloaded — issue #2878), kept so
+            // install/uninstall can clean them up.
             nushell_autoload_candidates(&home)
                 .into_iter()
                 .map(|autoload_dir| autoload_dir.join(format!("{}.nu", cmd)))
@@ -275,6 +407,15 @@ pub(super) fn config_paths(shell: super::Shell, cmd: &str) -> Result<Vec<PathBuf
 /// This caused issues with Homebrew PATH setup (see issue #566). We now install to
 /// `functions/{cmd}.fish` instead. This method returns the legacy path so install/uninstall
 /// can clean it up.
+///
+/// Hardcoded to `~/.config`, unlike [`fish_config_dir`], because this names a
+/// file worktrunk *wrote*, not a file fish reads: the write was hardcoded for
+/// as long as it existed, and install removes what this resolves to whole and
+/// unread. Resolving it through `$XDG_CONFIG_HOME` would both stop finding the
+/// stranded file and start deleting a `conf.d/{cmd}.fish` in the directory fish
+/// actually loads — one worktrunk never wrote and whose contents are never
+/// read. Uninstall's directory scan is gated on worktrunk-managed content and
+/// carries no such constraint.
 pub(super) fn legacy_fish_conf_d_path(cmd: &str) -> Result<PathBuf, std::io::Error> {
     let home = home_dir_required()?;
     Ok(home
@@ -284,57 +425,14 @@ pub(super) fn legacy_fish_conf_d_path(cmd: &str) -> Result<PathBuf, std::io::Err
         .join(format!("{}.fish", cmd)))
 }
 
-/// Returns the path to the native completion directory for a shell.
-///
-/// The `cmd` parameter affects the completion filename (e.g., `wt.fish` or `git-wt.fish`).
-///
-/// Note: Bash and Zsh use inline lazy completions in the init script.
-/// Only Fish uses a separate completion file at ~/.config/fish/completions/
-/// (installed by `wt config shell install`) that uses $WORKTRUNK_BIN to bypass
-/// the shell function wrapper.
-pub(super) fn completion_path(shell: super::Shell, cmd: &str) -> Result<PathBuf, std::io::Error> {
-    let home = home_dir_required()?;
-
-    // Use etcetera for XDG-compliant paths when available
-    let strategy = choose_base_strategy().ok();
-
-    Ok(match shell {
-        super::Shell::Bash => {
-            // XDG_DATA_HOME defaults to ~/.local/share
-            let data_home = strategy
-                .as_ref()
-                .map(|s| s.data_dir())
-                .unwrap_or_else(|| home.join(".local").join("share"));
-            data_home
-                .join("bash-completion")
-                .join("completions")
-                .join(cmd)
-        }
-        super::Shell::Zsh => home.join(".zfunc").join(format!("_{}", cmd)),
-        super::Shell::Fish => {
-            let config_home = strategy
-                .as_ref()
-                .map(|s| s.config_dir())
-                .unwrap_or_else(|| home.join(".config"));
-            config_home
-                .join("fish")
-                .join("completions")
-                .join(format!("{}.fish", cmd))
-        }
-        super::Shell::Nushell => {
-            // Nushell completions are defined inline in the init script.
-            // Return the canonical vendor-autoload path (same as config).
-            let dirs = nu_dirs();
-            nushell_vendor_autoload_dir(&home, dirs.vendor_autoload.as_deref())
-                .join(format!("{}.nu", cmd))
-        }
-        super::Shell::PowerShell => {
-            // PowerShell doesn't use a separate completion file - completions are
-            // registered inline in the profile using Register-ArgumentCompleter
-            // Return a dummy path that won't be used
-            home.join(format!(".{}-powershell-completions", cmd))
-        }
-    })
+/// The completion file worktrunk installs for fish, the one shell whose
+/// completions live in their own file (`<fish config>/completions/<cmd>.fish`).
+/// Bash, Zsh, Nushell and PowerShell register completions inline in the
+/// integration they install.
+pub fn fish_completion_path(cmd: &str) -> Result<PathBuf, std::io::Error> {
+    Ok(fish_config_dir(&home_dir_required()?)
+        .join("completions")
+        .join(format!("{cmd}.fish")))
 }
 
 #[cfg(test)]
@@ -356,27 +454,72 @@ mod tests {
         assert_eq!(parse_nu_path("  \n"), None);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn test_nushell_vendor_autoload_dir_prefers_queried() {
-        let home = PathBuf::from("/home/user");
-        let queried = PathBuf::from("/opt/nu/vendor/autoload");
+    fn test_parse_powershell_profile() {
         assert_eq!(
-            nushell_vendor_autoload_dir(&home, Some(&queried)),
-            queried,
-            "the path nu reports should be used verbatim"
+            parse_powershell_profile("/x/powershell/Microsoft.PowerShell_profile.ps1\n"),
+            Some(PathBuf::from(
+                "/x/powershell/Microsoft.PowerShell_profile.ps1"
+            ))
+        );
+        assert_eq!(parse_powershell_profile(""), None);
+        assert_eq!(parse_powershell_profile("relative/profile.ps1"), None);
+        assert_eq!(parse_powershell_profile("/a.ps1\n/b.ps1\n"), None);
+    }
+
+    /// Stand-in runtimes via `/bin/sh -c`: the reported path is trusted, a
+    /// runtime that can't answer falls back, and SIGINT/SIGTERM — on the child
+    /// or latched by the operation — cancels instead of falling back.
+    #[cfg(unix)]
+    #[test]
+    fn test_powershell_profile_from() {
+        let sh = |script: &str| {
+            crate::shell_exec::Cmd::new("/bin/sh")
+                .args(["-c", script])
+                .run()
+        };
+        assert_eq!(
+            powershell_profile_from(&sh("echo /custom/powershell/profile.ps1"), None),
+            Ok(Some(PathBuf::from("/custom/powershell/profile.ps1")))
+        );
+        assert_eq!(
+            powershell_profile_from(&sh("echo /custom/profile.ps1; exit 1"), None),
+            Ok(None)
+        );
+        let missing = crate::shell_exec::Cmd::new("/nonexistent/pwsh-xxxxxxxx").run();
+        assert_eq!(powershell_profile_from(&missing, None), Ok(None));
+        assert_eq!(powershell_profile_from(&sh("kill -INT $$"), None), Err(2));
+        assert_eq!(powershell_profile_from(&sh("kill -TERM $$"), None), Err(15));
+        // A crash is a failed query, not a cancellation.
+        assert_eq!(
+            powershell_profile_from(&sh("kill -KILL $$"), None),
+            Ok(None)
+        );
+        assert_eq!(
+            powershell_profile_from(&sh("echo /custom/profile.ps1"), Some(15)),
+            Err(15)
         );
     }
 
+    /// Only the cancelled query's own error reads as an interruption; an
+    /// ordinary `Interrupted` io error stays an ordinary failure.
+    #[cfg(unix)]
     #[test]
-    fn test_nushell_vendor_autoload_dir_fallback_under_data_dir() {
-        let home = PathBuf::from("/home/user");
-        let dir = nushell_vendor_autoload_dir(&home, None);
-        // Fallback must land under `<data-dir>/nushell/vendor/autoload`, never
-        // under the *config* dir (the bug this fixes).
-        assert!(
-            dir.ends_with("nushell/vendor/autoload"),
-            "fallback should be under <data>/nushell/vendor/autoload: {dir:?}"
-        );
+    fn test_profile_query_interruption() {
+        for signal in [2, 15] {
+            let cancelled = std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                ProfileQueryInterrupted(signal),
+            );
+            assert_eq!(profile_query_interruption(&cancelled), Some(signal));
+            assert_eq!(
+                cancelled.to_string(),
+                format!("PowerShell profile query interrupted by signal {signal}")
+            );
+        }
+        let ordinary = std::io::Error::from(std::io::ErrorKind::Interrupted);
+        assert_eq!(profile_query_interruption(&ordinary), None);
     }
 
     #[test]
@@ -407,13 +550,9 @@ mod tests {
         let home = PathBuf::from("/home/user");
         let candidates = nushell_autoload_candidates(&home);
 
-        assert!(!candidates.is_empty(), "must return at least one candidate");
-        // The write target (first entry) is a vendor/autoload directory.
-        assert!(
-            candidates[0].ends_with("vendor/autoload"),
-            "write target should be a vendor/autoload dir: {:?}",
-            candidates[0]
-        );
+        // The write target (first entry) is the directory `nu` reports; without
+        // `nu` there is nothing to integrate with, so no candidates at all.
+        assert_eq!(candidates.first(), nu_dirs().vendor_autoload.as_ref());
         // No duplicates.
         let unique: std::collections::HashSet<_> = candidates.iter().collect();
         assert_eq!(
@@ -421,11 +560,13 @@ mod tests {
             unique.len(),
             "candidates must not contain duplicates: {candidates:?}"
         );
-        // The legacy ~/.config location is always present for cleanup.
-        assert!(
+        // Whenever there is a target, the legacy ~/.config location is there
+        // too, for cleanup.
+        assert_eq!(
             candidates
                 .iter()
                 .any(|p| p == &home.join(".config/nushell/vendor/autoload")),
+            !candidates.is_empty(),
             "legacy ~/.config/nushell location must be a candidate: {candidates:?}"
         );
     }

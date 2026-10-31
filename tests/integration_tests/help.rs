@@ -122,6 +122,18 @@ fn test_merge_help_describes_exact_shape_no_rebase() {
     "help_config_plugins_codex_uninstall",
     "config plugins codex uninstall --help"
 )]
+#[case("help_config_plugins_pi", "config plugins pi --help")]
+#[case("help_config_plugins_pi_install", "config plugins pi install --help")]
+#[case(
+    "help_config_plugins_pi_uninstall",
+    "config plugins pi uninstall --help"
+)]
+#[case("help_config_plugins_omp", "config plugins omp --help")]
+#[case("help_config_plugins_omp_install", "config plugins omp install --help")]
+#[case(
+    "help_config_plugins_omp_uninstall",
+    "config plugins omp uninstall --help"
+)]
 #[case("help_config_state", "config state --help")]
 #[case("help_config_state_cache", "config state cache --help")]
 #[case(
@@ -291,10 +303,7 @@ fn test_help_without_detectable_width() {
 /// Tests --help-description outputs the meta description for docs frontmatter.
 #[rstest]
 #[case("switch", "Switch to a worktree; create if needed.")]
-#[case(
-    "merge",
-    "Merge current branch into the target branch. Squash & rebase"
-)]
+#[case("merge", "Merge a branch into the target branch. Squash & rebase")]
 #[case("hook", "Run configured hooks.")]
 fn test_help_description(#[case] cmd: &str, #[case] expected_prefix: &str) {
     let output = wt_command()

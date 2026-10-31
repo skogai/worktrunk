@@ -136,7 +136,9 @@ fn test_state_get_default_branch(repo: TestRepo) {
 
 #[rstest]
 fn test_state_get_default_branch_no_remote(repo: TestRepo) {
-    // Without remote, should infer from local branches
+    // Remove origin (fixture has it) so the branch is inferred from local branches
+    repo.run_git(&["remote", "remove", "origin"]);
+
     let output = wt_state_cmd(&repo, "default-branch", "get", &[])
         .output()
         .unwrap();
@@ -164,7 +166,7 @@ fn test_state_get_default_branch_fails_when_undetermined(repo: TestRepo) {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert_snapshot!(String::from_utf8_lossy(&output.stderr), @"[31m✗[39m [31mCannot determine default branch. To configure, run [1mwt config state default-branch set BRANCH[22m[39m");
+    assert_snapshot!(String::from_utf8_lossy(&output.stderr), @"[31m✗[39m [31mCannot determine default branch; to configure one, run [1mwt config state default-branch set BRANCH[22m[39m");
 }
 
 #[rstest]
@@ -772,7 +774,12 @@ fn test_state_get_ci_status_nonexistent_branch(repo: TestRepo) {
 /// Resolve a branch that exists only as a remote-tracking ref (no local
 /// counterpart). Exercises the `remote_branch` arm of the BranchRef match.
 #[rstest]
-fn test_state_get_ci_status_remote_only_branch(#[from(repo_with_remote)] repo: TestRepo) {
+#[case("team/fork/foo")]
+#[case("team/fork/HEAD")]
+fn test_state_get_ci_status_remote_only_branch(
+    #[from(repo_with_remote)] repo: TestRepo,
+    #[case] branch: &str,
+) {
     repo.create_branch("foo");
     repo.run_git(&["checkout", "foo"]);
     std::fs::write(repo.root_path().join("f.txt"), "f").unwrap();
@@ -782,7 +789,14 @@ fn test_state_get_ci_status_remote_only_branch(#[from(repo_with_remote)] repo: T
     repo.run_git(&["checkout", "main"]);
     repo.run_git(&["branch", "-D", "foo"]);
 
-    let output = wt_state_cmd(&repo, "ci-status", "get", &["--branch", "origin/foo"])
+    repo.run_git(&["remote", "rename", "origin", "team/fork"]);
+    repo.run_git(&[
+        "symbolic-ref",
+        "refs/remotes/team/fork/HEAD",
+        "refs/remotes/team/fork/foo",
+    ]);
+
+    let output = wt_state_cmd(&repo, "ci-status", "get", &["--branch", branch])
         .output()
         .unwrap();
     assert!(
@@ -1083,6 +1097,32 @@ fn test_state_clear_marker_all(repo: TestRepo) {
         .run()
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "");
+}
+
+/// A var named `marker` lives at `worktrunk.state.<branch>.vars.marker`, which
+/// the marker key pattern also matches. Clearing all markers must leave it,
+/// while still clearing the marker of a branch whose name ends in `.vars`.
+#[rstest]
+fn test_state_clear_marker_all_keeps_var_named_marker(repo: TestRepo) {
+    repo.set_marker("feature", "🔧");
+    repo.set_marker("topic.vars", "🚧");
+    repo.git_command()
+        .args(["config", "worktrunk.state.main.vars.marker", "hello"])
+        .run()
+        .unwrap();
+
+    let output = wt_state_cmd(&repo, "marker", "clear", &["--all"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_snapshot!(String::from_utf8_lossy(&output.stderr), @"[32m✓[39m [32mCleared [1m2[22m markers[39m");
+
+    let output = repo
+        .git_command()
+        .args(["config", "--get", "worktrunk.state.main.vars.marker"])
+        .run()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hello");
 }
 
 #[rstest]
@@ -1392,9 +1432,7 @@ fn test_state_clear_logs_single_file(repo: TestRepo) {
 // ============================================================================
 
 fn wt_state_clear_all_cmd(repo: &TestRepo) -> std::process::Command {
-    let mut cmd = wt_command();
-    cmd.current_dir(repo.root_path());
-    cmd.env("CLICOLOR_FORCE", "1");
+    let mut cmd = repo.wt_command();
     // `clear` prompts before removing markers/vars; `--yes` skips it so these
     // tests exercise the clearing itself. The prompt path has its own tests.
     cmd.args(["config", "state", "clear", "--yes"]);
@@ -1546,9 +1584,7 @@ fn test_state_clear_all_nothing_to_clear(repo: TestRepo) {
 /// Run `wt config state clear` (no `--yes`) with the given stdin, so the
 /// confirmation prompt reads `input`.
 fn clear_all_with_stdin(repo: &TestRepo, input: &str) -> std::process::Output {
-    let mut cmd = wt_command();
-    cmd.current_dir(repo.root_path());
-    cmd.env("CLICOLOR_FORCE", "1");
+    let mut cmd = repo.wt_command();
     cmd.args(["config", "state", "clear"]);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
@@ -1572,9 +1608,7 @@ fn test_state_clear_all_prompt_declines(repo: TestRepo) {
         .run()
         .unwrap();
 
-    let mut cmd = wt_command();
-    cmd.current_dir(repo.root_path());
-    cmd.env("CLICOLOR_FORCE", "1");
+    let mut cmd = repo.wt_command();
     cmd.args(["config", "state", "clear"]);
     cmd.stdin(Stdio::null());
     let output = cmd.output().unwrap();
@@ -1658,12 +1692,12 @@ fn test_state_cache_get_json_empty(repo: TestRepo) {
     assert!(output.status.success());
     assert_snapshot!(String::from_utf8_lossy(&output.stdout), @r#"
     {
-      "ci_status": [],
-      "git_commands_cache": 0,
-      "hints": [],
-      "max_pr_number": null,
       "previous_branch": null,
-      "summaries": []
+      "ci_status": [],
+      "max_pr_number": null,
+      "summaries": [],
+      "git_commands_cache": 0,
+      "hints": []
     }
     "#);
 }
@@ -1703,12 +1737,12 @@ fn test_state_cache_pr_number_ratchet(repo: TestRepo) {
     assert!(output.status.success());
     assert_snapshot!(String::from_utf8_lossy(&output.stdout), @r#"
     {
-      "ci_status": [],
-      "git_commands_cache": 0,
-      "hints": [],
-      "max_pr_number": 3035,
       "previous_branch": null,
-      "summaries": []
+      "ci_status": [],
+      "max_pr_number": 3035,
+      "summaries": [],
+      "git_commands_cache": 0,
+      "hints": []
     }
     "#);
 
@@ -2043,20 +2077,20 @@ fn test_state_get_json_empty(repo: TestRepo) {
     assert!(output.status.success());
     assert_snapshot!(String::from_utf8_lossy(&output.stdout), @r#"
     {
-      "ci_status": [],
-      "command_log": [],
       "default_branch": null,
-      "diagnostic": [],
-      "git_commands_cache": 0,
-      "hints": [],
-      "hook_output": [],
-      "markers": [],
-      "max_pr_number": null,
-      "previous_branch": null,
       "remote_head_branch": null,
+      "previous_branch": null,
+      "markers": [],
+      "ci_status": [],
+      "max_pr_number": null,
       "summaries": [],
-      "trash": [],
-      "vars": []
+      "git_commands_cache": 0,
+      "vars": [],
+      "command_log": [],
+      "hook_output": [],
+      "diagnostic": [],
+      "hints": [],
+      "trash": []
     }
     "#);
 }
@@ -2126,20 +2160,9 @@ fn test_state_get_json_comprehensive(repo: TestRepo) {
     settings.bind(|| {
         assert_snapshot!(normalized, @r#"
         {
-          "ci_status": [
-            {
-              "branch": "feature",
-              "checked_at": 1735776000,
-              "head": "abc12345def67890",
-              "status": "passed"
-            }
-          ],
-          "command_log": [],
           "default_branch": "main",
-          "diagnostic": [],
-          "git_commands_cache": 1,
-          "hints": [],
-          "hook_output": [],
+          "remote_head_branch": null,
+          "previous_branch": "feature",
           "markers": [
             {
               "branch": "feature",
@@ -2147,28 +2170,39 @@ fn test_state_get_json_comprehensive(repo: TestRepo) {
               "set_at": 1735776000
             }
           ],
+          "ci_status": [
+            {
+              "branch": "feature",
+              "status": "passed",
+              "checked_at": 1735776000,
+              "head": "abc12345def67890"
+            }
+          ],
           "max_pr_number": null,
-          "previous_branch": "feature",
-          "remote_head_branch": null,
           "summaries": [
             {
               "branch": "feature",
-              "generated_at": 1735776000,
-              "summary": "Add constant-time token validation"
+              "summary": "Add constant-time token validation",
+              "generated_at": 1735776000
             }
           ],
-          "trash": [
-            {
-              "modified_at": "<MTIME>",
-              "name": "myproject.feature-1234567890",
-              "path": "_REPO_/.git/wt/trash/myproject.feature-1234567890"
-            }
-          ],
+          "git_commands_cache": 1,
           "vars": [
             {
               "branch": "main",
               "key": "env",
               "value": "staging"
+            }
+          ],
+          "command_log": [],
+          "hook_output": [],
+          "diagnostic": [],
+          "hints": [],
+          "trash": [
+            {
+              "name": "myproject.feature-1234567890",
+              "path": "_REPO_/.git/wt/trash/myproject.feature-1234567890",
+              "modified_at": "<MTIME>"
             }
           ]
         }
@@ -2178,7 +2212,9 @@ fn test_state_get_json_comprehensive(repo: TestRepo) {
 
 #[rstest]
 fn test_state_get_json_with_logs(repo: TestRepo) {
-    // Create hook output and command log files
+    // Create hook output and command log files. `feature` exists, so its log
+    // reports the branch; `bugfix` stands for a deleted branch (`branch: null`).
+    repo.run_git(&["branch", "feature"]);
     let git_dir = repo.root_path().join(".git");
     let log_dir = git_dir.join("wt/logs");
     std::fs::create_dir_all(&log_dir).unwrap();
@@ -2214,48 +2250,48 @@ fn test_state_get_json_with_logs(repo: TestRepo) {
     settings.bind(|| {
         assert_snapshot!(normalized, @r#"
         {
+          "default_branch": null,
+          "remote_head_branch": null,
+          "previous_branch": null,
+          "markers": [],
           "ci_status": [],
+          "max_pr_number": null,
+          "summaries": [],
+          "git_commands_cache": 0,
+          "vars": [],
           "command_log": [
             {
               "file": "commands.jsonl",
-              "modified_at": "<MTIME>",
               "path": "_REPO_/.git/wt/logs/commands.jsonl",
-              "size": "<SIZE>"
+              "size": "<SIZE>",
+              "modified_at": "<MTIME>"
             }
           ],
-          "default_branch": null,
-          "diagnostic": [],
-          "git_commands_cache": 0,
-          "hints": [],
           "hook_output": [
             {
-              "branch": "bugfix",
               "file": "bugfix/internal/remove.log",
-              "hook_type": null,
-              "modified_at": "<MTIME>",
-              "name": "remove",
               "path": "_REPO_/.git/wt/logs/bugfix/internal/remove.log",
               "size": "<SIZE>",
-              "source": "internal"
+              "modified_at": "<MTIME>",
+              "branch": null,
+              "source": "internal",
+              "hook_type": null,
+              "name": "remove"
             },
             {
-              "branch": "feature",
               "file": "feature/user/post-start/npm.log",
-              "hook_type": "post-start",
-              "modified_at": "<MTIME>",
-              "name": "npm",
               "path": "_REPO_/.git/wt/logs/feature/user/post-start/npm.log",
               "size": "<SIZE>",
-              "source": "user"
+              "modified_at": "<MTIME>",
+              "branch": "feature",
+              "source": "user",
+              "hook_type": "post-start",
+              "name": "npm"
             }
           ],
-          "markers": [],
-          "max_pr_number": null,
-          "previous_branch": null,
-          "remote_head_branch": null,
-          "summaries": [],
-          "trash": [],
-          "vars": []
+          "diagnostic": [],
+          "hints": [],
+          "trash": []
         }
         "#);
     });
@@ -2579,6 +2615,24 @@ fn test_vars_set_and_get(repo: TestRepo) {
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "staging");
 }
 
+/// Without `--branch`, state commands act on `@`. In a detached worktree that
+/// refuses without naming the worktree, since it's the one the user is in.
+#[rstest]
+fn test_vars_set_in_detached_worktree(mut repo: TestRepo) {
+    let worktree = repo.add_worktree("feature");
+    repo.detach_head_in_worktree("feature");
+
+    let output = wt_state_cmd(&repo, "vars", "set", &["env=staging"])
+        .current_dir(&worktree)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_snapshot!(String::from_utf8_lossy(&output.stderr), @"
+    [31m✗[39m [31mCannot set variable: not on a branch (detached HEAD)[39m
+    [2m↳[22m [2mTo switch to a branch, run [4mgit switch <branch>[24m[22m
+    ");
+}
+
 #[rstest]
 fn test_vars_set_json_value(repo: TestRepo) {
     let json = r#"{"port":3000,"debug":true}"#;
@@ -2592,6 +2646,42 @@ fn test_vars_set_json_value(repo: TestRepo) {
         .unwrap();
     assert!(output.status.success());
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), json);
+}
+
+#[rstest]
+fn test_vars_list_json_preserves_multiline_value(repo: TestRepo) {
+    let value = "line one\nline two";
+    let output = wt_state_cmd(&repo, "vars", "set", &[&format!("note={value}")])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let output = wt_state_cmd(&repo, "vars", "get", &["note"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "line one\nline two\n"
+    );
+
+    let output = wt_state_cmd(&repo, "vars", "list", &["--format=json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["note"], value);
+
+    let output = wt_state_cmd(&repo, "vars", "clear", &["--all"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let output = wt_state_cmd(&repo, "vars", "get", &["note"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
 }
 
 #[rstest]
@@ -2675,6 +2765,29 @@ fn test_vars_clear_all(repo: TestRepo) {
     // Verify all gone
     let output = wt_state_cmd(&repo, "vars", "list", &[]).output().unwrap();
     assert_snapshot!(String::from_utf8_lossy(&output.stderr), @"[2m○[22m No variables for [1mmain[22m");
+}
+
+#[rstest]
+fn test_vars_clear_all_clears_valueless_key(repo: TestRepo) {
+    let config_path = repo.root_path().join(".git/config");
+    let mut config = std::fs::OpenOptions::new()
+        .append(true)
+        .open(config_path)
+        .unwrap();
+    writeln!(config, "\n[worktrunk \"state.main.vars\"]\n\tflag").unwrap();
+    drop(config);
+
+    let output = wt_state_cmd(&repo, "vars", "clear", &["--all"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let output = repo
+        .git_command()
+        .args(["config", "--get", "worktrunk.state.main.vars.flag"])
+        .run()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
 }
 
 #[rstest]
@@ -2965,8 +3078,8 @@ fn test_logs_get_json_empty(repo: TestRepo) {
     assert_snapshot!(String::from_utf8_lossy(&output.stdout), @r#"
     {
       "command_log": [],
-      "diagnostic": [],
-      "hook_output": []
+      "hook_output": [],
+      "diagnostic": []
     }
     "#);
 }
@@ -2985,8 +3098,8 @@ fn test_logs_bare_format_json(repo: TestRepo) {
     assert_snapshot!(String::from_utf8_lossy(&output.stdout), @r#"
     {
       "command_log": [],
-      "diagnostic": [],
-      "hook_output": []
+      "hook_output": [],
+      "diagnostic": []
     }
     "#);
 }
@@ -3024,6 +3137,7 @@ fn test_logs_get_json_with_files(repo: TestRepo) {
 /// work the same as for user/project hooks.
 #[rstest]
 fn test_logs_get_json_internal_op_structure(repo: TestRepo) {
+    repo.run_git(&["branch", "feature"]);
     let log_dir = repo.root_path().join(".git/wt/logs");
     std::fs::create_dir_all(&log_dir).unwrap();
     write_log_at(
@@ -3043,7 +3157,54 @@ fn test_logs_get_json_internal_op_structure(repo: TestRepo) {
     assert_eq!(hook["source"], "internal");
     assert_eq!(hook["hook_type"], serde_json::Value::Null);
     assert_eq!(hook["name"], "remove");
-    assert!(hook["branch"].as_str().unwrap().starts_with("feature"));
+    assert_eq!(hook["branch"], "feature");
+}
+
+/// `branch` is the real branch name, not the sanitized log directory, so
+/// `select(.branch == "feature/x")` matches exactly. A directory no local
+/// branch maps to — a deleted branch, or one two branches share — is `null`.
+#[rstest]
+fn test_logs_get_json_branch_is_unsanitized(repo: TestRepo) {
+    let feature_dir = sanitize_for_filename("feature/x");
+    let shared_dir = sanitize_for_filename("shared/x");
+    for branch in ["feature/x", "shared/x", shared_dir.as_str()] {
+        repo.run_git(&["branch", branch]);
+    }
+    let log_dir = repo.root_path().join(".git/wt/logs");
+    for branch in ["main", "feature/x", "shared/x", "gone/x"] {
+        write_log_at(
+            &log_dir,
+            &hook_log_rel_path(branch, "user", "post-start", "server"),
+            "output",
+        );
+    }
+
+    let output = wt_state_cmd(&repo, "logs", "get", &["--format=json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let mut branches: Vec<(String, serde_json::Value)> = parsed["hook_output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| {
+            let dir = h["file"].as_str().unwrap().split('/').next().unwrap();
+            (dir.to_string(), h["branch"].clone())
+        })
+        .collect();
+    branches.sort_by(|a, b| a.0.cmp(&b.0));
+    let gone_dir = sanitize_for_filename("gone/x");
+    let mut expected = vec![
+        (feature_dir, serde_json::json!("feature/x")),
+        (gone_dir, serde_json::Value::Null),
+        ("main".to_string(), serde_json::json!("main")),
+        (shared_dir, serde_json::Value::Null),
+    ];
+    expected.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(branches, expected);
 }
 
 /// Repo-wide internal logs are top-level shared files, not branch subtrees.
@@ -3342,4 +3503,31 @@ fn state_branch_flag_resolves_selectors(mut repo: TestRepo) {
         "the marker set via @ should read back via the worktree's path: {}",
         String::from_utf8_lossy(&get.stderr)
     );
+}
+
+/// A key with repeated Git config entries must actually disappear after clear.
+#[rstest]
+#[case("example")]
+#[case("--all")]
+fn test_vars_clear_removes_repeated_values(repo: TestRepo, #[case] argument: &str) {
+    let key = "worktrunk.state.main.vars.example";
+    for value in ["first", "second"] {
+        let output = repo
+            .git_command()
+            .args(["config", "--add", key, value])
+            .run()
+            .unwrap();
+        assert!(output.status.success());
+    }
+    let output = wt_state_cmd(&repo, "vars", "clear", &[argument])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let remaining = repo
+        .git_command()
+        .args(["config", "--get-all", key])
+        .run()
+        .unwrap();
+    assert_eq!(remaining.status.code(), Some(1), "{remaining:?}");
+    assert!(remaining.stdout.is_empty());
 }

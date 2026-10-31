@@ -74,8 +74,9 @@ const FIELD_SEP: char = '\0';
 ///
 /// Fields, in order: short name, object SHA, committer Unix timestamp,
 /// upstream short name (empty if none), upstream track (`[gone]` if the
-/// configured upstream no longer exists on the remote).
-const LOCAL_BRANCH_FORMAT: &str = "--format=%(refname:lstrip=2)%00%(objectname)%00%(committerdate:unix)%00%(upstream:short)%00%(upstream:track)";
+/// configured upstream no longer exists on the remote), push remote (a remote
+/// name or URL; empty if none), upstream remote (empty if none).
+const LOCAL_BRANCH_FORMAT: &str = "--format=%(refname:lstrip=2)%00%(objectname)%00%(committerdate:unix)%00%(upstream:short)%00%(upstream:track)%00%(push:remotename)%00%(upstream:remotename)";
 
 /// Format string for the remote-branch scan.
 ///
@@ -90,16 +91,15 @@ impl Repository {
     /// Accepts any valid commit-ish: branch names, tags, HEAD, commit SHAs,
     /// and relative refs like HEAD~2.
     pub fn ref_exists(&self, reference: &str) -> anyhow::Result<bool> {
-        // Use rev-parse to check if the reference resolves to a valid commit
-        // The ^{commit} suffix ensures we get the commit object, not a tag
-        Ok(self
-            .run_command(&[
-                "rev-parse",
-                "--verify",
-                "--end-of-options",
-                &format!("{}^{{commit}}", reference),
-            ])
-            .is_ok())
+        // Quiet verification uses status 1 for a missing commit-ish. Other
+        // failures, including native interruption, are not evidence of absence.
+        self.run_command_check(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            &format!("{reference}^{{commit}}"),
+        ])
     }
 
     /// Access the local-branch inventory, scanning on first call.
@@ -109,8 +109,9 @@ impl Repository {
     /// this `Repository` instance (shared across clones via `Arc`).
     ///
     /// `commit_sha` on each entry is a snapshot at scan time. Code that
-    /// needs a current SHA for a ref must resolve through a `RefSnapshot`
-    /// captured at the moment of read, not through this inventory. The
+    /// needs a current SHA for a ref must resolve through
+    /// [`Repository::capture_refs`] at the moment of read, not through this
+    /// inventory or a snapshot built from it. The
     /// inventory itself is used for branch listing and upstream-tracking
     /// metadata, stable for the duration of a command that runs no hook.
     /// A hook runs inside the command, so one that touches refs leaves the
@@ -193,8 +194,8 @@ impl Repository {
     /// (first-scan-wins cell vs. fresh snapshot).
     ///
     /// `commit_sha` is a snapshot at scan time — callers that need a
-    /// current SHA must resolve through a [`crate::git::RefSnapshot`]
-    /// captured at the moment of the read, not through this list.
+    /// current SHA must resolve through [`Repository::capture_refs`] at the
+    /// moment of the read, not through this list.
     pub(super) fn scan_local_branch_records(&self) -> anyhow::Result<Vec<LocalBranch>> {
         let output = self.run_command(&["for-each-ref", LOCAL_BRANCH_FORMAT, "refs/heads/"])?;
         let mut branches: Vec<LocalBranch> =
@@ -206,12 +207,13 @@ impl Repository {
     /// One `for-each-ref refs/remotes/` scan, parsed (excluding
     /// `<remote>/HEAD` symrefs) and sorted by committer timestamp. The
     /// shared scan primitive behind both [`remote_branches`](Self::remote_branches)
-    /// and the snapshot path. No cache side-effect.
+    /// and the snapshot path. Does not populate the remote-branch cache.
     pub(super) fn scan_remote_branch_records(&self) -> anyhow::Result<Vec<RemoteBranch>> {
         let output = self.run_command(&["for-each-ref", REMOTE_BRANCH_FORMAT, "refs/remotes/"])?;
+        let remotes = self.all_remote_urls();
         let mut branches: Vec<RemoteBranch> = output
             .lines()
-            .filter_map(parse_remote_branch_line)
+            .filter_map(|line| parse_remote_branch_line(line, &remotes))
             .collect();
         branches.sort_by_key(|b| std::cmp::Reverse(b.committer_ts));
         Ok(branches)
@@ -389,26 +391,32 @@ fn parse_local_branch_line(line: &str) -> Option<LocalBranch> {
     } else {
         Some(upstream_short_raw.to_string())
     };
+    let push_remote = Some(parts.next()?)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let upstream_remote = Some(parts.next()?)
+        .filter(|s| !s.is_empty() && *s != ".")
+        .map(str::to_string);
     Some(LocalBranch {
         name,
         commit_sha,
         committer_ts,
         upstream_short,
+        upstream_remote,
+        push_remote,
     })
 }
 
 /// Parse one record from the remote-branch scan.
 ///
-/// Skips `<remote>/HEAD` symrefs — they duplicate another ref and would
+/// Skips `<remote>/HEAD` symrefs, which duplicate another ref and would
 /// confuse callers that key by local name.
-fn parse_remote_branch_line(line: &str) -> Option<RemoteBranch> {
+fn parse_remote_branch_line(line: &str, remotes: &[(String, String)]) -> Option<RemoteBranch> {
     let mut parts = line.split(FIELD_SEP);
     let short_name = parts.next()?;
     let commit_sha = parts.next()?.to_string();
     let committer_ts: i64 = parts.next()?.parse().ok()?;
-
-    // `<remote>/HEAD` is a symref to the remote's default branch; skip it.
-    let (remote_name, local_name) = short_name.split_once('/')?;
+    let (remote_name, local_name) = super::remotes::split_remote_branch_name(short_name, remotes)?;
     if local_name == "HEAD" {
         return None;
     }

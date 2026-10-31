@@ -56,33 +56,24 @@ use crate::output;
 
 /// Single-character thread label (e.g. `a`, `b`, …, `A`, …) used to group
 /// concurrent records by thread in stderr / trace.log output.
+///
+/// Shares [`thread_id`]'s parse rather than repeating it, so the test that
+/// pins that parse covers this label too.
 fn thread_label() -> char {
-    let thread_id = format!("{:?}", std::thread::current().id());
-    let parsed = thread_id
-        .strip_prefix("ThreadId(")
-        .and_then(|s| s.strip_suffix(")"))
-        .and_then(|s| s.parse::<usize>().ok());
-    label_for_thread_index(parsed)
+    label_for_thread_index(thread_id())
 }
 
-/// Pure helper: map a parsed `ThreadId` number to a single-char label.
+/// Pure helper: map a thread id to a single-char label.
 ///
-/// `n == 0` → `'0'`; `1..=26` → `'a'..='z'`; `27..=52` → `'A'..='Z'`;
-/// everything else (including a `None` from a `ThreadId` whose `Debug`
-/// shape we don't recognize) → `'?'`. Tested via the branch coverage
-/// below — `thread_label` itself never sees `n == 0` or `n > 52` in
-/// practice, so its `unwrap_or` chain stays exercised only through
-/// `label_for_thread_index`.
-fn label_for_thread_index(n: Option<usize>) -> char {
-    let Some(n) = n else { return '?' };
-    if n == 0 {
-        '0'
-    } else if n <= 26 {
-        char::from(b'a' + (n - 1) as u8)
-    } else if n <= 52 {
-        char::from(b'A' + (n - 27) as u8)
-    } else {
-        '?'
+/// `1..=26` → `'a'..='z'`; `27..=52` → `'A'..='Z'`; everything else → `'?'`,
+/// including the `0` [`thread_id`] falls back to when `ThreadId`'s `Debug`
+/// shape stops matching. Tested via the branch coverage below —
+/// `thread_label` itself never sees `n == 0` or `n > 52` in practice.
+fn label_for_thread_index(n: u64) -> char {
+    match n {
+        1..=26 => char::from(b'a' + (n - 1) as u8),
+        27..=52 => char::from(b'A' + (n - 27) as u8),
+        _ => '?',
     }
 }
 
@@ -382,8 +373,8 @@ impl tracing::field::Visit for JsonFieldVisitor {
 /// `ts`/`tid` from the runtime *only if the event did not carry them* (a
 /// `[wt-trace]` record sets its own, captured at the precise event moment; a
 /// bridged `log::*` line carries neither, so it gets the emission-time values),
-/// and stamps the metadata `level`. Field order is serde_json's default
-/// (sorted) -- irrelevant to a machine reader.
+/// and stamps the metadata `level`. Fields retain insertion order, which is
+/// irrelevant to a machine reader.
 fn event_json(event: &Event<'_>) -> String {
     let mut visitor = JsonFieldVisitor::default();
     event.record(&mut visitor);
@@ -501,10 +492,8 @@ pub(crate) fn init(verbose_level: u8) {
     // gate `log_enabled!` checks before a `log::*` record evaluates its
     // format args. Worktrunk's own emit sites are native `tracing::*`, gated
     // by the global level hint the layer filters now expose (see
-    // `target_filter`), so this cap is specifically for the two `log`-API
-    // consumers that hint can't reach: the `log::*` records forwarded from
-    // dependencies, and the `log::log_enabled!` deep-logging guard in
-    // `shell_exec::log_output`.
+    // `target_filter`), so this cap governs `log::*` records forwarded from
+    // dependencies.
     //
     // Mirror the env-wins-when-set semantics the layer filters use (PR #2901):
     // if `RUST_LOG` is set, its level wins; otherwise the verbosity flag
@@ -684,7 +673,8 @@ where
 }
 
 /// `subprocess.log` layer: only `SUBPROCESS_FULL_TARGET` records (raw bodies
-/// and their `$ cmd … seq=N` headers), written through verbatim.
+/// and their `$ cmd … seq=N` headers), written through verbatim. The Debug
+/// baseline and `RUST_LOG` overrides match the trace file layers.
 fn build_subprocess_layer<S>(verbose_level: u8) -> Option<impl Layer<S>>
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
@@ -692,12 +682,15 @@ where
     if verbose_level < 2 || !log_files::SUBPROCESS.is_active() {
         return None;
     }
+    let env_filter = EnvFilter::builder()
+        .with_default_directive(LevelFilter::DEBUG.into())
+        .from_env_lossy();
     let only_full = target_filter(|meta| meta.target() == SUBPROCESS_FULL_TARGET);
     let layer = tracing_subscriber::fmt::layer()
         .with_writer(SubprocessMakeWriter)
         .with_ansi(false)
         .event_format(SubprocessFileFormat)
-        .with_filter(only_full);
+        .with_filter(env_filter.and(only_full));
     Some(layer)
 }
 
@@ -780,17 +773,17 @@ mod tests {
     /// hands it `n == 0` or `n > 52` in practice (Rust's `ThreadId`
     /// numbering starts at 1 and the main process won't spawn 53+ threads
     /// during the lifetime of the logger), but the branches are there for
-    /// the day either invariant changes.
+    /// the day either invariant changes. `0` is `thread_id`'s parse
+    /// fallback, so it labels like any other unrecognized id.
     #[test]
     fn label_covers_each_branch() {
-        assert_eq!(label_for_thread_index(None), '?');
-        assert_eq!(label_for_thread_index(Some(0)), '0');
-        assert_eq!(label_for_thread_index(Some(1)), 'a');
-        assert_eq!(label_for_thread_index(Some(26)), 'z');
-        assert_eq!(label_for_thread_index(Some(27)), 'A');
-        assert_eq!(label_for_thread_index(Some(52)), 'Z');
-        assert_eq!(label_for_thread_index(Some(53)), '?');
-        assert_eq!(label_for_thread_index(Some(9999)), '?');
+        assert_eq!(label_for_thread_index(0), '?');
+        assert_eq!(label_for_thread_index(1), 'a');
+        assert_eq!(label_for_thread_index(26), 'z');
+        assert_eq!(label_for_thread_index(27), 'A');
+        assert_eq!(label_for_thread_index(52), 'Z');
+        assert_eq!(label_for_thread_index(53), '?');
+        assert_eq!(label_for_thread_index(9999), '?');
     }
 
     /// Each shape `StderrFormat` recognises — verified ANSI-stripped so
@@ -975,7 +968,7 @@ mod tests {
     /// `event_json` serializes whatever typed fields an event carries, then
     /// stamps `level` and fills `ts`/`tid` only when the event omitted them.
     /// Drives real events through a capture layer (the only way to obtain a
-    /// `tracing::Event`). Keys land in serde_json's sorted order.
+    /// `tracing::Event`). Keys retain insertion order.
     #[test]
     fn event_json_serializes_structured_and_freeform_events() {
         use std::sync::{Arc, Mutex};
@@ -1024,10 +1017,20 @@ mod tests {
         });
         let lines = lines.lock().unwrap();
 
-        // Structured record: rich, keys sorted, `level` stamped, ts/tid kept.
+        // Structured record: rich, `level` stamped, ts/tid kept.
         assert_eq!(
-            lines[0],
-            r#"{"cmd":"git status","context":"worktree","dur_us":12300,"kind":"cmd_completed","level":"debug","ok":true,"seq":1,"tid":3,"ts":100}"#
+            serde_json::from_str::<serde_json::Value>(&lines[0]).expect("valid JSON"),
+            serde_json::json!({
+                "cmd": "git status",
+                "context": "worktree",
+                "dur_us": 12300,
+                "kind": "cmd_completed",
+                "level": "debug",
+                "ok": true,
+                "seq": 1,
+                "tid": 3,
+                "ts": 100,
+            })
         );
 
         // Embedded quote round-trips losslessly.

@@ -154,6 +154,58 @@ fn test_configure_shell_rejects_unsafe_cmd_without_modifying_rc(
     assert_eq!(fs::read_to_string(&zshrc_path).unwrap(), original);
 }
 
+/// An rc path that can't be read as a file fails installation with the read
+/// error and leaves the path untouched.
+#[rstest]
+fn test_configure_shell_bashrc_directory_fails(repo: TestRepo, temp_home: TempDir) {
+    let bashrc = temp_home.path().join(".bashrc");
+    fs::create_dir(&bashrc).unwrap();
+
+    let mut cmd = wt_command();
+    repo.configure_wt_cmd(&mut cmd);
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.args(["config", "shell", "install", "bash", "--yes"])
+        .current_dir(repo.root_path());
+    let output = cmd.output().unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("Failed to configure bash: Failed to read"),
+        "{stderr}"
+    );
+    assert!(bashrc.is_dir());
+}
+
+#[rstest]
+fn test_configure_shell_continues_after_invalid_bashrc(repo: TestRepo, temp_home: TempDir) {
+    let bashrc = temp_home.path().join(".bashrc");
+    let zshrc = temp_home.path().join(".zshrc");
+    let utf16_bashrc = b"\xff\xfe#\0 \0t\0e\0s\0t\0\n\0";
+    fs::write(&bashrc, utf16_bashrc).unwrap();
+    fs::write(&zshrc, "# zsh config\n").unwrap();
+
+    let mut cmd = wt_command();
+    repo.configure_wt_cmd(&mut cmd);
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.env("SHELL", "/bin/zsh");
+    cmd.args(["config", "shell", "install", "--yes"])
+        .current_dir(repo.root_path());
+    let output = cmd.output().unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("Failed to configure bash"), "{stderr}");
+    assert!(stderr.contains("not UTF-8 (looks like UTF-16)"), "{stderr}");
+    assert!(stderr.contains("Configured 1 shell"), "{stderr}");
+    assert!(
+        fs::read_to_string(&zshrc)
+            .unwrap()
+            .contains("config shell init zsh")
+    );
+    assert_eq!(fs::read(&bashrc).unwrap(), utf16_bashrc);
+}
+
 #[rstest]
 fn test_configure_shell_already_exists(repo: TestRepo, temp_home: TempDir) {
     // Create a fake .zshrc file with the line already present
@@ -1118,6 +1170,7 @@ fn test_powershell_skipped_when_installed_no_profile(repo: TestRepo, temp_home: 
         let mut cmd = wt_command();
         repo.configure_wt_cmd(&mut cmd);
         set_temp_home_env(&mut cmd, temp_home.path());
+        mock_pwsh_reporting_conventional_profile(&mut cmd, &temp_home);
         cmd.env("SHELL", "/bin/zsh");
         cmd.env("WORKTRUNK_TEST_POWERSHELL_INSTALLED", "1");
         cmd.arg("config")
@@ -1543,7 +1596,11 @@ fn test_install_uninstall_roundtrip(repo: TestRepo, temp_home: TempDir) {
 }
 
 #[rstest]
-fn test_uninstall_scan_removes_all_worktrunk_zsh_lines(repo: TestRepo, temp_home: TempDir) {
+fn test_uninstall_scan_removes_all_worktrunk_zsh_lines(
+    repo: TestRepo,
+    temp_home: TempDir,
+    #[values("git-wt", "git-wt.exe")] command_name: &str,
+) {
     let zshrc_path = temp_home.path().join(".zshrc");
     fs::write(
         &zshrc_path,
@@ -1558,7 +1615,13 @@ fn test_uninstall_scan_removes_all_worktrunk_zsh_lines(repo: TestRepo, temp_home
     install_cmd.env("WORKTRUNK_TEST_COMPINIT_CONFIGURED", "1");
     install_cmd
         .args([
-            "config", "shell", "install", "zsh", "--yes", "--cmd", "git-wt",
+            "config",
+            "shell",
+            "install",
+            "zsh",
+            "--yes",
+            "--cmd",
+            command_name,
         ])
         .current_dir(repo.root_path());
 
@@ -1569,7 +1632,9 @@ fn test_uninstall_scan_removes_all_worktrunk_zsh_lines(repo: TestRepo, temp_home
         String::from_utf8_lossy(&install_output.stderr)
     );
     let installed = fs::read_to_string(&zshrc_path).unwrap();
-    assert!(installed.contains("git-wt config shell init zsh"));
+    assert!(installed.contains(&format!("{command_name} config shell init zsh")));
+    assert!(install_cmd.output().unwrap().status.success());
+    assert_eq!(fs::read_to_string(&zshrc_path).unwrap(), installed);
 
     // A hand-written line in the `git wt` dispatch form, which install never
     // emits: uninstall recognizes worktrunk's integration by whatever name it
@@ -1597,7 +1662,7 @@ fn test_uninstall_scan_removes_all_worktrunk_zsh_lines(repo: TestRepo, temp_home
 
     let content = fs::read_to_string(&zshrc_path).unwrap();
     assert!(
-        !content.contains("git-wt config shell init zsh"),
+        !content.contains(&format!("{command_name} config shell init zsh")),
         "Custom command integration should be removed"
     );
     assert!(
@@ -1618,11 +1683,12 @@ fn test_uninstall_preserves_user_lines_quoting_the_init_command(
     repo: TestRepo,
     temp_home: TempDir,
 ) {
-    // Each survivor puts `wt config shell init` in argument position while an
-    // exec keyword sits elsewhere on the line — the shape that makes the
-    // whole-line execution-context check alone insufficient.
+    // Mentioning or wrapping an init invocation does not make the user's
+    // entire statement Worktrunk-owned.
     let survivors = [
         r#"alias setup='echo "run: wt config shell init fish | source"'"#,
+        r#"alias setup='eval "$(wt config shell init zsh)"'"#,
+        r#"eval "$(wt config shell init zsh)"; echo keep-me"#,
         r#"echo "wt config shell init bash | source""#,
     ];
     let zshrc_path = temp_home.path().join(".zshrc");
@@ -1764,6 +1830,7 @@ fn test_uninstall_shell_powershell_removes_integration_line(repo: TestRepo, temp
     let mut cmd = wt_command();
     repo.configure_wt_cmd(&mut cmd);
     set_temp_home_env(&mut cmd, temp_home.path());
+    mock_pwsh_reporting_conventional_profile(&mut cmd, &temp_home);
     cmd.args(["config", "shell", "uninstall", "powershell", "--yes"])
         .current_dir(repo.root_path());
 
@@ -1782,6 +1849,231 @@ fn test_uninstall_shell_powershell_removes_integration_line(repo: TestRepo, temp
     );
     assert!(content.contains("# my profile"));
     assert!(content.contains("Set-Alias ll Get-ChildItem"));
+}
+
+/// Put a mock `pwsh` answering every query with `response` first on PATH.
+#[cfg(unix)]
+fn mock_pwsh(
+    cmd: &mut std::process::Command,
+    temp_home: &TempDir,
+    response: crate::common::mock_commands::MockResponse,
+) -> std::path::PathBuf {
+    let mock_bin = temp_home.path().join("mock-bin");
+    fs::create_dir_all(&mock_bin).unwrap();
+    crate::common::mock_commands::MockConfig::new("pwsh")
+        .command("_default", response)
+        .write(&mock_bin);
+    cmd.env("WORKTRUNK_TEST_MOCK_CONFIG_DIR", &mock_bin);
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![mock_bin.clone()];
+    paths.extend(std::env::split_paths(&path));
+    cmd.env("PATH", std::env::join_paths(paths).unwrap());
+    mock_bin
+}
+
+/// Put a mock `pwsh` on PATH that reports the conventional
+/// `~/.config/powershell` profile under the temp home, so a test doesn't depend
+/// on a real `pwsh` being installed.
+#[cfg(unix)]
+fn mock_pwsh_reporting_conventional_profile(cmd: &mut std::process::Command, temp_home: &TempDir) {
+    let profile =
+        canonical_temp_home(temp_home).join(".config/powershell/Microsoft.PowerShell_profile.ps1");
+    mock_pwsh(
+        cmd,
+        temp_home,
+        crate::common::mock_commands::MockResponse::output(&format!("{}\n", profile.display())),
+    );
+}
+
+/// The profile `pwsh` reports wins over `~/.config/powershell`: PowerShell
+/// honors `$XDG_CONFIG_HOME`, so install and uninstall both follow it.
+#[cfg(unix)]
+#[rstest]
+fn test_powershell_profile_follows_runtime(repo: TestRepo, temp_home: TempDir) {
+    let home = canonical_temp_home(&temp_home);
+    let profile = home.join("custom-config/powershell/Microsoft.PowerShell_profile.ps1");
+    let conventional = home.join(".config/powershell/Microsoft.PowerShell_profile.ps1");
+    let reported = format!("{}\n", profile.display());
+
+    let mut install = wt_command();
+    repo.configure_wt_cmd(&mut install);
+    set_temp_home_env(&mut install, temp_home.path());
+    mock_pwsh(
+        &mut install,
+        &temp_home,
+        crate::common::mock_commands::MockResponse::output(&reported),
+    );
+    install.env("WORKTRUNK_TEST_POWERSHELL_ENV", "1");
+    install
+        .args(["config", "shell", "install", "powershell", "--yes"])
+        .current_dir(repo.root_path());
+    let output = install.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let content = fs::read_to_string(&profile).unwrap();
+    assert!(
+        content.contains("wt config shell init powershell"),
+        "{content}"
+    );
+    assert!(!conventional.exists());
+
+    let mut uninstall = wt_command();
+    repo.configure_wt_cmd(&mut uninstall);
+    set_temp_home_env(&mut uninstall, temp_home.path());
+    mock_pwsh(
+        &mut uninstall,
+        &temp_home,
+        crate::common::mock_commands::MockResponse::output(&reported),
+    );
+    uninstall
+        .args(["config", "shell", "uninstall", "powershell", "--yes"])
+        .current_dir(repo.root_path());
+    let output = uninstall.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let content = fs::read_to_string(&profile).unwrap_or_default();
+    assert!(!content.contains("config shell init"), "{content}");
+}
+
+/// A `pwsh` that can't answer has no profile to integrate with, so install
+/// writes none rather than guessing the conventional one.
+#[cfg(unix)]
+#[rstest]
+fn test_powershell_profile_absent_when_runtime_fails(repo: TestRepo, temp_home: TempDir) {
+    let home = canonical_temp_home(&temp_home);
+    let mut cmd = wt_command();
+    repo.configure_wt_cmd(&mut cmd);
+    set_temp_home_env(&mut cmd, temp_home.path());
+    mock_pwsh(
+        &mut cmd,
+        &temp_home,
+        crate::common::mock_commands::MockResponse::exit(1),
+    );
+    cmd.env("WORKTRUNK_TEST_POWERSHELL_ENV", "1");
+    cmd.args(["config", "shell", "install", "powershell", "--yes"])
+        .current_dir(repo.root_path());
+    let output = cmd.output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && stderr.contains("No shell config files found"),
+        "{stderr}"
+    );
+    assert!(
+        !home
+            .join(".config/powershell/Microsoft.PowerShell_profile.ps1")
+            .exists()
+    );
+}
+
+/// SIGINT or SIGTERM while the profile query runs cancels install: wt
+/// neither writes the reported profile nor falls back to the conventional one.
+#[cfg(unix)]
+#[rstest]
+#[case::sigint(nix::sys::signal::Signal::SIGINT)]
+#[case::sigterm(nix::sys::signal::Signal::SIGTERM)]
+fn test_powershell_profile_query_cancellation_stops_install(
+    repo: TestRepo,
+    temp_home: TempDir,
+    #[case] signal: nix::sys::signal::Signal,
+) {
+    use crate::common::mock_commands::{MockResponse, mock_calls};
+    let home = canonical_temp_home(&temp_home);
+    let profile = home.join("custom-config/powershell/Microsoft.PowerShell_profile.ps1");
+    let log_dir = temp_home.path().join("calls");
+    fs::create_dir_all(&log_dir).unwrap();
+
+    let mut cmd = wt_command();
+    repo.configure_wt_cmd(&mut cmd);
+    set_temp_home_env(&mut cmd, temp_home.path());
+    let mock_bin = mock_pwsh(
+        &mut cmd,
+        &temp_home,
+        MockResponse::output(&format!("{}\n", profile.display())).wait_for_file("release"),
+    );
+    cmd.env("WORKTRUNK_TEST_MOCK_CALL_LOG_DIR", &log_dir);
+    cmd.env("WORKTRUNK_TEST_POWERSHELL_ENV", "1");
+    cmd.args(["config", "shell", "install", "powershell", "--yes"])
+        .current_dir(repo.root_path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let child = cmd.spawn().unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while mock_calls(&log_dir, "pwsh").is_empty() {
+        assert!(std::time::Instant::now() < deadline, "pwsh never queried");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(child.id() as i32), signal).unwrap();
+    fs::write(mock_bin.join("release"), "").unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        crate::common::shell_exit_code(&output.status),
+        Some(128 + signal as i32),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!profile.exists());
+    assert!(
+        !home
+            .join(".config/powershell/Microsoft.PowerShell_profile.ps1")
+            .exists()
+    );
+}
+
+/// A `pwsh` killed by INT/TERM while a descendant still holds its output
+/// pipes cancels install too, rather than reading as a timeout past the probe
+/// deadline and falling back to the conventional profile.
+#[cfg(unix)]
+#[rstest]
+#[case::sigint("INT", 130)]
+#[case::sigterm("TERM", 143)]
+fn test_powershell_profile_query_signal_with_pipe_holding_descendant(
+    repo: TestRepo,
+    temp_home: TempDir,
+    #[case] signal: &str,
+    #[case] exit_code: i32,
+) {
+    use std::os::unix::fs::PermissionsExt;
+    let home = canonical_temp_home(&temp_home);
+    let mock_bin = temp_home.path().join("mock-bin");
+    fs::create_dir_all(&mock_bin).unwrap();
+    let pwsh = mock_bin.join("pwsh");
+    fs::write(&pwsh, format!("#!/bin/sh\nsleep 60 &\nkill -{signal} $$\n")).unwrap();
+    fs::set_permissions(&pwsh, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cmd = wt_command();
+    repo.configure_wt_cmd(&mut cmd);
+    set_temp_home_env(&mut cmd, temp_home.path());
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![mock_bin];
+    paths.extend(std::env::split_paths(&path));
+    cmd.env("PATH", std::env::join_paths(paths).unwrap());
+    // Expire the probe before the descendant releases the pipes, yet late
+    // enough that the mock's `kill` lands first even under suite load.
+    cmd.env("WORKTRUNK_TEST_PROBE_TIMEOUT_MS", "5000");
+    cmd.env("WORKTRUNK_TEST_POWERSHELL_ENV", "1");
+    cmd.args(["config", "shell", "install", "powershell", "--yes"])
+        .current_dir(repo.root_path());
+    let output = cmd.output().unwrap();
+
+    assert_eq!(
+        crate::common::shell_exit_code(&output.status),
+        Some(exit_code),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !home
+            .join(".config/powershell/Microsoft.PowerShell_profile.ps1")
+            .exists()
+    );
 }
 
 #[rstest]
@@ -2942,6 +3234,8 @@ fn test_powershell_env_detection(repo: TestRepo, temp_home: TempDir) {
     let mut cmd = wt_command();
     repo.configure_wt_cmd(&mut cmd);
     set_temp_home_env(&mut cmd, temp_home.path());
+    #[cfg(unix)]
+    mock_pwsh_reporting_conventional_profile(&mut cmd, &temp_home);
     // Force PowerShell detection via test env var
     cmd.env("WORKTRUNK_TEST_POWERSHELL_ENV", "1");
     // Set SHELL to something non-PowerShell to ensure we're testing the override
@@ -3242,5 +3536,197 @@ fn test_nushell_install_target_is_a_vendor_autoload_dir(repo: TestRepo, temp_hom
         installed_in_autoload,
         "worktrunk must install wt.nu into one of nu's vendor-autoload dirs (issue #2878).\n\
          vendor-autoload-dirs:\n{dirs}"
+    );
+}
+
+/// A `ZDOTDIR` that isn't an absolute path is ignored, and the zsh integration
+/// line lands in `$HOME/.zshrc`.
+///
+/// Regression guard: the value used to be taken at face value, so an empty one
+/// collapsed zsh's config path to the relative `.zshrc` and a bare `dotfiles`
+/// to `dotfiles/.zshrc` — either way install appended the integration line
+/// under whatever directory `wt` was run from, a dotfiles checkout being the
+/// obvious way to have a `.zshrc` sitting there, while the file zsh reads went
+/// untouched. `wt config shell uninstall` rewrites rc files whole, so the same
+/// resolution decides which file that rewrite lands on.
+#[rstest]
+#[case::empty("")]
+#[case::relative("dotfiles")]
+fn test_configure_shell_non_absolute_zdotdir_uses_home(
+    #[case] zdotdir: &str,
+    repo: TestRepo,
+    temp_home: TempDir,
+) {
+    let home_zshrc = temp_home.path().join(".zshrc");
+    fs::write(&home_zshrc, "# Existing config\n").unwrap();
+
+    // A decoy `.zshrc` where the unguarded value would have resolved: under the
+    // invocation directory, joined with `ZDOTDIR` itself.
+    let run_dir = temp_home.path().join("work");
+    let decoy_zshrc = run_dir.join(zdotdir).join(".zshrc");
+    fs::create_dir_all(decoy_zshrc.parent().unwrap()).unwrap();
+    fs::write(&decoy_zshrc, "# Decoy\n").unwrap();
+
+    let mut cmd = wt_command();
+    repo.configure_wt_cmd(&mut cmd);
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.env("SHELL", "/bin/zsh");
+    cmd.env("ZDOTDIR", zdotdir);
+    cmd.env("WORKTRUNK_TEST_COMPINIT_CONFIGURED", "1");
+    cmd.args(["config", "shell", "install", "zsh", "--yes"]);
+    cmd.current_dir(&run_dir);
+
+    let output = cmd.output().expect("install command should run");
+    assert!(
+        output.status.success(),
+        "install failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let home_contents = fs::read_to_string(&home_zshrc).unwrap();
+    assert!(
+        home_contents.contains("config shell init zsh"),
+        "integration line should land in $HOME/.zshrc, got:\n{home_contents}"
+    );
+    assert_eq!(
+        fs::read_to_string(&decoy_zshrc).unwrap(),
+        "# Decoy\n",
+        "the .zshrc under the invocation directory must be left alone"
+    );
+}
+
+/// An absolute `ZDOTDIR` is honoured: the zsh integration line lands under it,
+/// not under `$HOME`.
+///
+/// The companion to the non-absolute cases above, and the one that makes them
+/// mean something. Every other zsh test points `ZDOTDIR` at `$HOME` itself or
+/// at `/dev/null` for shell isolation, so without this case a `zsh_config_dir`
+/// that ignored the variable outright — the over-tightening the guard invites
+/// — would pass the whole suite.
+#[rstest]
+fn test_configure_shell_absolute_zdotdir_is_honoured(repo: TestRepo, temp_home: TempDir) {
+    let home = canonical_temp_home(&temp_home);
+    // Distinct from `$HOME`, so only honouring `ZDOTDIR` reaches it.
+    let zdotdir = home.join("zsh-config");
+    fs::create_dir_all(&zdotdir).unwrap();
+    fs::write(zdotdir.join(".zshrc"), "# Existing config\n").unwrap();
+    // A decoy at the fallback, so the assertion separates the two answers.
+    fs::write(home.join(".zshrc"), "# Decoy\n").unwrap();
+
+    let mut cmd = wt_command();
+    repo.configure_wt_cmd(&mut cmd);
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.env("SHELL", "/bin/zsh");
+    cmd.env("ZDOTDIR", &zdotdir);
+    cmd.env("WORKTRUNK_TEST_COMPINIT_MISSING", "1");
+    cmd.args([
+        "config", "shell", "install", "zsh", "--yes", "--cmd", "git-wt",
+    ]);
+    cmd.current_dir(repo.root_path());
+
+    let output = cmd.output().expect("install command should run");
+    assert!(
+        output.status.success(),
+        "install failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    setup_home_snapshot_settings(&temp_home).bind(|| {
+        insta::assert_snapshot!(String::from_utf8_lossy(&output.stderr), @"
+        [32m✓[39m [32mAdded shell extension & completions for [1mzsh[22m @ [1m_PARENT_/zsh-config/.zshrc[22m[39m
+
+        [32m✓[39m [32mConfigured 1 shell[39m
+        [33m▲[39m [33mCompletions require compinit; add to _PARENT_/zsh-config/.zshrc before the git-wt line:[39m
+        [107m [0m [2m[0m[2m[34mautoload[0m[2m [0m[2m[36m-Uz[0m[2m compinit [0m[2m[36m&&[0m[2m [0m[2m[34mcompinit[0m
+        [2m↳[22m [2mRestart shell to activate shell integration[22m
+        ");
+    });
+
+    let zdotdir_contents = fs::read_to_string(zdotdir.join(".zshrc")).unwrap();
+    assert!(
+        zdotdir_contents.contains("config shell init zsh"),
+        "integration line should land in $ZDOTDIR/.zshrc, got:\n{zdotdir_contents}"
+    );
+    assert_eq!(
+        fs::read_to_string(home.join(".zshrc")).unwrap(),
+        "# Decoy\n",
+        "$HOME/.zshrc must be left alone when $ZDOTDIR is absolute"
+    );
+}
+
+/// A non-default `XDG_CONFIG_HOME` sends the fish wrapper and the fish
+/// completion to the same fish config directory.
+///
+/// Regression guard: `config_paths` hardcoded `~/.config/fish` while
+/// `completion_path` resolved the XDG config dir, so with the variable pointing
+/// anywhere else worktrunk wrote the wrapper where fish never looks and the
+/// completion where it does — install reported success for both and `wt` was
+/// never defined as a function.
+#[rstest]
+#[cfg(unix)]
+fn test_configure_shell_fish_honors_xdg_config_home(repo: TestRepo, temp_home: TempDir) {
+    let xdg_config = temp_home.path().join("xdg-config");
+    fs::create_dir_all(&xdg_config).unwrap();
+
+    let mut cmd = wt_command();
+    repo.configure_wt_cmd(&mut cmd);
+    set_temp_home_env(&mut cmd, temp_home.path());
+    // After `set_temp_home_env`, which pins the variable to `$HOME/.config` —
+    // the one value that makes the hardcode and the XDG lookup agree.
+    cmd.env("XDG_CONFIG_HOME", &xdg_config);
+    cmd.env("SHELL", "/bin/fish");
+    cmd.args(["config", "shell", "install", "fish", "--yes"])
+        .current_dir(repo.root_path());
+
+    let output = cmd.output().expect("install command should run");
+    assert!(
+        output.status.success(),
+        "install failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let wrapper = xdg_config.join("fish/functions/wt.fish");
+    let completion = xdg_config.join("fish/completions/wt.fish");
+    assert!(
+        wrapper.exists(),
+        "wrapper should land under $XDG_CONFIG_HOME: {wrapper:?}"
+    );
+    assert!(
+        completion.exists(),
+        "completion should land under $XDG_CONFIG_HOME: {completion:?}"
+    );
+    assert!(
+        !temp_home
+            .path()
+            .join(".config/fish/functions/wt.fish")
+            .exists(),
+        "nothing should be written to ~/.config/fish when $XDG_CONFIG_HOME points elsewhere"
+    );
+
+    // Uninstall scans the same directory install wrote to, so what install
+    // creates is what uninstall can remove.
+    let mut uninstall = wt_command();
+    repo.configure_wt_cmd(&mut uninstall);
+    set_temp_home_env(&mut uninstall, temp_home.path());
+    uninstall.env("XDG_CONFIG_HOME", &xdg_config);
+    uninstall.env("SHELL", "/bin/fish");
+    uninstall
+        .args(["config", "shell", "uninstall", "fish", "--yes"])
+        .current_dir(repo.root_path());
+
+    let output = uninstall.output().expect("uninstall command should run");
+    assert!(
+        output.status.success(),
+        "uninstall failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(!wrapper.exists(), "uninstall should remove {wrapper:?}");
+    assert!(
+        !completion.exists(),
+        "uninstall should remove {completion:?}"
     );
 }

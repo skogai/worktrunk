@@ -86,8 +86,8 @@
 //! ```bash
 //! RUST_LOG=debug ./target/release/wt -C <repo> switch \
 //!   2> >(cargo run -p wt-perf --release -q -- trace > trace.json)
-//! # Open trace.json in Perfetto, or run the phase-duration SQL query
-//! # documented in benches/CLAUDE.md §"What's on the critical path?".
+//! # Open trace.json in Perfetto; benches/AGENTS.md §"Analyzing a trace"
+//! # describes phase and subprocess attribution.
 //! ```
 
 mod items;
@@ -102,6 +102,8 @@ mod preview_orchestrator;
 mod progressive_handler;
 mod prs;
 mod summary;
+
+use crate::commands::command_executor::ForegroundStdin;
 
 use std::cell::RefCell;
 use std::io::IsTerminal;
@@ -129,7 +131,7 @@ use crate::output::print_json;
 use super::hook_plan::{ApprovedHookPlan, HookPlanBuilder};
 use super::hooks::HookAnnouncer;
 use super::list::collect;
-use super::list::model::{BranchScope, ListItem};
+use super::list::model::ListItem;
 use super::list::progressive::RenderTarget;
 use super::list::render::PLACEHOLDER;
 use super::repository_ext::{RemoveTarget, RepositoryCliExt};
@@ -387,17 +389,31 @@ impl AltXRemover {
                 handle_remove_output(
                     result,
                     RemovalExecution::Silent,
+                    ForegroundStdin::Closed,
                     &plan,
                     /* quiet */ true,
                     &mut announcer,
-                )?;
+                )
+                .map_err(|failure| failure.error)?;
                 announcer.flush()?;
             }
             RemovalPlan::BranchOnly {
                 branch_name,
                 deletion_mode,
+                prune_entry,
                 ..
             } => {
+                // The stale entry goes first, as `wt remove` does it: deleting
+                // the branch under a registration that still names it would
+                // leave an entry with an unborn `HEAD`, which `wt step prune`
+                // never collects. A failed prune keeps the branch, so the row
+                // is restored.
+                if let Some(path) = prune_entry
+                    && let Err(e) = repo.prune_worktree_entry(path)
+                {
+                    tracing::warn!(branch = %branch_name, error = %e, "picker: failed to prune stale worktree for '{branch_name}': {e:#}");
+                    return Ok(());
+                }
                 if !deletion_mode.should_keep() {
                     let default_branch = repo.default_branch();
                     let target = default_branch.as_deref().unwrap_or("HEAD");
@@ -824,7 +840,7 @@ fn build_morph_branch_row(
     default_branch: Option<&str>,
 ) -> (String, LocalContent) {
     let mut branch_item = worktree_item.clone();
-    branch_item.reclassify_as_branch(BranchScope::Local, branch.to_string());
+    branch_item.reclassify_as_branch(branch.to_string());
     branch_item.status_symbols = Default::default();
     branch_item.refresh_status_symbols(default_branch);
     let line = layout
@@ -1303,7 +1319,7 @@ impl CommandCollector for PickerCollector {
 /// `post-remove` anchor). The picker can't prompt mid-render, so it runs the
 /// removal's hooks only when they're already approved (e.g. from a prior
 /// `wt remove` / `wt merge`) and skips them otherwise — unapproved project
-/// commands must never run. See CLAUDE.md → "Project Commands Run Only After
+/// commands must never run. See AGENTS.md → "Project Commands Run Only After
 /// Approval".
 fn approved_removal_plan(
     repo: &Repository,
@@ -1315,7 +1331,7 @@ fn approved_removal_plan(
     // pipeline can be matched against approvals — `approve_readonly` then
     // drops them (fail-closed), rather than aborting the picker removal.
     let project_id = repo.project_identifier().ok();
-    let pid = project_id.as_deref();
+    let pid = project_id.as_ref();
     let user = repo.user_config();
     let project_config = repo.load_project_config()?;
 
@@ -1641,7 +1657,7 @@ pub fn handle_picker(
     let is_preview_bench = std::env::var_os("WORKTRUNK_PREVIEW_BENCH").is_some();
     let skip_tui = is_dry_run || is_preview_bench;
     if !skip_tui && !std::io::stdin().is_terminal() {
-        anyhow::bail!("Interactive picker requires an interactive terminal");
+        return Err(worktrunk::git::GitError::InteractivePickerRequiresTerminal.into());
     }
     worktrunk::trace::instant("Picker started");
 
@@ -1763,7 +1779,7 @@ pub fn handle_picker(
     // status (see `populate_from_cache`), then fetched live and streamed in — the
     // same 30–60s-TTL cache plus live fetch as `wt list --full`. The picker's
     // lifetime is bounded by the user, so a slow forge call never blocks anything
-    // (see the "Network Access" notes in CLAUDE.md). The `pr` preview tab reads
+    // (see the "Network Access" notes in AGENTS.md). The `pr` preview tab reads
     // the same live status. `--prs` rows carry their own number from the explicit
     // `--prs` forge call.
 
@@ -1817,7 +1833,14 @@ pub fn handle_picker(
         state
             .initial_layout
             .dimensions_for(term_width, term_height, num_items_estimate);
-    let preview_window_spec = state.initial_layout.spec_for(preview_dims);
+    let mut preview_window_spec = state.initial_layout.spec_for(preview_dims);
+    // `[switch.picker] preview = false` opens list-only. skim's `hidden`
+    // modifier is the same flag `alt-p:toggle-preview` flips, so the toggle
+    // reveals the pane at the size computed above. Background pre-rendering
+    // still runs, so the first reveal is as warm as an always-shown preview.
+    if !config.switch_picker.preview() {
+        preview_window_spec.push_str(":hidden");
+    }
 
     // When summary generation is unavailable, prime the Summary cache with
     // config guidance instead of showing a perpetual "Generating…" placeholder.
@@ -2192,6 +2215,7 @@ pub fn handle_picker(
             identifier: &identifier,
             create: should_create,
             base: None,
+            path: None,
             clobber: false,
             verify: true,
             yes: false,
@@ -2542,7 +2566,7 @@ pub mod tests {
         resolve_shortcut_branch, resolve_shortcut_url, summary_command_and_hint,
         switch_pipeline_repo,
     };
-    use crate::commands::list::model::{BranchScope, ListItem, WorktreeData};
+    use crate::commands::list::model::{ListItem, WorktreeData};
     use crate::commands::worktree::RemovalPlan;
     use insta::assert_yaml_snapshot;
     use skim::prelude::SkimItem;
@@ -2891,11 +2915,71 @@ pub mod tests {
             target_branch: None,
             integration_reason: None,
             branch_checked_out_at: None,
+            detached_worktree: None,
         };
         AltXRemover::do_removal(&repo, &result, &Approvals::default()).unwrap();
 
         let output = repo.run_command(&["branch", "--list", "feature"]).unwrap();
         assert!(output.is_empty(), "integrated branch should be deleted");
+    }
+
+    /// A stale row's plan carries its registration, which goes along with the
+    /// branch; deleting the branch alone would leave an entry naming a branch
+    /// that no longer exists.
+    #[test]
+    fn test_do_removal_branch_only_prunes_stale_entry() {
+        let mut test = worktrunk::testing::TestRepo::with_initial_commit();
+        let wt_path = test.add_worktree("feature");
+        fs::remove_file(wt_path.join(".git")).unwrap();
+        let repo = worktrunk::git::Repository::at(test.path()).unwrap();
+
+        let result = RemovalPlan::BranchOnly {
+            branch_name: "feature".to_string(),
+            deletion_mode: BranchDeletionMode::SafeDelete,
+            prune_entry: Some(wt_path.clone()),
+            target_branch: None,
+            integration_reason: None,
+            branch_checked_out_at: None,
+            detached_worktree: None,
+        };
+        AltXRemover::do_removal(&repo, &result, &Approvals::default()).unwrap();
+
+        let list = repo
+            .run_command(&["worktree", "list", "--porcelain"])
+            .unwrap();
+        assert!(
+            !list.contains("prunable"),
+            "stale entry should be pruned:\n{list}"
+        );
+        let output = repo.run_command(&["branch", "--list", "feature"]).unwrap();
+        assert!(output.is_empty(), "integrated branch should be deleted");
+        assert!(wt_path.is_dir(), "the directory should stay");
+    }
+
+    /// A prune that fails leaves the branch alone, so the row is restored
+    /// rather than showing a removal that only half happened.
+    #[test]
+    fn test_do_removal_branch_only_keeps_branch_when_prune_fails() {
+        let test = worktrunk::testing::TestRepo::with_initial_commit();
+        let repo = worktrunk::git::Repository::at(test.path()).unwrap();
+        repo.run_command(&["branch", "feature"]).unwrap();
+
+        let result = RemovalPlan::BranchOnly {
+            branch_name: "feature".to_string(),
+            deletion_mode: BranchDeletionMode::SafeDelete,
+            prune_entry: Some(test.path().join("not-registered")),
+            target_branch: None,
+            integration_reason: None,
+            branch_checked_out_at: None,
+            detached_worktree: None,
+        };
+        AltXRemover::do_removal(&repo, &result, &Approvals::default()).unwrap();
+
+        let output = repo.run_command(&["branch", "--list", "feature"]).unwrap();
+        assert!(
+            !output.is_empty(),
+            "the branch should survive a failed prune"
+        );
     }
 
     #[test]
@@ -2918,6 +3002,7 @@ pub mod tests {
             target_branch: None,
             integration_reason: None,
             branch_checked_out_at: None,
+            detached_worktree: None,
         };
         AltXRemover::do_removal(&repo, &result, &Approvals::default()).unwrap();
 
@@ -3318,8 +3403,8 @@ pub mod tests {
     /// concurrent background removal can trigger.
     ///
     /// `apply` renames the worktree into the trash (so its path vanishes) and
-    /// then runs `git worktree remove` on it, which deletes that worktree's
-    /// `.git/worktrees/<id>` admin dir — all on a background thread.
+    /// then unregisters it, deleting that worktree's `.git/worktrees/<id>`
+    /// admin dir — all on a background thread.
     /// `git branch --list` enumerates
     /// worktrees to mark checked-out branches, so a query that races the
     /// in-flight prune can read a half-deleted admin dir and fail with
@@ -3844,6 +3929,7 @@ pub mod tests {
             target_branch: None,
             integration_reason: None,
             branch_checked_out_at: None,
+            detached_worktree: None,
         };
         assert_eq!(
             super::removal_failure_subject(&branch_only),
@@ -3887,7 +3973,7 @@ pub mod tests {
         let approvals_path = approvals_dir.path().join("approvals.toml");
         let mut approvals = Approvals::default();
         approvals
-            .approve_commands(pid, vec!["false".to_string()], &approvals_path)
+            .approve_commands(pid.to_string(), vec!["false".to_string()], &approvals_path)
             .unwrap();
 
         // Build the row from the git-reported worktree path, not the raw temp
@@ -4260,7 +4346,7 @@ pub mod tests {
             local,
             LocalContent::from_item(&{
                 let mut b = ListItem::new_branch("abc123".to_string(), "feature".to_string());
-                b.reclassify_as_branch(BranchScope::Local, "feature".into());
+                b.reclassify_as_branch("feature".into());
                 b
             }),
             "the morphed row's diff signals are the branch's (working_tree empty)"
@@ -4304,6 +4390,7 @@ pub mod tests {
             target_branch: None,
             integration_reason: None,
             branch_checked_out_at: None,
+            detached_worktree: None,
         };
         assert!(super::removal_target_still_present(&repo, &present_branch));
 
@@ -4314,6 +4401,7 @@ pub mod tests {
             target_branch: None,
             integration_reason: None,
             branch_checked_out_at: None,
+            detached_worktree: None,
         };
         assert!(!super::removal_target_still_present(&repo, &gone_branch));
     }
@@ -4335,6 +4423,7 @@ pub mod tests {
                 target_branch: None,
                 integration_reason: integration,
                 branch_checked_out_at: None,
+                detached_worktree: None,
             }
         };
 

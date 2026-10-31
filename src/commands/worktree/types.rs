@@ -98,7 +98,7 @@ pub enum CreationMethod {
 /// Identity of the PR/MR a `pr:N` / `mr:N` argument resolved to.
 ///
 /// Resolved once, before `pre-switch` hooks run, then held by whoever needs it:
-/// the `ResolvedTarget` `pre-switch` reads, the plan `pre-start` reads, and the
+/// the `SwitchTarget` `pre-switch` reads, the plan `pre-start` reads, and the
 /// pipeline's own clone behind the post-* hooks — an `Existing` switch builds no
 /// `SwitchPlan::Create` at all. So `pr_number` / `pr_url` reach every switch
 /// hook whether the PR came from this repo or a fork. Reading it back off
@@ -124,8 +124,9 @@ pub enum SwitchPlan {
         path: PathBuf,
         /// The branch at this worktree. `None` for detached HEAD.
         branch: Option<String>,
-        /// Branch to record as "previous" for `wt switch -`
-        new_previous: Option<String>,
+        /// The worktree being left — path, and branch (`None` when detached) —
+        /// to record for `wt switch -`
+        new_previous: Option<(PathBuf, Option<String>)>,
     },
     /// Need to create a new worktree
     Create {
@@ -140,8 +141,8 @@ pub enum SwitchPlan {
         /// True when a stale path occupies `worktree_path` and `--clobber` was
         /// given — `execute_switch` backs it up before creating the worktree.
         needs_clobber_backup: bool,
-        /// Branch to record as "previous" for `wt switch -`
-        new_previous: Option<String>,
+        /// The worktree being left, to record for `wt switch -`
+        new_previous: Option<(PathBuf, Option<String>)>,
     },
 }
 
@@ -198,8 +199,8 @@ impl SharedBranchCheckout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BranchFate {
     /// No deletion was attempted: the plan had no branch (detached worktree)
-    /// or retained it (`deletion_mode` Keep — shared checkout, or
-    /// `--no-delete-branch`).
+    /// or retained it (`deletion_mode` Keep — a shared checkout, an unborn
+    /// branch with no ref to delete, or `--no-delete-branch`).
     NotAttempted,
     /// The deletion ran and the branch is gone.
     Deleted,
@@ -330,19 +331,19 @@ pub enum RemovalPlan {
         /// [`SharedBranchCheckout`].
         branch_checked_out_at: Option<SharedBranchCheckout>,
     },
-    /// Branch exists but has no worktree directory - attempt branch deletion
+    /// Branch exists but has no usable worktree - attempt branch deletion
     /// only, unregistering the stale worktree entry first when one remains.
     BranchOnly {
         branch_name: String,
         deletion_mode: BranchDeletionMode,
         /// Stale worktree entry to unregister, recorded when the plan fell
-        /// back from a worktree whose directory was missing. Planning never
-        /// mutates — execution performs the prune (`git worktree remove`,
-        /// which validates before touching anything, so a directory that
-        /// reappears at this path between planning and execution is handled
-        /// by git: a clean reconnected worktree is removed, a dirty or
-        /// foreign one refuses loudly). `None` when the branch has no
-        /// worktree entry at all.
+        /// back from a prunable worktree. Planning never mutates — execution
+        /// performs the prune
+        /// ([`prune_worktree_entry`](worktrunk::git::Repository::prune_worktree_entry)),
+        /// which repeats git's prune test first, so a worktree reconnected at
+        /// this path between planning and execution refuses rather than
+        /// losing its registration. Whatever remains of the directory stays.
+        /// `None` when the branch has no worktree entry at all.
         prune_entry: Option<PathBuf>,
         /// Integration target for display. May be the effective target (e.g.,
         /// `origin/main` when upstream is ahead) or the local default branch.
@@ -352,10 +353,26 @@ pub enum RemovalPlan {
         /// executor still rechecks topology and ref state before safe deletion.
         integration_reason: Option<worktrunk::git::IntegrationReason>,
         /// A surviving checkout of `branch_name`, when one exists. Only reachable
-        /// on a pruned removal — the target's directory was gone, but a sibling
-        /// checkout of the same branch survives the fallback to branch-only
-        /// deletion. See [`SharedBranchCheckout`].
+        /// on a pruned removal — the target was stale, but a sibling checkout
+        /// of the same branch survives the fallback to branch-only deletion.
+        /// See [`SharedBranchCheckout`].
         branch_checked_out_at: Option<SharedBranchCheckout>,
+        /// A detached worktree occupying the directory `branch_name`'s worktree
+        /// would use, when one is there.
+        ///
+        /// Detaching severs the only link git records between a worktree and a
+        /// branch, so the branch truly has no worktree and this removal is the
+        /// right operation — but the directory is still on disk, and saying only
+        /// "no worktree found" leaves the user believing it isn't. Naming it is
+        /// the whole job: nothing here acts on it, and `wt remove <path>` is
+        /// what removes it.
+        ///
+        /// The command fills this rather than the planner, which has no
+        /// [`UserConfig`](worktrunk::config::UserConfig) to expand the
+        /// `worktree-path` template with. `None` everywhere else, which is also
+        /// what `wt step prune` and the picker want — neither has a user's typed
+        /// branch name to explain.
+        detached_worktree: Option<PathBuf>,
     },
 }
 
@@ -443,6 +460,7 @@ impl RemovalPlan {
                 branch_name,
                 prune_entry,
                 branch_checked_out_at,
+                detached_worktree,
                 ..
             } => serde_json::json!({
                 "kind": "branch_only",
@@ -450,6 +468,7 @@ impl RemovalPlan {
                 "pruned": prune_entry.is_some(),
                 "branch_outcome": branch_outcome,
                 "branch_checked_out_at": branch_checked_out_at.as_ref().map(|c| &c.path),
+                "detached_worktree": detached_worktree,
             }),
         }
     }
@@ -484,6 +503,7 @@ mod tests {
             target_branch: None,
             integration_reason: None,
             branch_checked_out_at: None,
+            detached_worktree: None,
         };
         assert_eq!(branch_only.branch_name(), Some("solo"));
     }
@@ -682,6 +702,7 @@ mod tests {
             target_branch: None,
             integration_reason: None,
             branch_checked_out_at: None,
+            detached_worktree: None,
         };
         match result {
             RemovalPlan::BranchOnly {
@@ -691,6 +712,7 @@ mod tests {
                 target_branch,
                 integration_reason,
                 branch_checked_out_at,
+                ..
             } => {
                 assert_eq!(branch_name, "stale-branch");
                 assert!(deletion_mode.should_keep());
@@ -713,6 +735,7 @@ mod tests {
             target_branch: Some("main".to_string()),
             integration_reason: None,
             branch_checked_out_at: None,
+            detached_worktree: None,
         };
         match result {
             RemovalPlan::BranchOnly {
@@ -722,6 +745,7 @@ mod tests {
                 target_branch,
                 integration_reason,
                 branch_checked_out_at,
+                ..
             } => {
                 assert_eq!(branch_name, "pruned-branch");
                 assert!(!deletion_mode.should_keep());

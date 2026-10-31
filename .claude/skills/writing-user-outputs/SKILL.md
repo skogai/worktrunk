@@ -105,15 +105,12 @@ only when the pipe is a courier rather than the destination; anything a person
 reads directly stays on plain anstream, which is what strips color on a pipe
 and honors `NO_COLOR`.
 
-**`--format=json` answers** go through `crate::output::print_json`, never a
-hand-rolled `println!("{}", serde_json::to_string_pretty(&v)?)`. It serializes
-pretty with one trailing newline and prints through anstream, so no
-`--format=json` surface panics when its consumer stops reading. Before that,
-thirty call sites had open-coded those two lines, and whether any one of them
-panicked under `| head -3` came down to which `println!` its module happened to
-import. `wt switch --format=json` is the one non-caller: it emits its single
-result as one compact line (still through anstream's `println!`), because that
-is what a shell loop reads.
+**`--format=json` answers** use `crate::output::print_json` at the command
+handler. Inner operations return typed facts; when work can complete before a
+later failure, retain those facts in `CommandFailure<T>`. The outer handler can
+use `finish_output` to emit the available result once and return the original
+error for main's readable stderr diagnostics and native exit handling. A path
+with no result emits nothing; a legitimate JSON null remains a result.
 
 **Shell integration functions** (`src/output/global.rs`):
 
@@ -180,12 +177,12 @@ Examples that page: `--help`, `wt config show`, `wt hook show`, `wt step {commit
 Build the whole output into a `String` first (don't stream), then:
 
 ```rust
-crate::help_pager::show_help_in_pager(&out, true);
+crate::help_pager::show_help_in_pager(&out, true)?;
 ```
 
-The helper is infallible from the caller's perspective — it falls back to
-plain stdout itself when no pager is configured, stdout isn't a TTY, or the
-pager fails.
+The helper falls back to plain stdout when paging is disabled or unavailable,
+stdout is not a TTY, or the pager cannot start. Propagate its result so native
+signal failures and cancellation reach command cleanup.
 
 ## Security
 
@@ -230,8 +227,8 @@ address the user. Imperatives like "Run", "Use", "Add" are fine — they're
 concise CLI idiom.
 
 ```rust
-// BAD - "Use 'wt merge' to rebase your changes onto main"
-// GOOD - "Use 'wt merge' to rebase onto main"
+// BAD - "To rebase your changes onto main, run wt merge"
+// GOOD - "To rebase onto main, run wt merge"
 ```
 
 **Avoid redundant parenthesized content:** Parenthesized text should add new
@@ -292,10 +289,10 @@ mentioned in the error message.
 ```rust
 // BAD - "it" refers to branch name in error message
 // Error: "Branch 'feature' not found"
-// Hint:  "Use --create to create it"
+// Hint:  "To create it, use --create"
 // GOOD - self-contained hint
 // Error: "Branch 'feature' not found"
-// Hint:  "Use --create to create a new branch"
+// Hint:  "To create a new branch, use --create"
 ```
 
 ## Heading Case
@@ -413,7 +410,7 @@ anyway, that message comes first:
 
 ```
 ▲ Auto-staging 1 untracked path:
-   ┃ notes.md
+  notes.md
 ◎ Generating commit message...
 ```
 
@@ -422,7 +419,7 @@ Not:
 ```
 ◎ Generating commit message...
 ▲ Auto-staging 1 untracked path:
-   ┃ notes.md
+  notes.md
 ```
 
 Warnings that result from the action itself (something failed during execution)
@@ -526,12 +523,13 @@ clearer:
 ```
 
 **Description + command in single message:** For warnings/errors that include a
-recovery command, join with semicolon. Use `<bold>` for commands in
+recovery command, join with semicolon, and order the recovery "To X, run Y" as
+hints do, so the command still ends the line. Use `<bold>` for commands in
 warnings/errors (only hints use `<underline>`):
 
 ```rust
 // Warning with inline recovery command (bold for commands)
-warning_message("Failed to restore stash; run <bold>git stash pop {ref}</> to restore manually")
+warning_message("Failed to restore stash; to restore manually, run <bold>git stash pop {ref}</>")
 warning_message("{tool} not authenticated; run <bold>{tool} auth login</>")
 
 // For longer suggestions, use separate hint message (underline for commands)
@@ -639,12 +637,12 @@ at the top of `wt step commit`, has nothing to separate from and starts flush.
 ```
 ❯ Configure claude for commit messages? [y/N/?] y
 ✓ Added to user config:
-   ┃ [commit.generation]
-   ┃ command = "..."
+  [commit.generation]
+  command = "..."
 ↳ View config: wt config show
 
 ▲ Auto-staging 1 untracked path:
-   ┃ a
+  a
 ◎ Generating commit message...
 ```
 
@@ -709,7 +707,7 @@ time-to-first-output with work the user didn't ask for.
 Worktrunk marks the boundary with `WORKTRUNK_FIRST_OUTPUT`: handlers
 early-return where output begins, so work before that return is on the hot
 path, work after it is not. See `handle_remove_command` —
-`sweep_stale_trash` runs after `handle_remove_output`.
+`run_internal_sweep` runs after `handle_remove_output`.
 
 ## Information Display: Show Once, Not Twice
 
@@ -762,7 +760,7 @@ Use `eprintln!` with formatting functions. Use `cformat!` for inner styling:
 
 ```rust
 eprintln!("{}", success_message(cformat!("Created <bold>{branch}</> from <bold>{base}</>")));
-eprintln!("{}", hint_message(cformat!("Run <underline>wt merge</> to continue")));
+eprintln!("{}", hint_message(cformat!("To continue, run <underline>wt merge</>")));
 ```
 
 **color-print tags:** `<bold>`, `<dim>`, `<underline>`, `<bright-black>`, `<red>`,
@@ -789,11 +787,11 @@ Never quote commands or branch names. Use styling to make them stand out:
 
 ```rust
 // GOOD - bold in normal context
-eprintln!("{}", info_message(cformat!("Use <bold>wt merge</> to continue")));
+eprintln!("{}", info_message(cformat!("To continue, use <bold>wt merge</>")));
 // GOOD - underline for commands in hints
-eprintln!("{}", hint_message(cformat!("Run <underline>wt list</> to see worktrees")));
+eprintln!("{}", hint_message(cformat!("To see worktrees, run <underline>wt list</>")));
 // BAD - quoted commands
-eprintln!("{}", hint_message("Run 'wt list' to see worktrees"));
+eprintln!("{}", hint_message("To see worktrees, run 'wt list'"));
 ```
 
 ## Hyperlinks
@@ -821,7 +819,14 @@ to the render rather than to the cell emitting it: `LayoutConfig::link_style`
 answers it once for a whole row, so a CI reference and a dev-server port can't
 disagree. Two destinations carry no links, and so no underline: a terminal
 without OSC 8 support, where `wt list` prints the dev-server URL in full, and
-the picker, whose rows pass through skim.
+the picker's rows, which `Destination::picker` renders as
+`LinkStyle::Unlinked` (that variant's docstring has the reason). Nothing in the
+picker is clickable, by two routes: a row's link style is decided at render
+time, so it carries no OSC 8 to begin with, and the preview pane is parsed by
+skim through `ansi_to_tui`, which keeps none. Underline there is
+free to mean something else, and the preview pane spends it twice: on a URL,
+marking a reference rather than a link (`pr_pane::url_line`), and on the active
+tab in the tab bar (`items::render_preview_tabs`).
 
 ## Design Principles
 
@@ -832,7 +837,10 @@ the picker, whose rows pass through skim.
   redirects) can be interpolated directly without escaping. Do NOT escape
   `<`/`>` in variables — it adds extra chars.
 - **YAGNI** — Most output needs no styling
-- **Graceful degradation** — Colors auto-adjust (NO_COLOR, TTY detection)
+- **Graceful degradation** — Styling follows the consumer (NO_COLOR, TTY
+  detection). Plain output preserves meaning through wording, spacing and
+  existing semantic symbols. Missing decoration alone does not justify new
+  markers; add text when information would otherwise be lost.
 - **Unicode-aware** — Width calculations respect symbols and CJK (via `StyledLine`)
 
 **StyledLine** for table rendering with proper width calculations:
@@ -898,7 +906,11 @@ worktree-path = ".worktrees/{{ branch | sanitize }}"
 ## Gutter Formatting
 
 Use gutter for **quoted content** (git output, commit messages, config to copy,
-hook commands being displayed):
+hook commands being displayed).
+
+The gutter is a background-colored blank column followed by a space. Plain
+output keeps the two-space indent. Gutter examples in this skill show that plain
+form.
 
 - `format_bash_with_gutter()` — shell commands (dimmed + syntax highlighting)
 - `format_with_gutter()` — other content
@@ -1016,7 +1028,7 @@ std::fs::read_to_string(&path).context("Failed to read config")?
 
 ```
 ✗ Commit generation command 'llm --model claude' failed
-   ┃ Error: [Errno 8] nodename nor servname provided
+  Error: [Errno 8] nodename nor servname provided
 
 // NOT: ✗ ... failed: LLM command failed: Error: [Errno 8]...
 ```
@@ -1034,9 +1046,9 @@ labeled blocks. Each block is a bash gutter (dim + syntax highlighting via
 then `source` or `result`):
 ```
 ○ name source
- ┃ template
+  template
 ○ name result
- ┃ result
+  result
 ```
 
 The two headers carry the input/output distinction, so both blocks share the

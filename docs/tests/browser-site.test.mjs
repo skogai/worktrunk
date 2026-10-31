@@ -51,6 +51,28 @@ async function sitemapRoutes() {
     .map((match) => new URL(match[1]).pathname);
 }
 
+// Layout checks measure the page as set in its web fonts. The stylesheet loads
+// them with `display=swap`, so at DOMContentLoaded text can still be in a wider
+// fallback face, and a terminal sized to the column overflows it.
+async function openPage(page, url) {
+  await page.goto(url, { waitUntil: 'load' });
+  await page.evaluate(() => document.fonts.ready);
+}
+
+// Every page header carries the shields.io GitHub-stars badge, the one
+// third-party resource besides the web fonts. Serve a stand-in at the badge's
+// declared size so `load` waits only on the local server and the fonts.
+const starsBadge = '<svg xmlns="http://www.w3.org/2000/svg" width="90" height="20"></svg>';
+
+async function newPage(browser, options) {
+  const page = await browser.newPage(options);
+  await page.route('https://img.shields.io/**', (route) => route.fulfill({
+    contentType: 'image/svg+xml',
+    body: starsBadge,
+  }));
+  return page;
+}
+
 function rgbChannels(value) {
   const channels = value.match(/[\d.]+/gu).slice(0, 3).map(Number);
   return value.startsWith('color(srgb')
@@ -82,9 +104,9 @@ test('mobile pages stay viewport-bound while code remains readable', { timeout: 
   try {
     for (const theme of ['light', 'dark']) {
       for (const width of mobileWidths) {
-        const page = await browser.newPage({ viewport: { width, height: 844 }, colorScheme: theme });
+        const page = await newPage(browser, { viewport: { width, height: 844 }, colorScheme: theme });
         for (const route of publicRoutes) {
-          await page.goto(`${baseUrl}${route}`, { waitUntil: 'domcontentloaded' });
+          await openPage(page, `${baseUrl}${route}`);
           await page.evaluate((selectedTheme) => {
             document.documentElement.dataset.theme = selectedTheme;
           }, theme);
@@ -120,7 +142,7 @@ test('mobile pages stay viewport-bound while code remains readable', { timeout: 
               ));
               return contrast(effective, background);
             });
-            const fixedTerminal = [...document.querySelectorAll('.frame.is-terminal')]
+            const fixedTerminal = [...document.querySelectorAll('.expressive-code .frame')]
               .filter((frame) => frame.querySelector('.wt-output'))
               .map((frame) => frame.querySelector('pre'))
               .find((pre) => pre.scrollWidth > pre.clientWidth + 1);
@@ -133,10 +155,6 @@ test('mobile pages stay viewport-bound while code remains readable', { timeout: 
               frames: [...document.querySelectorAll('.expressive-code .frame')].map((frame) => {
                 const pre = frame.querySelector('pre');
                 return {
-                  className: frame.className,
-                  managedTerminal: Boolean(
-                    frame.querySelector('.wt-command, .wt-output, .wt-copyable'),
-                  ),
                   hasOutput: Boolean(frame.querySelector('.wt-output')),
                   frameLeft: frame.getBoundingClientRect().left,
                   frameRight: frame.getBoundingClientRect().right,
@@ -164,17 +182,7 @@ test('mobile pages stay viewport-bound while code remains readable', { timeout: 
               frame.frameRight <= layout.viewportWidth + 1,
               `${theme} ${width}px ${route} code ends offscreen`,
             );
-            const terminal = frame.className.includes('is-terminal');
-            const commandsOnly = frame.className.includes('wt-commands-only');
-            if (terminal) {
-              assert.equal(
-                commandsOnly,
-                !frame.hasOutput,
-                `${theme} ${width}px ${route} misclassifies a terminal block`,
-              );
-            }
-            const wraps = !terminal || commandsOnly;
-            if (wraps) {
+            if (!frame.hasOutput) {
               assert.ok(
                 frame.preScrollWidth <= frame.preClientWidth + 1,
                 `${theme} ${width}px ${route} wrappable code still scrolls horizontally`,
@@ -196,30 +204,146 @@ test('mobile pages stay viewport-bound while code remains readable', { timeout: 
   }
 });
 
-test('desktop terminal examples fit without horizontal scrolling', { timeout: 60_000 }, async () => {
+// 1920px leaves the content panel wider than the capped content column, so a
+// code frame sized off the panel instead of the column shows up there.
+test('desktop code examples fit the content column', { timeout: 60_000 }, async () => {
   const browser = await webkit.launch();
   try {
-    for (const width of [1152, 1376]) {
-      const page = await browser.newPage({ viewport: { width, height: 900 } });
+    for (const width of [1152, 1376, 1401, 1920]) {
+      const page = await newPage(browser, { viewport: { width, height: 900 } });
       for (const route of await sitemapRoutes()) {
-        await page.goto(`${baseUrl}${route}`, { waitUntil: 'domcontentloaded' });
-        const terminals = await page.evaluate(() => (
-          [...document.querySelectorAll('.frame.is-terminal')]
-            .filter((frame) => frame.querySelector('.wt-output'))
-            .map((frame) => {
-              const pre = frame.querySelector('pre');
-              return {
-                command: frame.querySelector('.wt-command')?.textContent.trim(),
-                clientWidth: pre.clientWidth,
-                scrollWidth: pre.scrollWidth,
-              };
-            })
-        ));
+        await openPage(page, `${baseUrl}${route}`);
+        const { column, blocks, terminals } = await page.evaluate(() => {
+          const { left, right } = document.querySelector('.sl-markdown-content').getBoundingClientRect();
+          return {
+            column: { left, right },
+            blocks: [...document.querySelectorAll('.sl-markdown-content .expressive-code')].map((block) => {
+              const rect = block.getBoundingClientRect();
+              return { left: rect.left, right: rect.right, text: block.textContent.trim().slice(0, 60) };
+            }),
+            terminals: [...document.querySelectorAll('.expressive-code .frame')]
+              .filter((frame) => frame.querySelector('.wt-output'))
+              .map((frame) => {
+                const pre = frame.querySelector('pre');
+                return {
+                  command: frame.querySelector('.wt-command')?.textContent.trim(),
+                  clientWidth: pre.clientWidth,
+                  scrollWidth: pre.scrollWidth,
+                };
+              }),
+          };
+        });
+        for (const block of blocks) {
+          assert.ok(
+            block.left >= column.left - 1 && block.right <= column.right + 1,
+            `${route} "${block.text}" leaves the content column at ${width}px`,
+          );
+        }
         for (const terminal of terminals) {
           assert.ok(
             terminal.scrollWidth <= terminal.clientWidth + 1,
             `${route} ${terminal.command} scrolls horizontally at ${width}px`,
           );
+        }
+      }
+      await page.close();
+    }
+
+    const page = await newPage(browser, { viewport: { width: 1920, height: 900 } });
+    await openPage(page, baseUrl + '/');
+    const rail = await page.evaluate(() => {
+      const frame = [...document.querySelectorAll('.expressive-code .frame')]
+        .find((candidate) => candidate.querySelector('.wt-command')?.textContent.trim() === 'wt list');
+      const pre = frame.querySelector('pre').getBoundingClientRect();
+      const textBounds = [...frame.querySelectorAll('.ec-line')].map((line) => {
+        const walker = document.createTreeWalker(line, NodeFilter.SHOW_TEXT);
+        let node;
+        let first;
+        let last;
+        while ((node = walker.nextNode())) {
+          if (!node.textContent) continue;
+          first ??= node;
+          last = node;
+        }
+        if (!first) return null;
+        const firstRange = document.createRange();
+        const lastRange = document.createRange();
+        firstRange.selectNodeContents(first);
+        lastRange.selectNodeContents(last);
+        return {
+          left: firstRange.getBoundingClientRect().left,
+          right: lastRange.getBoundingClientRect().right,
+          columns: line.textContent.length,
+        };
+      }).filter(Boolean);
+      const widest = textBounds.reduce((current, candidate) => (
+        candidate.right - candidate.left > current.right - current.left ? candidate : current
+      ));
+      const padEnd = parseFloat(
+        getComputedStyle(frame.querySelector('.ec-line.wt-output .code')).paddingInlineEnd,
+      );
+      return {
+        spare: pre.right - widest.right - padEnd,
+        column: (widest.right - widest.left) / widest.columns,
+      };
+    });
+    assert.ok(
+      rail.spare >= 0 && rail.spare < rail.column,
+      `99-column terminal leaves ${rail.spare.toFixed(1)}px spare beside ${rail.column.toFixed(1)}px columns`,
+    );
+    await page.close();
+  } finally {
+    await browser.close();
+  }
+});
+
+test('copy buttons sit in view on the line they copy without overlapping', { timeout: 60_000 }, async () => {
+  const browser = await webkit.launch();
+  try {
+    for (const { width, touch } of [{ width: 393, touch: true }, { width: 1376, touch: false }]) {
+      const page = await newPage(browser, {
+        viewport: { width, height: 900 },
+        hasTouch: touch,
+        isMobile: touch,
+      });
+      for (const route of await sitemapRoutes()) {
+        await openPage(page, `${baseUrl}${route}`);
+        const frames = await page.evaluate(() => {
+          for (const details of document.querySelectorAll('.sl-markdown-content details')) details.open = true;
+          return [...document.querySelectorAll('.expressive-code .frame')].map((frame) => {
+            const code = frame.querySelector('pre').getBoundingClientRect();
+            return {
+              text: frame.textContent.trim().slice(0, 60),
+              codeLeft: code.left,
+              codeRight: code.right,
+              buttons: [...frame.querySelectorAll('.copy button')].map((button) => {
+                // A block's control belongs on its first line.
+                const line = (button.closest('.ec-line') ?? frame.querySelector('.ec-line'))
+                  .getBoundingClientRect();
+                const { top, bottom, left, right } = button.getBoundingClientRect();
+                return { top, bottom, left, right, lineTop: line.top, lineBottom: line.bottom };
+              }),
+            };
+          });
+        });
+        const label = (frame) => `${route} "${frame.text}" at ${width}px`;
+        for (const frame of frames) {
+          for (const [index, button] of frame.buttons.entries()) {
+            const center = (button.top + button.bottom) / 2;
+            assert.ok(
+              center >= button.lineTop && center <= button.lineBottom,
+              `${label(frame)}: copy button is off its line`,
+            );
+            assert.ok(
+              button.left >= frame.codeLeft - 1 && button.right <= frame.codeRight + 1,
+              `${label(frame)}: copy button is scrolled out of sight`,
+            );
+            assert.ok(
+              frame.buttons.slice(index + 1)
+                .every((other) => other.top >= button.bottom - 0.5 || other.bottom <= button.top + 0.5),
+              `${label(frame)}: copy buttons overlap`,
+            );
+          }
         }
       }
       await page.close();
@@ -233,9 +357,9 @@ test('code artifacts keep their visual hierarchy in both themes', async () => {
   const browser = await webkit.launch();
   try {
     for (const theme of ['light', 'dark']) {
-      const page = await browser.newPage({ viewport: { width: 1280, height: 900 }, colorScheme: theme });
+      const page = await newPage(browser, { viewport: { width: 1280, height: 900 }, colorScheme: theme });
 
-      await page.goto(`${baseUrl}/claude-code/`, { waitUntil: 'domcontentloaded' });
+      await openPage(page, `${baseUrl}/claude-code/`);
       await page.evaluate((selectedTheme) => {
         document.documentElement.dataset.theme = selectedTheme;
       }, theme);
@@ -264,7 +388,7 @@ test('code artifacts keep their visual hierarchy in both themes', async () => {
         assert.ok(ratio >= 4.5, `${theme} shell token ${text} contrast is ${ratio.toFixed(2)}:1`);
       }
 
-      await page.goto(baseUrl + '/', { waitUntil: 'domcontentloaded' });
+      await openPage(page, baseUrl + '/');
       await page.evaluate((selectedTheme) => {
         document.documentElement.dataset.theme = selectedTheme;
       }, theme);
@@ -359,12 +483,12 @@ test('code artifacts keep their visual hierarchy in both themes', async () => {
         );
       }
 
-      await page.goto(`${baseUrl}/list/`, { waitUntil: 'domcontentloaded' });
+      await openPage(page, `${baseUrl}/list/`);
       await page.evaluate((selectedTheme) => {
         document.documentElement.dataset.theme = selectedTheme;
       }, theme);
       const listStyles = await page.evaluate(() => {
-        const frame = [...document.querySelectorAll('.frame.is-terminal')]
+        const frame = [...document.querySelectorAll('.expressive-code .frame')]
           .find((candidate) => candidate.textContent.includes('feature-api'));
         const normal = frame.querySelector('.wt-output .code');
         const dim = frame.querySelector('.wt-terminal-dim:not(.wt-terminal-red)');
@@ -405,7 +529,7 @@ test('code artifacts keep their visual hierarchy in both themes', async () => {
         assert.ok(ratio >= 4.5, `${theme} help-role contrast is ${ratio.toFixed(2)}:1`);
       }
 
-      await page.goto(`${baseUrl}/config/`, { waitUntil: 'domcontentloaded' });
+      await openPage(page, `${baseUrl}/config/`);
       await page.evaluate((selectedTheme) => {
         document.documentElement.dataset.theme = selectedTheme;
       }, theme);
@@ -418,6 +542,8 @@ test('code artifacts keep their visual hierarchy in both themes', async () => {
           title: title.textContent,
           titleBottom: title.getBoundingClientRect().bottom,
           codeTop: pre.getBoundingClientRect().top,
+          titleLeft: title.getBoundingClientRect().left,
+          codeLeft: pre.getBoundingClientRect().left,
           titleFont: getComputedStyle(title).fontFamily,
           titleColor: getComputedStyle(title).color,
           titleBackground: getComputedStyle(title).backgroundColor,
@@ -432,6 +558,10 @@ test('code artifacts keep their visual hierarchy in both themes', async () => {
       assert.ok(
         Math.abs(fileFrame.titleBottom - fileFrame.codeTop) < 1,
         `${theme} file label is detached from its code`,
+      );
+      assert.ok(
+        Math.abs(fileFrame.titleLeft - fileFrame.codeLeft) < 1,
+        `${theme} file label is inset from its code`,
       );
       assert.notEqual(
         fileFrame.titleBackground,

@@ -1,6 +1,6 @@
 //! Git config, hints, marker, and default branch operations for Repository.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -103,7 +103,7 @@ impl Repository {
         Ok(())
     }
 
-    /// Unset a config key and keep the bulk config map coherent.
+    /// Unset every value for a config key and keep the bulk config map coherent.
     ///
     /// Returns `true` if the key was cleared, `false` if it didn't exist.
     /// Propagates actual git config errors (corrupt config, permission denied).
@@ -111,12 +111,14 @@ impl Repository {
     /// Removes the canonical form (matching what git emits) to stay in
     /// sync with `set_config_value` and `config_last`.
     pub(super) fn unset_config_value(&self, key: &str) -> anyhow::Result<bool> {
-        let args = ["config", "--unset", key];
+        // --unset also returns 5 for repeated values without removing them.
+        // --unset-all makes 5 unambiguously mean that the key was absent.
+        let args = ["config", "--unset-all", key];
         let output = self.run_command_output(&args)?;
         let existed = if output.status.success() {
             true
         } else if output.status.code() == Some(5) {
-            // --unset exit code 5 = key didn't exist
+            // --unset-all exit code 5 = key didn't exist
             false
         } else {
             return Err(CommandError::from_failed_output("git", &args, &output).into());
@@ -131,20 +133,23 @@ impl Repository {
         Ok(existed)
     }
 
-    /// Run `git config --get-regexp <pattern>` and return stdout.
+    /// Read matching config entries without using newlines as record boundaries.
     ///
-    /// Distinguishes exit 1 (no matching keys — expected, returns empty
-    /// string) from real config errors (corrupt config, permission denied —
-    /// surfaced as `Err`). Use this instead of `run_command` + `.unwrap_or_default()`,
-    /// which conflates the two.
-    pub fn get_config_regexp(&self, pattern: &str) -> anyhow::Result<String> {
-        let args = ["config", "--get-regexp", pattern];
+    /// `git config --null --get-regexp` emits `key\nvalue\0` records, so values
+    /// containing newlines remain intact. Valueless keys are emitted as
+    /// `key\0` and read as `"true"`, git's boolean reading of them (see
+    /// `parse_config_list_z`). When a key has multiple values, the last value
+    /// wins, matching the other config readers.
+    pub fn config_regexp_entries(&self, pattern: &str) -> anyhow::Result<Vec<(String, String)>> {
+        let args = ["config", "--null", "--get-regexp", pattern];
         let output = self.run_command_output(&args)?;
         if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+            Ok(super::parse_config_list_z(&output.stdout)
+                .into_iter()
+                .filter_map(|(key, values)| values.into_iter().last().map(|value| (key, value)))
+                .collect())
         } else if output.status.code() == Some(1) {
-            // Exit 1 = no keys matched the pattern
-            Ok(String::new())
+            Ok(Vec::new())
         } else {
             Err(CommandError::from_failed_output("git", &args, &output).into())
         }
@@ -186,15 +191,13 @@ impl Repository {
     pub fn vars_entries(&self, branch: &str) -> std::collections::BTreeMap<String, String> {
         let escaped = regex::escape(branch);
         let pattern = format!(r"^worktrunk\.state\.{escaped}\.vars\.");
-        let output = self.get_config_regexp(&pattern).unwrap_or_default();
-
         let prefix = format!("worktrunk.state.{branch}.vars.");
-        output
-            .lines()
-            .filter_map(|line| {
-                let (config_key, value) = line.split_once(' ')?;
+        self.config_regexp_entries(&pattern)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(config_key, value)| {
                 let key = config_key.strip_prefix(&prefix)?;
-                Some((key.to_string(), value.to_string()))
+                Some((key.to_string(), value))
             })
             .collect()
     }
@@ -207,25 +210,21 @@ impl Repository {
     pub fn all_vars_entries(
         &self,
     ) -> std::collections::HashMap<String, std::collections::BTreeMap<String, String>> {
-        let output = self
-            .get_config_regexp(r"^worktrunk\.state\..+\.vars\.")
+        let entries = self
+            .config_regexp_entries(r"^worktrunk\.state\..+\.vars\.")
             .unwrap_or_default();
 
         let mut result: std::collections::HashMap<
             String,
             std::collections::BTreeMap<String, String>,
         > = std::collections::HashMap::new();
-        for line in output.lines() {
-            let Some((config_key, value)) = line.split_once(' ') else {
-                continue;
-            };
-            let Some((branch, key)) = parse_vars_config_key(config_key) else {
-                continue;
-            };
+        for (config_key, value) in entries {
+            let (branch, key) =
+                parse_vars_config_key(&config_key).expect("config key matched vars pattern");
             result
                 .entry(branch.to_string())
                 .or_default()
-                .insert(key.to_string(), value.to_string());
+                .insert(key.to_string(), value);
         }
         result
     }
@@ -290,15 +289,56 @@ impl Repository {
         Ok(result)
     }
 
-    /// Set the previous branch in worktrunk.history for `wt switch -` support.
+    /// Record the worktree `wt switch` is leaving, so `wt switch -` can
+    /// return to it.
     ///
-    /// Stores the branch we're switching FROM, so `wt switch -` can return to it.
-    pub fn set_switch_previous(&self, previous: Option<&str>) -> anyhow::Result<()> {
-        if let Some(prev) = previous {
-            self.set_config_value("worktrunk.history", prev)?;
+    /// The branch goes in `worktrunk.history` and the path in
+    /// `worktrunk.history-path`. The branch alone can't name a detached
+    /// worktree, or the second checkout of a branch checked out twice; the
+    /// path can. A detached worktree clears the branch, so the two keys always
+    /// describe the same worktree, which is what
+    /// [`switch_previous_worktree`](Self::switch_previous_worktree) checks.
+    pub fn record_switch_source(&self, path: &Path, branch: Option<&str>) -> anyhow::Result<()> {
+        match branch {
+            Some(branch) => self.set_config_value("worktrunk.history", branch)?,
+            None => {
+                self.unset_config("worktrunk.history")?;
+            }
         }
-        // If previous is None (detached HEAD), don't update history
+        self.set_config_value("worktrunk.history-path", &path.to_string_lossy())
+    }
+
+    /// Set the previous branch outright (`wt config state previous-branch
+    /// set`), dropping the path a switch recorded alongside the old one.
+    pub fn set_switch_previous(&self, branch: &str) -> anyhow::Result<()> {
+        self.set_config_value("worktrunk.history", branch)?;
+        self.unset_config("worktrunk.history-path")?;
         Ok(())
+    }
+
+    /// Forget the previous worktree. Returns whether anything was recorded.
+    pub fn clear_switch_previous(&self) -> anyhow::Result<bool> {
+        let branch = self.unset_config("worktrunk.history")?;
+        let path = self.unset_config("worktrunk.history-path")?;
+        Ok(branch || path)
+    }
+
+    /// The worktree `wt switch` last left, while it is still registered and
+    /// still holds the branch recorded with it.
+    ///
+    /// `None` sends `wt switch -` to [`switch_previous`](Self::switch_previous)
+    /// instead: the worktree is gone, its checkout changed since, or an older
+    /// wt recorded a different branch without a path. An older wt recording
+    /// the same branch leaves the stale path standing, which matters only for
+    /// a branch checked out twice.
+    pub fn switch_previous_worktree(&self) -> anyhow::Result<Option<(PathBuf, Option<String>)>> {
+        let Some(path) = self.config_last("worktrunk.history-path")? else {
+            return Ok(None);
+        };
+        let Some((path, branch)) = self.worktree_at_path(Path::new(&path))? else {
+            return Ok(None);
+        };
+        Ok((branch == self.switch_previous()).then_some((path, branch)))
     }
 
     /// Get the previous branch from worktrunk.history for `wt switch -`.
@@ -404,7 +444,7 @@ impl Repository {
     /// call per repo may run `git ls-remote` (100 ms–2 s); the result is
     /// then persisted to `worktrunk.default-branch` and every subsequent
     /// call is a local cache hit. No other detection helper may add a
-    /// similar fallback. See `CLAUDE.md` → "Network Access" for the policy.
+    /// similar fallback. See `AGENTS.md` → "Network Access" for the policy.
     ///
     /// Detection strategy:
     /// 1. Check worktrunk cache (`git config worktrunk.default-branch`)
@@ -524,7 +564,7 @@ impl Repository {
                 .ok_or_else(|| {
                     GitError::Other {
                         message: cformat!(
-                            "Cannot determine default branch. Specify target explicitly or run <bold>wt config state default-branch set BRANCH</>"
+                            "Cannot determine default branch; specify the target explicitly, or to configure one, run <bold>wt config state default-branch set BRANCH</>"
                         ),
                     }
                     .into()
@@ -630,7 +670,11 @@ impl Repository {
             if target.is_none() {
                 return Err(self.uncached_default_branch_error(reference));
             }
-            return Err(GitError::ReferenceNotFound { reference }.into());
+            return Err(GitError::ReferenceNotFound {
+                reference,
+                flag: None,
+            }
+            .into());
         }
         Ok(reference)
     }
@@ -724,14 +768,18 @@ impl Repository {
     // Private helpers for default_branch detection
 
     fn local_default_branch(&self, remote: &str) -> anyhow::Result<String> {
-        let stdout =
-            self.run_command(&["rev-parse", "--abbrev-ref", &format!("{}/HEAD", remote)])?;
+        let stdout = self.run_command(&[
+            "rev-parse",
+            "--abbrev-ref",
+            "--verify",
+            &format!("refs/remotes/{remote}/HEAD"),
+        ])?;
         DefaultBranchName::from_local(remote, &stdout).map(DefaultBranchName::into_string)
     }
 
     pub(super) fn query_remote_default_branch(&self, remote: &str) -> anyhow::Result<String> {
         let stdout = self.run_command_bounded(
-            &["ls-remote", "--symref", remote, "HEAD"],
+            &["ls-remote", "--symref", "--", remote, "HEAD"],
             Some(REMOTE_DETECTION_TIMEOUT),
         )?;
         DefaultBranchName::from_remote(&stdout).map(DefaultBranchName::into_string)
@@ -951,7 +999,7 @@ impl Repository {
         }
 
         let spec = format!("{}:.config/wt.toml", self.default_branch()?);
-        match self.run_command_output(&["show", &spec]) {
+        match self.run_command_output(&["show", "--end-of-options", &spec]) {
             Ok(output) if output.status.success() => Some((
                 String::from_utf8_lossy(&output.stdout).into_owned(),
                 PathBuf::from(&spec),
@@ -1061,29 +1109,29 @@ mod tests {
     use crate::testing::TestRepo;
 
     #[test]
-    fn test_get_config_regexp_no_match_returns_empty() {
+    fn test_config_regexp_entries_no_match_returns_empty() {
         // Exit 1 from git config --get-regexp means "no keys matched" — must
-        // surface as Ok("") rather than an error so callers don't conflate
+        // surface as an empty list rather than an error so callers don't conflate
         // no-matches with real config failures.
         let test = TestRepo::with_initial_commit();
         let repo = Repository::at(test.root_path()).unwrap();
 
-        let output = repo
-            .get_config_regexp(r"^worktrunk\.state\..+\.marker$")
+        let entries = repo
+            .config_regexp_entries(r"^worktrunk\.state\..+\.marker$")
             .unwrap();
-        assert_eq!(output, "");
+        assert!(entries.is_empty());
     }
 
     #[test]
-    fn test_get_config_regexp_failure_is_command_error() {
+    fn test_config_regexp_entries_failure_is_command_error() {
         // A real failure (invalid pattern, exit 6) must surface as a typed
         // `CommandError` — unlike exit 1, which means "no keys matched".
         let test = TestRepo::with_initial_commit();
         let repo = Repository::at(test.root_path()).unwrap();
 
-        let err = repo.get_config_regexp("(").unwrap_err();
+        let err = repo.config_regexp_entries("(").unwrap_err();
         let cmd_err = CommandError::find_in(&err).expect("error should carry a CommandError");
-        assert_eq!(cmd_err.command_string(), "git config --get-regexp (");
+        assert_eq!(cmd_err.command_string(), "git config --null --get-regexp (");
     }
 
     #[test]
@@ -1095,7 +1143,33 @@ mod tests {
 
         let err = repo.unset_config("inva lid.key").unwrap_err();
         let cmd_err = CommandError::find_in(&err).expect("error should carry a CommandError");
-        assert_eq!(cmd_err.command_string(), "git config --unset inva lid.key");
+        assert_eq!(
+            cmd_err.command_string(),
+            "git config --unset-all inva lid.key"
+        );
+    }
+
+    #[test]
+    fn test_unset_config_clears_all_values_and_cache() {
+        let test = TestRepo::with_initial_commit();
+        let key = "worktrunk.state.main.vars.example";
+        for value in ["first", "second"] {
+            let output = test
+                .git_command()
+                .args(["config", "--add", key, value])
+                .run()
+                .unwrap();
+            assert!(output.status.success());
+        }
+        let repo = Repository::at(test.root_path()).unwrap();
+        // Populate the bulk cache before clearing, so both cached and fresh
+        // reads must agree with what was removed from disk.
+        assert_eq!(repo.config_value(key).unwrap().as_deref(), Some("second"));
+        assert!(repo.unset_config(key).unwrap());
+        assert_eq!(repo.config_value(key).unwrap(), None);
+        let fresh = Repository::at(test.root_path()).unwrap();
+        assert_eq!(fresh.config_value(key).unwrap(), None);
+        assert!(!repo.unset_config(key).unwrap());
     }
 
     #[test]
@@ -1113,7 +1187,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_config_regexp_returns_matches() {
+    fn test_config_regexp_entries_returns_matches() {
         let test = TestRepo::with_initial_commit();
         let repo = Repository::at(test.root_path()).unwrap();
 
@@ -1122,11 +1196,17 @@ mod tests {
         repo.set_config("worktrunk.state.bugfix.marker", r#"{"marker":"fix"}"#)
             .unwrap();
 
-        let output = repo
-            .get_config_regexp(r"^worktrunk\.state\..+\.marker$")
+        let entries = repo
+            .config_regexp_entries(r"^worktrunk\.state\..+\.marker$")
             .unwrap();
-        assert!(output.contains("worktrunk.state.feature.marker"));
-        assert!(output.contains("worktrunk.state.bugfix.marker"));
+        assert!(entries.contains(&(
+            "worktrunk.state.feature.marker".to_string(),
+            r#"{"marker":"wip"}"#.to_string()
+        )));
+        assert!(entries.contains(&(
+            "worktrunk.state.bugfix.marker".to_string(),
+            r#"{"marker":"fix"}"#.to_string()
+        )));
     }
 
     /// `mark_hint_shown` writes 1 on first call and increments on each
@@ -1183,7 +1263,7 @@ mod tests {
     }
 
     /// The snapshot read must parse the same entries as the subprocess read,
-    /// including branch names that themselves contain `.vars.`.
+    /// including multiline values and branch names containing `.vars.`.
     #[test]
     fn test_all_vars_from_snapshot_matches_subprocess_read() {
         let test = TestRepo::with_initial_commit();
@@ -1191,7 +1271,7 @@ mod tests {
 
         repo.set_config("worktrunk.state.feature.vars.ticket", "JIRA-1")
             .unwrap();
-        repo.set_config("worktrunk.state.feature.vars.note", "a note")
+        repo.set_config("worktrunk.state.feature.vars.note", "a note\ncontinued")
             .unwrap();
         repo.set_config("worktrunk.state.weird.vars.branch.vars.key", "v")
             .unwrap();
@@ -1199,7 +1279,7 @@ mod tests {
         let snapshot = repo.all_vars_from_snapshot().unwrap();
         assert_eq!(snapshot, repo.all_vars_entries());
         assert_eq!(snapshot["feature"]["ticket"], "JIRA-1");
-        assert_eq!(snapshot["feature"]["note"], "a note");
+        assert_eq!(snapshot["feature"]["note"], "a note\ncontinued");
         assert_eq!(snapshot["weird.vars.branch"]["key"], "v");
     }
 

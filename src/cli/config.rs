@@ -33,7 +33,7 @@ pub enum ConfigShellCommand {
 
 ## Manual setup
 
-Add one line to the shell config:
+For bash, fish, zsh, and PowerShell, add the matching line to the shell config. For Nushell, run the command to save the wrapper in its autoload directory.
 
 Bash (~/.bashrc):
 ```console
@@ -50,14 +50,19 @@ Zsh (~/.zshrc):
 eval "$(wt config shell init zsh)"
 ```
 
-Nushell [experimental] — save to vendor autoload directory:
+Nushell 0.113+ [experimental] — save to vendor autoload directory:
 ```console
 $ wt config shell init nu | save -f ($nu.vendor-autoload-dirs | last | path join wt.nu)
+```
+
+PowerShell ($PROFILE):
+```powershell
+Invoke-Expression (& wt config shell init powershell | Out-String)
 ```"#
     )]
     Init {
         /// Shell to generate code for
-        #[arg(value_enum)]
+        #[arg(value_enum, value_name = super::shell_value_name())]
         shell: Shell,
 
         /// Command name for shell integration (defaults to binary name)
@@ -71,7 +76,7 @@ $ wt config shell init nu | save -f ($nu.vendor-autoload-dirs | last | path join
 
     /// Write shell integration to config files
     #[command(
-        after_long_help = r#"Detects existing shell config files and adds the integration line.
+        after_long_help = r#"Appends an initialization line to bash, zsh, and PowerShell config files. For fish and Nushell, it replaces the autoloaded wrapper file; fish also gets a separate completion file. See [worktrunk.dev/shell-integration](/shell-integration/#files-created) for their locations.
 
 ## Examples
 
@@ -90,7 +95,7 @@ Use --yes to skip confirmation."#
     )]
     Install {
         /// Shell to install (default: all)
-        #[arg(value_enum)]
+        #[arg(value_enum, value_name = super::shell_value_name())]
         shell: Option<Shell>,
 
         /// Show what would be changed
@@ -108,7 +113,7 @@ Use --yes to skip confirmation."#
 
     /// Remove shell integration from config files
     #[command(
-        after_long_help = r#"Removes shell integration lines from config files.
+        after_long_help = r#"Removes Worktrunk initialization lines from bash, zsh, and PowerShell config files, and Worktrunk wrapper and completion files for fish and Nushell.
 
 ## Examples
 
@@ -129,13 +134,11 @@ $ wt config shell uninstall --yes
 
 ## Version tolerance
 
-Uninstall removes every worktrunk-managed integration it finds, regardless of:
-- Binary name it was installed under (`wt`, `git-wt`, …)
-- Minor syntax variations between versions"#
+Uninstall recognizes the standalone setup lines written by Worktrunk or shown in `wt config shell init --help`, including older generated forms and custom binary names. Customized initialization lines must be removed manually."#
     )]
     Uninstall {
         /// Shell to uninstall (default: all)
-        #[arg(value_enum)]
+        #[arg(value_enum, value_name = super::shell_value_name())]
         shell: Option<Shell>,
 
         /// Show what would be changed
@@ -186,8 +189,10 @@ $ wt config plugins opencode install --yes
 ## Plugin location
 
 The plugin is written to `~/.config/opencode/plugins/worktrunk.ts`,
-mirroring OpenCode's own global-config precedence:
-`$OPENCODE_CONFIG_DIR` > `$XDG_CONFIG_HOME/opencode` > `~/.config/opencode`."#
+following OpenCode's global-config precedence:
+`$OPENCODE_CONFIG_DIR` > `$XDG_CONFIG_HOME/opencode` > `~/.config/opencode`.
+An empty `$OPENCODE_CONFIG_DIR` and an empty or relative `$XDG_CONFIG_HOME`
+are ignored."#
     )]
     Install,
 
@@ -207,9 +212,13 @@ $ wt config plugins opencode uninstall
 // Ordering: action + inverse adjacent (install, uninstall).
 #[derive(Subcommand)]
 pub enum ConfigPluginsPiCommand {
-    /// Install the activity tracking hook
+    /// Install the activity tracking extension
     #[command(
-        after_long_help = r#"Writes the Worktrunk hook to Pi's profile-aware user hook directory.
+        after_long_help = r#"Writes the Worktrunk extension to Pi's user extension directory.
+
+Where oh-my-pi is on `PATH` and Pi is not — the state a user of the pre-split
+`pi install` is in — the output names `wt config plugins omp install` before
+writing anything.
 
 ## Examples
 
@@ -218,23 +227,65 @@ $ wt config plugins pi install
 $ wt config plugins pi install --yes
 ```
 
-## Plugin location
+## Extension location
 
-The default location is `~/.omp/agent/hooks/pre/worktrunk.ts`. The installer
-honors `$PI_CONFIG_DIR` and active `$OMP_PROFILE` / `$PI_PROFILE` profiles.
-`$PI_CODING_AGENT_DIR` overrides the agent directory for the default profile
-only — named profiles ignore it, matching Pi's own resolution."#
+The default location is `~/.pi/agent/extensions/worktrunk.ts`.
+`$PI_CODING_AGENT_DIR` replaces the agent directory (`~/.pi/agent`).
+
+This targets Pi (<https://github.com/earendil-works/pi>), which loads
+extensions from `extensions/`. oh-my-pi (`omp`) is a separate agent with a
+different hook API — use `wt config plugins omp install` for that."#
     )]
     Install,
 
-    /// Remove the activity tracking hook
+    /// Remove the activity tracking extension
     #[command(
-        after_long_help = r#"Removes the Worktrunk hook from Pi's active user hook directory.
+        after_long_help = r#"Removes the Worktrunk extension from Pi's user extension directory.
+
+Where nothing is installed there while an oh-my-pi hook remains — the state an
+install from before `pi` and `omp` became separate commands leaves behind — the
+output names `wt config plugins omp uninstall` rather than reporting a removal.
 
 ## Examples
 
 ```console
 $ wt config plugins pi uninstall
+```"#
+    )]
+    Uninstall,
+}
+
+// Ordering: action + inverse adjacent (install, uninstall).
+#[derive(Subcommand)]
+pub enum ConfigPluginsOmpCommand {
+    /// Install the activity tracking hook
+    #[command(
+        after_long_help = r#"Writes the Worktrunk hook to oh-my-pi's profile-aware user hook directory.
+
+## Examples
+
+```console
+$ wt config plugins omp install
+$ wt config plugins omp install --yes
+```
+
+## Hook location
+
+The default location is `~/.omp/agent/hooks/pre/worktrunk.ts`. The installer
+honors `$PI_CONFIG_DIR` and active `$OMP_PROFILE` / `$PI_PROFILE` profiles.
+`$PI_CODING_AGENT_DIR` overrides the agent directory for the default profile
+only — named profiles ignore it, matching oh-my-pi's own resolution."#
+    )]
+    Install,
+
+    /// Remove the activity tracking hook
+    #[command(
+        after_long_help = r#"Removes the Worktrunk hook from oh-my-pi's active user hook directory.
+
+## Examples
+
+```console
+$ wt config plugins omp uninstall
 ```"#
     )]
     Uninstall,
@@ -277,7 +328,7 @@ pub enum ApprovalsCommand {
     #[command(
         after_long_help = r#"Shows every command the project config declares — hooks, aliases, and commit-message guidance — grouped into APPROVED and UNAPPROVED sections. Approvals recorded for commands no longer in the project config (edited or removed since approval) are listed separately.
 
-Reading is all it does: no prompt, no write. `--format=json` emits the same four distinctions as a structured payload — see [Reading approval state](/config/#reading-approval-state).
+Reading is all it does: no prompt, no write. `--format=json` emits the same four distinctions as a structured payload — see [Reading approval state](/config/#wt-config-approvals--reading-approval-state).
 
 ## Examples
 
@@ -303,7 +354,7 @@ $ wt config approvals list --format=json | jq -r .state
 By default, shows only unapproved commands. Use `--all` to review all commands
 including previously approved ones.
 
-`--yes` writes the approvals without prompting, which is how a container or CI job pre-approves a project it has just cloned. It trusts every command the project config declares, including one whose template changed since an earlier approval. A caller that wants to look before granting them can list those first — see [Reading approval state](/config/#reading-approval-state).
+`--yes` writes the approvals without prompting, which is how a container or CI job pre-approves a project it has just cloned. It trusts every command the project config declares, including one whose template changed since an earlier approval. A caller that wants to look before granting them can list those first — see [Reading approval state](/config/#wt-config-approvals--reading-approval-state).
 
 ## Examples
 
@@ -378,6 +429,32 @@ $ wt config plugins codex uninstall
         action: ConfigPluginsCodexCommand,
     },
 
+    /// oh-my-pi activity hook
+    #[command(
+        after_long_help = r#"Activity tracking hook — shows status markers in `wt list`:
+- 🤖 — agent is working
+- 💬 — agent is waiting for input
+
+oh-my-pi's `session_shutdown` event clears the marker when the session exits.
+
+## Examples
+
+```console
+$ wt config plugins omp install
+$ wt config plugins omp uninstall
+```
+
+## Hook location
+
+Written to `~/.omp/agent/hooks/pre/worktrunk.ts`. Honors `$PI_CONFIG_DIR`,
+the active `$OMP_PROFILE` / `$PI_PROFILE` profile, and `$PI_CODING_AGENT_DIR`
+for the default profile."#
+    )]
+    Omp {
+        #[command(subcommand)]
+        action: ConfigPluginsOmpCommand,
+    },
+
     /// OpenCode plugin
     #[command(
         after_long_help = r#"Activity tracking plugin — shows status markers in `wt list`:
@@ -393,18 +470,19 @@ $ wt config plugins opencode uninstall
 
 ## Plugin location
 
-Written to `~/.config/opencode/plugins/worktrunk.ts`. Honors OpenCode's
+Written to `~/.config/opencode/plugins/worktrunk.ts`. Follows OpenCode's
 config precedence: `$OPENCODE_CONFIG_DIR` > `$XDG_CONFIG_HOME/opencode` >
-`~/.config/opencode`."#
+`~/.config/opencode`. An empty `$OPENCODE_CONFIG_DIR` and an empty or relative
+`$XDG_CONFIG_HOME` are ignored."#
     )]
     Opencode {
         #[command(subcommand)]
         action: ConfigPluginsOpencodeCommand,
     },
 
-    /// Pi / oh-my-pi activity hook
+    /// Pi activity extension
     #[command(
-        after_long_help = r#"Activity tracking hook — shows status markers in `wt list`:
+        after_long_help = r#"Activity tracking extension — shows status markers in `wt list`:
 - 🤖 — agent is working
 - 💬 — agent is waiting for input
 
@@ -415,7 +493,12 @@ Pi's `session_shutdown` event clears the marker when the session exits.
 ```console
 $ wt config plugins pi install
 $ wt config plugins pi uninstall
-```"#
+```
+
+## Extension location
+
+Written to `~/.pi/agent/extensions/worktrunk.ts`. `$PI_CODING_AGENT_DIR`
+replaces the agent directory."#
     )]
     Pi {
         #[command(subcommand)]
@@ -467,6 +550,14 @@ Preserves existing settings. Creates the config directory and `settings.json` if
 Skips gracefully if the statusline is already configured."#
     )]
     InstallStatusline,
+
+    /// Internal: the plugin's hook command, reading Claude Code's hook payload from stdin
+    #[command(hide = true)]
+    Hook,
+
+    /// Internal: the PermissionRequest hook of plugin copies that predate `hook`
+    #[command(hide = true, name = "approve-enter-worktree")]
+    ApproveEnterWorktree,
 }
 
 // Ordering: introspection adjacent to invocation — show prints the template,
@@ -538,6 +629,36 @@ $ wt config alias dry-run deploy -- --env=staging
 #[derive(Subcommand)]
 pub enum ConfigCommand {
     /// Shell integration setup
+    #[command(
+        after_long_help = r#"A subprocess cannot change its parent shell's directory. Shell integration defines a function that runs the Worktrunk binary, then changes the shell's directory when the command requests it. It also enables tab completion.
+
+## Setup
+
+```console
+$ wt config shell install
+```
+
+Start a new shell after installation to load the wrapper. Invoke `wt` by name. Running a binary path or `git wt` bypasses the wrapper, so the shell's directory stays unchanged.
+
+- `wt config shell install --help` — installation options
+- `wt config shell init --help` — manual setup
+- `wt config shell uninstall` — remove the integration
+
+## Check the current shell
+
+```console
+$ wt config show
+```
+
+The SHELL INTEGRATION section reports whether the wrapper is active in the current session. Installation and activation are separate: a configured shell can still be running without the wrapper until its config is reloaded.
+
+In bash, zsh, or fish, `type wt` checks that `wt` resolves to a function. In PowerShell, `Get-Command wt -All` lists the Function and Application definitions.
+
+See [worktrunk.dev/shell-integration](/shell-integration/) for warning messages, installed files, and wrapper behavior.
+<!-- subdoc: init -->
+<!-- subdoc: install -->
+<!-- subdoc: uninstall -->"#
+    )]
     Shell {
         #[command(subcommand)]
         action: ConfigShellCommand,
@@ -577,7 +698,7 @@ $ wt config show --full
 ```
 
 This tests:
-- **CI tool status** — Whether `gh` (GitHub) or `glab` (GitLab) is installed and authenticated
+- **CI tool status** — Whether the CLI for the repository's forge (`gh`, `glab`, `tea`, or `az`) is installed and authenticated
 - **Commit generation** — Whether the LLM command can generate commit messages
 - **Version check** — Whether a newer version is available on GitHub"#
     )]
@@ -597,15 +718,6 @@ This tests:
 to their current equivalents, removes deprecated keys that have no equivalent,
 and reports each one. Shows a diff and asks for confirmation.
 
-Migrations are computed in memory on demand; nothing is written outside this
-command. Set `--output <path>` to write a migrated config to that destination
-instead of applying it in place. Use `-` for stdout. When both user and project
-config need migration, stdout emits a labeled inspection artifact and file
-output fails rather than combining the configs.
-
-`--output` omits deprecated `approved-commands` with a stderr warning; only an
-in-place update migrates them to `approvals.toml`.
-
 ## Examples
 
 Preview and apply updates:
@@ -618,12 +730,12 @@ Apply without confirmation:
 $ wt config update --yes
 ```
 
-Write the migration artifact to a file:
+Write the migrated config to a file instead of updating in place:
 ```console
 $ wt config update --output migrated.toml
 ```
 
-Write the migration artifact to stdout:
+Print the migrated config:
 ```console
 $ wt config update --output=-
 ```"#
@@ -679,7 +791,7 @@ $ wt config approvals list --format=json | jq -r .state
 
 Approved commands are saved to `~/.config/worktrunk/approvals.toml`. Re-approval is required when the command template changes or the project moves.
 
-`--yes` bypasses the prompt, and what it leaves behind depends on the command it is passed to. On a command that runs project commands it grants consent for that run alone and records nothing, so the next run asks again. On `wt config approvals add` the record is the whole point, so the approvals are written — which is how an unattended environment pre-approves a project it has just cloned.
+`--yes` approves project commands for the current run without saving approval. `wt config approvals add --yes` saves approvals for future runs.
 
 ## Reading approval state
 
@@ -698,7 +810,7 @@ Approved commands are saved to `~/.config/worktrunk/approvals.toml`. Re-approval
 
 `state` is `no_commands` (the project declares none), `approval_required` (at least one is unapproved), or `approved`. `name` is absent for an unnamed command and for the commit-template fragment.
 
-`stale` is separate rather than a fourth `state`, because it co-occurs with all three: these are approvals recorded earlier whose command has since been edited or removed from the project config. They are what `--yes` would silently re-approve, so an orchestrator preserving the approval model reads them before choosing that flag."#
+`stale`, which can accompany any `state`, lists approvals whose command has since been edited or removed from the project config."#
     )]
     Approvals {
         #[command(subcommand)]
@@ -739,15 +851,17 @@ $ wt config alias dry-run deploy -- --env=staging
 ## Supported tools
 
 - **claude** — Claude Code plugin (activity tracking + statusline)
-- **codex** — Codex plugin (Worktrunk configuration skill)
+- **codex** — Codex plugin (activity tracking + Worktrunk configuration skill)
+- **omp** — oh-my-pi hook (activity tracking)
 - **opencode** — OpenCode plugin (activity tracking)
-- **pi** — Pi / oh-my-pi plugin (activity tracking)
+- **pi** — Pi extension (activity tracking)
 
 ## Examples
 
 ```console
 $ wt config plugins claude install
 $ wt config plugins codex install
+$ wt config plugins omp install
 $ wt config plugins opencode install
 $ wt config plugins pi install
 ```"#
@@ -808,7 +922,6 @@ $ wt config state clear
 <!-- subdoc: cache -->
 <!-- subdoc: default-branch -->
 <!-- subdoc: logs -->
-<!-- subdoc: ci-status -->
 <!-- subdoc: marker -->
 <!-- subdoc: vars -->"#
     )]
@@ -836,7 +949,7 @@ pub enum StateCommand {
 - **Previous branch**: Previous branch for `wt switch -`
 - **Branch markers**: User-defined branch notes
 - **Vars**: Custom variables per branch
-- **CI status**: Cached GitHub/GitLab CI status per branch (30-60s TTL), plus the largest PR/MR number seen (sizes the `wt list` CI column)
+- **CI status**: Cached forge CI status per branch (30-60s TTL)
 - **Summaries**: Cached LLM-generated branch summaries (shown in `wt list --full` and `wt switch` preview)
 - **Git commands cache**: Cached merge-tree, ancestry, diff-stat, and `wt switch` preview results
 - **Hints**: One-time hints that have been shown
@@ -879,7 +992,7 @@ untouched."#)]
 
 ## What's cached
 
-- **CI status** — GitHub/GitLab CI per branch (30–60s TTL), shown in [`wt list`](/list/#ci-status), plus the largest PR/MR number seen (sizes the CI column)
+- **CI status** — forge CI per branch (30–60s TTL), shown in [`wt list`](/list/#ci-status)
 - **Summaries** — LLM-generated branch summaries (`wt list --full`, `wt switch` preview)
 - **Git commands** — cached merge-tree, ancestry, diff-stat, and `wt switch` preview results
 - **Hints** — one-time hints already shown in this repo
@@ -922,20 +1035,16 @@ In a hook or alias template, prefer the `{{ default_branch }}` [template variabl
 
 Without a subcommand, runs `get`. `set` stores the override in the repository's local git config. The override adds no project file and applies to every linked worktree in the clone. `clear` then `get` re-detects. The branch must exist locally for `wt list` comparisons.
 
-`default-branch get` resolves the value and caches it on a miss; the aggregate `wt config state get` only reports the cache (read-only), so it can show `(none)` until something populates it.
-
 ## Detection
 
 Worktrunk detects the default branch automatically:
 
 1. **Worktrunk cache** — Checks `git config worktrunk.default-branch`
 2. **Git cache** — Detects primary remote and checks its HEAD (e.g., `origin/HEAD`)
-3. **Remote query** — If not cached, queries `git ls-remote` — typically 100ms–2s, abandoned after 10s
+3. **Remote query** — If not cached, queries `git ls-remote`, giving up after 10s
 4. **Local inference** — If no remote, or the query was abandoned, infers from local branches
 
-Once detected, the result is cached in `worktrunk.default-branch` for fast access. The cache isn't re-validated on every command, so a later change to `origin/HEAD` — a renamed default branch followed by `git remote set-head origin -a` — isn't picked up automatically. `wt config state` flags the drift when the cached value differs from the remote's local HEAD — expected for a deliberate override; `set` adopts the new branch and `clear` re-detects.
-
-An abandoned remote query is the one case that isn't cached: the branch it inferred locally answers that command, but a value guessed while the remote was unreachable would otherwise become permanent, so the next command queries again.
+Once detected, the result is cached in `worktrunk.default-branch` — except a value inferred after the remote query was abandoned, so an outage can't make a guess permanent. A later change to `origin/HEAD` isn't picked up automatically: `wt config state` flags the mismatch, `set` adopts the new branch, and `clear` re-detects.
 
 The local inference fallback uses these heuristics in order:
 - If only one local branch exists, uses it
@@ -960,7 +1069,7 @@ Enables `wt switch -` to return to the previous worktree, similar to `cd -` or `
 
 ## How it works
 
-Updated automatically on every `wt switch`. Stored in git config as `worktrunk.history`.
+Updated automatically on every `wt switch`. Stored in git config as `worktrunk.history`, with the worktree's path in `worktrunk.history-path`.
 
 Without a subcommand, runs `get`. Use `set` to override or `clear` to reset."#
     )]
@@ -1001,7 +1110,7 @@ Hook output lives in per-branch subtrees under `.git/wt/logs/{branch}/`:
 | Background hooks | `{branch}/{source}/{hook-type}/{name}.log` |
 | Background removal | `{branch}/internal/remove.log` |
 
-All `post-*` hooks (post-start, post-switch, post-commit, post-merge) run in the background and produce log files. Source is `user` or `project`. Branch and hook names are sanitized for filesystem safety (invalid characters → `-`; short collision-avoidance hash appended). Same operation on same branch overwrites the previous log. Removing a branch clears its subtree; orphans from deleted branches can be swept with `wt config state logs clear`.
+All `post-*` hooks (post-start, post-switch, post-commit, post-merge, post-remove) run in the background and produce log files. Source is `user` or `project`. Branch and hook names are sanitized for filesystem safety. Same operation on same branch overwrites the previous log. Removing a branch clears its subtree; orphans from deleted branches can be swept with `wt config state logs clear`.
 
 ### Diagnostic files
 
@@ -1012,15 +1121,15 @@ All `post-*` hooks (post-start, post-switch, post-commit, post-merge) run in the
 | `subprocess.log` | Running with `-vv` |
 | `diagnostic.md` | Running with `-vv` |
 
-`trace.log` is the human-readable trace at `-vv` — each command's start (`$ …`) and completion (`✓`/`✗ … 12.3ms`), in-process spans, milestones, and bounded subprocess previews. `trace.jsonl` is the same event stream as one JSON object per line, for machines (`jq`, chrome://tracing); `wt config state logs profile` reads it to summarize a performance report (where time went, parallelism, redundant commands). `subprocess.log` holds the raw uncapped subprocess stdout/stderr bodies. `diagnostic.md` is a markdown bug-report bundle that leads with that same performance profile and inlines `trace.log`; `wt` prints a `gh gist create` command pointing at it. All four are overwritten on each `-vv` run.
+`trace.log` is the human-readable trace of commands and their timings. `trace.jsonl` holds the same events as JSON lines, which `wt config state logs profile` summarizes into a performance report. `subprocess.log` holds full subprocess output. `diagnostic.md` is a bug-report bundle; `wt` prints a `gh gist create` command for it. All four are overwritten on each `-vv` run.
 
 ## Location
 
-All logs are stored in `.git/wt/logs/` (in the main worktree's git directory). All worktrees write to the same directory. Top-level files are shared logs (command audit + diagnostics); top-level directories are per-branch log trees.
+All logs are stored in `.git/wt/logs/` (in the main worktree's git directory). All worktrees write to the same directory.
 
 ## Structured output
 
-`wt config state logs --format=json` emits three arrays — `command_log`, `hook_output`, `diagnostic`. Each entry carries a `file` (relative), `path` (absolute), `size`, and `modified_at` (unix seconds). Hook-output entries additionally expose `branch`, `source` (`user` / `project` / `internal`), `hook_type` (the `post-*` kind, or `null` for internal ops), and `name`. Filter with `jq` to pick out a specific entry.
+`wt config state logs --format=json` emits three arrays — `command_log`, `hook_output`, `diagnostic`. Each entry carries a `file` (relative), `path` (absolute), `size`, and `modified_at` (unix seconds). Hook-output entries additionally expose `branch`, `source` (`user` / `project` / `internal`), `hook_type` (the `post-*` kind, or `null` for internal ops), and `name`. `branch` is the branch name, or `null` when no local branch writes to that log directory (e.g. the branch was deleted). `name` is the hook name as it appears in the log path, which differs from the configured name only when that contains characters unsafe in a filename. Filter with `jq` to pick out a specific entry.
 
 ## Examples
 
@@ -1036,12 +1145,12 @@ $ tail -5 .git/wt/logs/commands.jsonl | jq .
 
 Path to one hook log (e.g. the `post-start` `server` hook for the current branch):
 ```console
-$ wt config state logs --format=json | jq -r '.hook_output[] | select(.source == "user" and .hook_type == "post-start" and (.name | startswith("server"))) | .path'
+$ wt config state logs --format=json | jq -r --arg branch "$(git branch --show-current)" '.hook_output[] | select([.branch, .source, .hook_type, .name] == [$branch, "user", "post-start", "server"]) | .path'
 ```
 
 Logs for a specific branch:
 ```console
-$ wt config state logs --format=json | jq '.hook_output[] | select(.branch | startswith("feature"))'
+$ wt config state logs --format=json | jq '.hook_output[] | select(.branch == "feature/auth")'
 ```
 
 Clear all logs:
@@ -1122,7 +1231,7 @@ wt list
 ## Use cases
 
 - **Work status** — `🚧` WIP, `✅` ready for review, `🔥` urgent
-- **Agent tracking** — The [Claude Code](/claude-code/) plugin sets markers automatically
+- **Agent tracking** — [Agent plugins](/claude-code/) set markers automatically
 - **Notes** — Any short text: `"blocked"`, `"needs tests"`
 
 ## Storage
@@ -1176,6 +1285,7 @@ $ wt config state vars set env=production --branch=main
 Variables are available in [hook templates](/hook/#template-variables) as `{{ vars.<key> }}`. Use the `default` filter for keys that may not be set:
 
 ```toml
+# .config/wt.toml
 [post-start]
 dev = "ENV={{ vars.env | default('development') }} npm start -- --port {{ vars.port | default('3000') }}"
 ```
@@ -1186,13 +1296,14 @@ JSON object and array values support dot access:
 $ wt config state vars set config='{"port": 3000, "debug": true}'
 ```
 ```toml
+# .config/wt.toml
 [post-start]
 dev = "npm start -- --port {{ vars.config.port }}"
 ```
 
 ## Storage format
 
-Stored in git config as `worktrunk.state.<branch>.vars.<key>`. Keys must contain only letters, digits and hyphens — dots conflict with git config's section separator, underscores with its variable name format."#
+Stored in git config as `worktrunk.state.<branch>.vars.<key>`. Keys may contain only letters, digits, and hyphens."#
     )]
     Vars {
         #[command(subcommand)]
@@ -1415,14 +1526,14 @@ List all log files:
 $ wt config state logs
 ```
 
-Get the absolute path of one post-start hook log for the current branch (use `jq` to filter):
+Get the absolute path of the current branch's `server` post-start hook log:
 ```console
-$ wt config state logs --format=json | jq -r '.hook_output[] | select(.source == "user" and .hook_type == "post-start" and (.name | startswith("server"))) | .path'
+$ wt config state logs --format=json | jq -r --arg branch "$(git branch --show-current)" '.hook_output[] | select([.branch, .source, .hook_type, .name] == [$branch, "user", "post-start", "server"]) | .path'
 ```
 
 Stream that log with `tail -f`:
 ```console
-$ tail -f "$(wt config state logs --format=json | jq -r '.hook_output[] | select(.source == "user" and .hook_type == "post-start" and (.name | startswith("server"))) | .path' | head -1)"
+$ tail -f "$(wt config state logs --format=json | jq -r --arg branch "$(git branch --show-current)" '.hook_output[] | select([.branch, .source, .hook_type, .name] == [$branch, "user", "post-start", "server"]) | .path')"
 ```
 
 Logs for a background worktree removal (internal op):
@@ -1432,7 +1543,7 @@ $ wt config state logs --format=json | jq '.hook_output[] | select(.source == "i
 
 Logs for a specific branch:
 ```console
-$ wt config state logs --format=json | jq '.hook_output[] | select(.branch | startswith("feature"))'
+$ wt config state logs --format=json | jq '.hook_output[] | select(.branch == "feature/auth")'
 ```"#
     )]
     Get,
@@ -1659,7 +1770,7 @@ $ wt config state vars clear --all
 
 Clear all keys for a specific branch:
 ```console
-$ wt config state vars clear env --branch=feature
+$ wt config state vars clear --all --branch=feature
 ```"#)]
     Clear {
         /// Key to clear (required unless --all)

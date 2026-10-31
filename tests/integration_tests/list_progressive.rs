@@ -5,9 +5,153 @@
 #![cfg(all(unix, feature = "shell-integration-tests"))]
 
 use crate::common::progressive_output::{ProgressiveCaptureOptions, capture_progressive_output};
-use crate::common::pty::{build_pty_command, exec_cmd_in_pty};
+use crate::common::pty::{build_pty_command, exec_cmd_in_pty, exec_cmd_in_pty_prompted_with};
 use crate::common::{TestRepo, repo, wt_bin};
+use ansi_str::AnsiStr;
 use rstest::rstest;
+
+/// Loading footers distinguish inventory, visible rows, and task progress.
+/// Capture the complete PTY stream so even a fast run exercises the counter,
+/// including progress from off-screen rows.
+#[test]
+fn test_list_progressive_loading_footer() {
+    let mut repo = TestRepo::standard_main_only();
+    repo.add_worktree("feature-a");
+    repo.add_worktree("feature-b");
+    for branch in ["branch-a", "branch-b"] {
+        repo.run_git(&["branch", branch]);
+    }
+
+    let progress_pattern =
+        regex::Regex::new(r"○ (\d+)/(\d+) tasks complete — (\d+ worktrees[^\r\n]*)").unwrap();
+    let mut previous_total = None;
+    for (height, width, expected) in [
+        (30, 150, "○ 3 worktrees, 2 branches — loading details…"),
+        (
+            9,
+            150,
+            "○ 3 worktrees, 2 branches — first 3 of 5 shown — loading details…",
+        ),
+        (
+            9,
+            60,
+            "○ 3 worktrees, 2 branches — first 3 of 5 shown — loading de…",
+        ),
+    ] {
+        let pair = crate::common::open_pty_with_size(height, width);
+        let cmd = build_pty_command(
+            wt_bin().to_str().unwrap(),
+            &["list", "--progressive", "--branches"],
+            repo.root_path(),
+            &repo.test_env_vars(),
+            None,
+        );
+        let mut child = pair.slave.spawn_command(cmd).unwrap();
+        drop(pair.slave);
+        let reader = pair.master.try_clone_reader().unwrap();
+        let writer = pair.master.take_writer().unwrap();
+        let (raw, exit_code) =
+            crate::common::pty::read_pty_output(reader, writer, pair.master, &mut child);
+        assert_eq!(exit_code, 0);
+        let output = raw.ansi_strip();
+        let loading_footers: Vec<_> = output
+            .lines()
+            .filter(|line| line.contains(" — loading "))
+            .map(|line| &line[line.find('○').unwrap()..])
+            .collect();
+        assert!(
+            !loading_footers.is_empty(),
+            "initial footer missing: {output}"
+        );
+        for footer in loading_footers {
+            assert_eq!(footer.trim_end(), expected);
+        }
+        let progress: Vec<_> = progress_pattern
+            .captures_iter(&output)
+            .map(|capture| {
+                if width == 150 {
+                    assert_eq!(
+                        &capture[3],
+                        expected
+                            .strip_prefix("○ ")
+                            .unwrap()
+                            .strip_suffix(" — loading details…")
+                            .unwrap()
+                    );
+                }
+                (
+                    capture[1].parse::<usize>().unwrap(),
+                    capture[2].parse::<usize>().unwrap(),
+                )
+            })
+            .collect();
+        let total = progress.last().expect("task counter missing").1;
+        assert!(total > 0);
+        assert_eq!(progress.first(), Some(&(0, total)));
+        assert_eq!(progress.last(), Some(&(total, total)));
+        assert!(
+            progress
+                .iter()
+                .all(|&(_, denominator)| denominator == total)
+        );
+        assert!(progress.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+        if let Some(previous_total) = previous_total {
+            assert_eq!(
+                total, previous_total,
+                "clipping must not change task totals"
+            );
+        }
+        previous_total = Some(total);
+        assert!(
+            output.contains("Showing 3 worktrees, 2 branches"),
+            "final summary missing: {output}"
+        );
+    }
+}
+
+/// Keep one summary pending until the stall footer is visible, then let it
+/// finish. Dropping the gate also releases the command if the test panics.
+#[test]
+fn test_list_progressive_stall_keeps_task_progress() {
+    let mut repo = TestRepo::standard_main_only();
+    repo.add_worktree("clean");
+    std::fs::write(repo.root_path().join("file.txt"), "changed\n").unwrap();
+    repo.write_test_config(
+        r#"
+[list]
+columns = ["branch", "summary"]
+
+[commit.generation]
+command = 'cat >/dev/null; while [ -e "$WORKTRUNK_TEST_SUMMARY_GATE" ]; do sleep 0.05; done; echo Update content'
+"#,
+    );
+    let mut gate = Some(tempfile::NamedTempFile::new_in(repo.home_path()).unwrap());
+    let mut env = repo.test_env_vars();
+    env.push((
+        "WORKTRUNK_TEST_SUMMARY_GATE".to_owned(),
+        gate.as_ref().unwrap().path().to_str().unwrap().to_owned(),
+    ));
+    let cmd = build_pty_command(
+        wt_bin().to_str().unwrap(),
+        &["list", "--progressive"],
+        repo.root_path(),
+        &env,
+        None,
+    );
+    let stall_marker = "1/2 tasks complete — no recent progress;";
+    let (raw, exit_code) = exec_cmd_in_pty_prompted_with(cmd, &[""], stall_marker, |_| {
+        gate.take();
+    });
+    assert_eq!(exit_code, 0);
+    let output = raw.ansi_strip();
+    let stall = output
+        .lines()
+        .find(|line| line.contains(stall_marker))
+        .unwrap();
+    insta::assert_snapshot!(stall.trim(), @"○ 1/2 tasks complete — no recent progress; waiting on summary generation for main — 2 worktrees");
+    assert!(output.contains("○ 2/2 tasks complete — 2 worktrees"));
+    assert!(output.contains("Showing 2 worktrees"));
+}
 
 /// Tests progressive rendering with multiple worktrees.
 /// Verifies: headers appear immediately, dots decrease over time, all worktrees visible.

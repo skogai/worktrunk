@@ -15,7 +15,7 @@
 //! **Authoritative** (hand-authored or override state; lost permanently if
 //! cleared). `state clear` prompts before removing these unless `--yes`:
 //!
-//! - Default branch override (git config `worktrunk.default_branch.*`)
+//! - Default branch override (git config `worktrunk.default-branch`)
 //! - Branch markers (git config `worktrunk.state.<branch>.marker`)
 //! - Vars (git config `worktrunk.state.<branch>.vars.*`)
 //! - Logs (`.git/wt/logs/`)
@@ -25,7 +25,7 @@
 //! (`handle_cache_get`) and dropped by `wt config state cache clear`
 //! (`handle_cache_clear`), which needs no prompt:
 //!
-//! - Previous branch (git config `worktrunk.history`)
+//! - Previous branch (git config `worktrunk.history`, with `worktrunk.history-path`)
 //! - CI status cache (`.git/wt/cache/ci-status/`, plus the PR-number width
 //!   ratchet in `.git/wt/cache/pr-number/`)
 //! - Summary cache (`.git/wt/cache/summary/`)
@@ -69,6 +69,7 @@
 //! must remain files. If a future category needs multiple files, it should live
 //! under a single reserved subdirectory rather than adding sibling top-level dirs.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -77,7 +78,9 @@ use anyhow::Context;
 use color_print::cformat;
 use path_slash::PathExt as _;
 use worktrunk::git::{BranchRef, CommandError, Repository, resolve_input_path, sha_cache};
-use worktrunk::path::format_path_for_display;
+use worktrunk::path::{format_path_for_display, sanitize_for_filename};
+use worktrunk::progress::Progress;
+use worktrunk::remove_dir::remove_dir_with_progress;
 use worktrunk::styling::{
     eprintln, format_heading, format_with_gutter, hint_message, info_message, println,
     success_message, warning_message,
@@ -206,7 +209,7 @@ fn sort_hook_entries(entries: &mut [HookOutputEntry]) {
 /// A top-level entry staged under `wt_trash_dir()`.
 ///
 /// Worktree removal renames directories into `.git/wt/trash/<name>-<timestamp>`
-/// and a background `rm -rf` cleans them up; entries still present here are
+/// and a background trash drain deletes them; entries still present here are
 /// awaiting (or escaped) that sweep.
 struct TrashEntry {
     /// Filename, e.g. `myproject.feature-1234567890`.
@@ -221,7 +224,7 @@ struct TrashEntry {
 /// Only the first level matters — each entry is one staged worktree (a
 /// directory) or a stray file. Sorted by mtime (newest first) with name as
 /// tie-breaker. Individual dirent/metadata failures are skipped: `state get`
-/// is a read-only inspector and can race with the background `rm -rf`, so a
+/// is a read-only inspector and can race with the background trash drain, so a
 /// partial listing is more useful than a hard failure.
 fn list_trash_entries(repo: &Repository) -> anyhow::Result<Vec<TrashEntry>> {
     let trash_dir = repo.wt_trash_dir();
@@ -251,7 +254,7 @@ fn list_trash_entries(repo: &Repository) -> anyhow::Result<Vec<TrashEntry>> {
 /// Clear stale entries from the wt/trash directory.
 ///
 /// Worktree removal renames directories into `.git/wt/trash/` for instant UX,
-/// then deletes them in a background process. If the background `rm -rf` fails
+/// then deletes them in a background process. If the background drain fails
 /// or is killed, entries accumulate. This cleans them up.
 fn clear_trash(repo: &Repository) -> anyhow::Result<usize> {
     let trash_dir = repo.wt_trash_dir();
@@ -262,13 +265,12 @@ fn clear_trash(repo: &Repository) -> anyhow::Result<usize> {
 
     let mut cleared = 0;
     for entry in std::fs::read_dir(&trash_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            std::fs::remove_dir_all(&path)?;
-        } else {
-            std::fs::remove_file(&path)?;
-        }
+        let path = entry?.path();
+        anyhow::ensure!(
+            remove_dir_with_progress(&path, &Progress::disabled()),
+            "Failed to remove {}",
+            format_path_for_display(&path)
+        );
         cleared += 1;
     }
 
@@ -360,11 +362,12 @@ struct LogRow {
 
 /// Structured view of a hook-output log path. Values are the on-disk (sanitized)
 /// names, so filters like `select(.source == "user")` work without splitting
-/// the relative path on `/`.
+/// the relative path on `/`. The JSON `branch` field is the exception: it maps
+/// `branch_dir` back to the branch name (see [`branch_by_log_dir`]).
 struct HookStructure {
     /// First path segment — sanitized branch directory (may include a short
     /// collision-avoidance hash).
-    branch: String,
+    branch_dir: String,
     /// `"user"`, `"project"`, or `"internal"`.
     source: String,
     /// Hook type (`post-start`, `post-switch`, …) for user/project hooks;
@@ -377,15 +380,22 @@ struct HookStructure {
 
 impl LogRow {
     fn to_json(&self) -> serde_json::Value {
-        let mut obj = serde_json::json!({
+        serde_json::json!({
             "file": self.display_name,
             "path": self.path,
             "size": self.size,
             "modified_at": self.modified_at,
-        });
+        })
+    }
+
+    /// JSON for a hook-output row: the base fields plus the structured
+    /// segments, with `branch` resolved through `branch_by_dir`.
+    fn to_hook_json(&self, branch_by_dir: &HashMap<String, Option<String>>) -> serde_json::Value {
+        let mut obj = self.to_json();
         if let Some(s) = &self.hook_structure {
             let map = obj.as_object_mut().expect("json! produced an object");
-            map.insert("branch".into(), s.branch.clone().into());
+            let branch = branch_by_dir.get(&s.branch_dir).cloned().flatten();
+            map.insert("branch".into(), branch.into());
             map.insert("source".into(), s.source.clone().into());
             map.insert(
                 "hook_type".into(),
@@ -451,14 +461,14 @@ fn hook_output_log_row(log_dir: &Path, entry: &HookOutputEntry) -> LogRow {
 fn parse_hook_structure(relative: &str) -> Option<HookStructure> {
     let parts: Vec<&str> = relative.split('/').collect();
     match parts.as_slice() {
-        [branch, "internal", op_log] => Some(HookStructure {
-            branch: (*branch).to_string(),
+        [branch_dir, "internal", op_log] => Some(HookStructure {
+            branch_dir: (*branch_dir).to_string(),
             source: "internal".to_string(),
             hook_type: None,
             name: op_log.strip_suffix(".log").unwrap_or(op_log).to_string(),
         }),
-        [branch, source, hook_type, name_log] => Some(HookStructure {
-            branch: (*branch).to_string(),
+        [branch_dir, source, hook_type, name_log] => Some(HookStructure {
+            branch_dir: (*branch_dir).to_string(),
             source: (*source).to_string(),
             hook_type: Some((*hook_type).to_string()),
             name: name_log
@@ -509,12 +519,34 @@ fn partition_log_files_json(
         .iter()
         .map(|e| hook_output_log_row(&log_dir, e))
         .collect();
+    let branch_by_dir = branch_by_log_dir(repo)?;
 
     Ok((
         cmd_rows.iter().map(LogRow::to_json).collect(),
-        hook_rows.iter().map(LogRow::to_json).collect(),
+        hook_rows
+            .iter()
+            .map(|r| r.to_hook_json(&branch_by_dir))
+            .collect(),
         diagnostic_rows.iter().map(LogRow::to_json).collect(),
     ))
+}
+
+/// Map each hook-log branch directory back to the local branch that writes it.
+///
+/// A branch's logs live under `sanitize_for_filename(branch)`, which appends a
+/// one-way hash to names that aren't filename-safe (`feature/x` →
+/// `feature-x-<hash>`), so the directory alone can't recover the name.
+/// Sanitizing every local branch inverts it for the branches that still exist.
+/// A directory two branches share maps to `None`, as does (by absence) one
+/// whose branch was deleted, so `branch` in JSON is either exact or `null`.
+fn branch_by_log_dir(repo: &Repository) -> anyhow::Result<HashMap<String, Option<String>>> {
+    let mut map = HashMap::new();
+    for branch in repo.local_branches()? {
+        map.entry(sanitize_for_filename(&branch.name))
+            .and_modify(|b| *b = None)
+            .or_insert_with(|| Some(branch.name.clone()));
+    }
+    Ok(map)
 }
 
 /// Sort log rows by mtime (newest first), stable on display name.
@@ -642,7 +674,7 @@ pub fn handle_logs_list(format: SwitchFormat) -> anyhow::Result<()> {
     let mut out = String::new();
     render_all_log_sections(&mut out, &repo)?;
 
-    show_help_in_pager(&out, true);
+    show_help_in_pager(&out, true)?;
     Ok(())
 }
 
@@ -692,7 +724,7 @@ pub fn handle_logs_profile(file: Option<PathBuf>, format: SwitchFormat) -> anyho
     if format == SwitchFormat::Json {
         print_json(&profile)?;
     } else {
-        show_help_in_pager(&profile.render_text(&source), true);
+        show_help_in_pager(&profile.render_text(&source), true)?;
     }
     Ok(())
 }
@@ -713,7 +745,7 @@ pub fn handle_state_get(
         "default-branch" => {
             let branch_name = repo.default_branch().ok_or_else(|| {
                 anyhow::anyhow!(cformat!(
-                    "Cannot determine default branch. To configure, run <bold>wt config state default-branch set BRANCH</>"
+                    "Cannot determine default branch; to configure one, run <bold>wt config state default-branch set BRANCH</>"
                 ))
             })?;
             println!("{branch_name}");
@@ -723,10 +755,8 @@ pub fn handle_state_get(
             None => println!(""),
         },
         "marker" => {
-            let branch_name = match branch {
-                Some(b) => repo.require_selected_branch(&b, "get marker")?,
-                None => repo.require_current_branch("get marker for current branch")?,
-            };
+            let branch_name =
+                repo.require_selected_branch(branch.as_deref().unwrap_or("@"), "get marker")?;
             if format == SwitchFormat::Json {
                 // Read raw config to get both marker and set_at
                 let config_key = format!("worktrunk.state.{branch_name}.marker");
@@ -756,10 +786,8 @@ pub fn handle_state_get(
             }
         }
         "ci-status" => {
-            let branch_name = match branch {
-                Some(b) => repo.require_selected_branch(&b, "get ci-status")?,
-                None => repo.require_current_branch("get ci-status for current branch")?,
-            };
+            let branch_name =
+                repo.require_selected_branch(branch.as_deref().unwrap_or("@"), "get ci-status")?;
 
             // Ask git for both qualified forms in one call so the remote/local
             // determination and the HEAD SHA come from the same ref. A local
@@ -789,7 +817,12 @@ pub fn handle_state_get(
 
             let branch_ref = match (local_sha, remote_sha) {
                 (Some(sha), _) => BranchRef::local_branch(&branch_name, sha),
-                (None, Some(sha)) => BranchRef::remote_branch(&branch_name, sha),
+                (None, Some(sha)) => {
+                    let (remote, branch) = repo
+                        .split_remote_branch_name(&branch_name)
+                        .context("remote branch has no remote prefix")?;
+                    BranchRef::remote_branch(remote, branch, sha)
+                }
                 (None, None) => {
                     return Err(worktrunk::git::GitError::BranchNotFound {
                         // Offering `--create` for a name git rejects sends the
@@ -884,17 +917,15 @@ pub fn handle_state_set(key: &str, value: String, branch: Option<String>) -> any
             );
         }
         "previous-branch" => {
-            repo.set_switch_previous(Some(&value))?;
+            repo.set_switch_previous(&value)?;
             eprintln!(
                 "{}",
                 success_message(cformat!("Set previous branch to <bold>{value}</>"))
             );
         }
         "marker" => {
-            let branch_name = match branch {
-                Some(b) => repo.require_selected_branch(&b, "set marker")?,
-                None => repo.require_current_branch("set marker for current branch")?,
-            };
+            let branch_name =
+                repo.require_selected_branch(branch.as_deref().unwrap_or("@"), "set marker")?;
 
             // Store as JSON with timestamp
             let now = epoch_now();
@@ -942,7 +973,7 @@ pub fn handle_state_clear(key: &str, branch: Option<String>, all: bool) -> anyho
             }
         }
         "previous-branch" => {
-            if repo.unset_config("worktrunk.history")? {
+            if repo.clear_switch_previous()? {
                 eprintln!("{}", success_message("Cleared previous branch"));
             } else {
                 eprintln!("{}", info_message("No previous branch to clear"));
@@ -957,10 +988,8 @@ pub fn handle_state_clear(key: &str, branch: Option<String>, all: bool) -> anyho
                 }
             } else {
                 // Clear CI status for specific branch
-                let branch_name = match branch {
-                    Some(b) => repo.require_selected_branch(&b, "clear ci-status")?,
-                    None => repo.require_current_branch("clear ci-status for current branch")?,
-                };
+                let branch_name = repo
+                    .require_selected_branch(branch.as_deref().unwrap_or("@"), "clear ci-status")?;
                 if CachedCiStatus::clear_one(&repo, &branch_name)? {
                     eprintln!(
                         "{}",
@@ -989,10 +1018,8 @@ pub fn handle_state_clear(key: &str, branch: Option<String>, all: bool) -> anyho
                     );
                 }
             } else {
-                let branch_name = match branch {
-                    Some(b) => repo.require_selected_branch(&b, "clear marker")?,
-                    None => repo.require_current_branch("clear marker for current branch")?,
-                };
+                let branch_name =
+                    repo.require_selected_branch(branch.as_deref().unwrap_or("@"), "clear marker")?;
 
                 let config_key = format!("worktrunk.state.{branch_name}.marker");
                 if repo.unset_config(&config_key)? {
@@ -1111,7 +1138,7 @@ fn clear_default_branch_reported(repo: &Repository) -> anyhow::Result<bool> {
 }
 
 fn clear_previous_branch_reported(repo: &Repository) -> anyhow::Result<bool> {
-    if repo.unset_config("worktrunk.history")? {
+    if repo.clear_switch_previous()? {
         eprintln!("{}", success_message("Cleared previous branch"));
         return Ok(true);
     }
@@ -1428,7 +1455,7 @@ fn handle_state_show_table(repo: &Repository) -> anyhow::Result<()> {
         writeln!(out, "{}", rendered.trim_end())?;
     }
 
-    show_help_in_pager(&out, true);
+    show_help_in_pager(&out, true)?;
 
     Ok(())
 }
@@ -1461,7 +1488,7 @@ fn handle_cache_get_table(repo: &Repository) -> anyhow::Result<()> {
     writeln!(out)?;
     render_hints_section(&mut out, repo)?;
 
-    show_help_in_pager(&out, true);
+    show_help_in_pager(&out, true)?;
 
     Ok(())
 }
@@ -1641,10 +1668,8 @@ fn validate_vars_key(key: &str) -> anyhow::Result<()> {
 pub fn handle_vars_get(key: &str, branch: Option<String>) -> anyhow::Result<()> {
     validate_vars_key(key)?;
     let repo = Repository::current()?;
-    let branch_name = match branch {
-        Some(b) => repo.require_selected_branch(&b, "get variable")?,
-        None => repo.require_current_branch("get variable for current branch")?,
-    };
+    let branch_name =
+        repo.require_selected_branch(branch.as_deref().unwrap_or("@"), "get variable")?;
 
     let config_key = format!("worktrunk.state.{branch_name}.vars.{key}");
     if let Some(value) = repo.config_value(&config_key)? {
@@ -1657,10 +1682,8 @@ pub fn handle_vars_get(key: &str, branch: Option<String>) -> anyhow::Result<()> 
 pub fn handle_vars_set(key: &str, value: &str, branch: Option<String>) -> anyhow::Result<()> {
     validate_vars_key(key)?;
     let repo = Repository::current()?;
-    let branch_name = match branch {
-        Some(b) => repo.require_selected_branch(&b, "set variable")?,
-        None => repo.require_current_branch("set variable for current branch")?,
-    };
+    let branch_name =
+        repo.require_selected_branch(branch.as_deref().unwrap_or("@"), "set variable")?;
 
     let config_key = format!("worktrunk.state.{branch_name}.vars.{key}");
     repo.set_config(&config_key, value)?;
@@ -1675,10 +1698,8 @@ pub fn handle_vars_set(key: &str, value: &str, branch: Option<String>) -> anyhow
 /// Handle vars list
 pub fn handle_vars_list(branch: Option<String>, format: SwitchFormat) -> anyhow::Result<()> {
     let repo = Repository::current()?;
-    let branch_name = match branch {
-        Some(b) => repo.require_selected_branch(&b, "list variables")?,
-        None => repo.require_current_branch("list variables for current branch")?,
-    };
+    let branch_name =
+        repo.require_selected_branch(branch.as_deref().unwrap_or("@"), "list variables")?;
 
     let entries: Vec<_> = repo.vars_entries(&branch_name).into_iter().collect();
 
@@ -1708,10 +1729,8 @@ pub fn handle_vars_clear(
     branch: Option<String>,
 ) -> anyhow::Result<()> {
     let repo = Repository::current()?;
-    let branch_name = match branch {
-        Some(b) => repo.require_selected_branch(&b, "clear variable")?,
-        None => repo.require_current_branch("clear variable for current branch")?,
-    };
+    let branch_name =
+        repo.require_selected_branch(branch.as_deref().unwrap_or("@"), "clear variable")?;
 
     match (all, key) {
         (false, None) => {
@@ -1765,29 +1784,46 @@ pub fn handle_vars_clear(
 /// Clear all branch markers. Used by `state clear marker --all` and
 /// `state clear --all`.
 ///
-/// `get_config_regexp` returns an empty string when no keys match (git exit 1)
-/// and `Err` for real config errors — both the listing step and each
-/// `unset_config` call propagate errors so user-initiated clears never lie
-/// about success.
+/// `config_regexp_entries` returns an empty list when Git reports no matches.
+/// It returns `Err` for real config errors. Both the listing step and each
+/// `unset_config` call propagate errors so user-initiated clears never report
+/// false success.
+///
+/// The marker pattern also matches a var named `marker`
+/// (`worktrunk.state.<branch>.vars.marker`). Such a key is skipped unless its
+/// value is marker JSON, in which case it is the marker of a branch whose name
+/// ends in `.vars`.
 fn clear_all_markers(repo: &Repository) -> anyhow::Result<usize> {
-    clear_matching_config(repo, r"^worktrunk\.state\..+\.marker$")
+    let entries = repo.config_regexp_entries(r"^worktrunk\.state\..+\.marker$")?;
+    let mut cleared = 0;
+    for (config_key, value) in entries {
+        if config_key.ends_with(".vars.marker") && !is_marker_json(&value) {
+            continue;
+        }
+        repo.unset_config(&config_key)?;
+        cleared += 1;
+    }
+    Ok(cleared)
+}
+
+fn is_marker_json(value: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(value)
+        .is_ok_and(|parsed| parsed.get("marker").is_some_and(|v| v.is_string()))
 }
 
 fn clear_matching_config(repo: &Repository, pattern: &str) -> anyhow::Result<usize> {
-    let output = repo.get_config_regexp(pattern)?;
+    let entries = repo.config_regexp_entries(pattern)?;
     let mut cleared = 0;
-    for line in output.lines() {
-        if let Some(config_key) = line.split_whitespace().next() {
-            repo.unset_config(config_key)?;
-            cleared += 1;
-        }
+    for (config_key, _) in entries {
+        repo.unset_config(&config_key)?;
+        cleared += 1;
     }
     Ok(cleared)
 }
 
 /// Clear all vars entries across all branches (used by handle_state_clear_all).
 ///
-/// Enumerates keys via `get_config_regexp` (not `all_vars_entries`) so a
+/// Enumerates keys via `config_regexp_entries` (not `all_vars_entries`) so a
 /// config read failure surfaces as an error — the display-path helper
 /// absorbs errors as empty, which would silently report "cleared 0" here.
 fn clear_all_vars(repo: &Repository) -> anyhow::Result<usize> {
@@ -1805,23 +1841,19 @@ pub(super) struct MarkerEntry {
 
 /// Get all branch markers from git config with timestamps
 pub(super) fn all_markers(repo: &Repository) -> Vec<MarkerEntry> {
-    let output = repo
-        .get_config_regexp(r"^worktrunk\.state\..+\.marker$")
+    let entries = repo
+        .config_regexp_entries(r"^worktrunk\.state\..+\.marker$")
         .unwrap_or_default();
 
     let mut markers = Vec::new();
-    for line in output.lines() {
-        // Format: "worktrunk.state.<branch>.marker json_value"
-        let Some((key, value)) = line.split_once(' ') else {
-            continue;
-        };
+    for (key, value) in entries {
         let Some(branch) = key
             .strip_prefix("worktrunk.state.")
             .and_then(|s| s.strip_suffix(".marker"))
         else {
             continue;
         };
-        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(value) else {
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&value) else {
             continue; // Skip invalid JSON
         };
         let Some(marker) = parsed.get("marker").and_then(|v| v.as_str()) else {
